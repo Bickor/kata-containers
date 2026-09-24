@@ -43,6 +43,7 @@ func TestQemuArm64CPUModel(t *testing.T) {
 func TestQemuArm64MemoryTopology(t *testing.T) {
 	assert := assert.New(t)
 	arm64 := newTestQemu(assert, QemuVirt)
+	memoryOffset := uint64(1024)
 
 	hostMem := uint64(4096)
 	mem := uint64(1024)
@@ -50,7 +51,7 @@ func TestQemuArm64MemoryTopology(t *testing.T) {
 	expectedMemory := govmmQemu.Memory{
 		Size:   fmt.Sprintf("%dM", mem),
 		Slots:  slots,
-		MaxMem: fmt.Sprintf("%dM", hostMem),
+		MaxMem: fmt.Sprintf("%dM", hostMem+memoryOffset),
 	}
 
 	m := arm64.memoryTopology(mem, hostMem, slots)
@@ -121,43 +122,11 @@ func TestQemuArm64AppendImage(t *testing.T) {
 			ID:       "mem0",
 			MemPath:  f.Name(),
 			Size:     (uint64)(imageStat.Size()),
+			ReadOnly: true,
 		},
 	}
 
 	devices, err = arm64.appendImage(context.Background(), devices, f.Name())
-	assert.NoError(err)
-	assert.Equal(expectedOut, devices)
-}
-
-func TestQemuArm64AppendNvdimmImage(t *testing.T) {
-	var devices []govmmQemu.Device
-	assert := assert.New(t)
-
-	f, err := os.CreateTemp("", "img")
-	assert.NoError(err)
-	defer func() { _ = f.Close() }()
-	defer func() { _ = os.Remove(f.Name()) }()
-
-	imageStat, err := f.Stat()
-	assert.NoError(err)
-
-	cfg := qemuConfig(QemuVirt)
-	cfg.ImagePath = f.Name()
-	arm64, err := newQemuArch(cfg)
-	assert.NoError(err)
-
-	expectedOut := []govmmQemu.Device{
-		govmmQemu.Object{
-			Driver:   govmmQemu.NVDIMM,
-			Type:     govmmQemu.MemoryBackendFile,
-			DeviceID: "nv0",
-			ID:       "mem0",
-			MemPath:  f.Name(),
-			Size:     (uint64)(imageStat.Size()),
-		},
-	}
-
-	devices, err = arm64.appendNvdimmImage(devices, f.Name())
 	assert.NoError(err)
 	assert.Equal(expectedOut, devices)
 }
@@ -182,43 +151,56 @@ func TestQemuArm64AppendProtectionDevice(t *testing.T) {
 	var err error
 
 	// no protection
-	devices, bios, err = arm64.appendProtectionDevice(devices, firmware, "")
+	devices, bios, err = arm64.appendProtectionDevice(devices, firmware, "", []byte(""))
 	assert.Empty(devices)
 	assert.Empty(bios)
 	assert.NoError(err)
 
 	// PEF protection
 	arm64.(*qemuArm64).protection = pefProtection
-	devices, bios, err = arm64.appendProtectionDevice(devices, firmware, "")
-	assert.Empty(devices)
+	devices, bios, err = arm64.appendProtectionDevice(devices, firmware, "", []byte(""))
+	assert.Error(err)
 	assert.Empty(bios)
-	assert.NoError(err)
 
 	// Secure Execution protection
 	arm64.(*qemuArm64).protection = seProtection
-	devices, bios, err = arm64.appendProtectionDevice(devices, firmware, "")
-	assert.Empty(devices)
+	devices, bios, err = arm64.appendProtectionDevice(devices, firmware, "", []byte(""))
+	assert.Error(err)
 	assert.Empty(bios)
-	assert.NoError(err)
 
 	// SEV protection
 	arm64.(*qemuArm64).protection = sevProtection
-	devices, bios, err = arm64.appendProtectionDevice(devices, firmware, "")
-	assert.Empty(devices)
+	devices, bios, err = arm64.appendProtectionDevice(devices, firmware, "", []byte(""))
+	assert.Error(err)
 	assert.Empty(bios)
-	assert.NoError(err)
 
 	// SNP protection
 	arm64.(*qemuArm64).protection = snpProtection
-	devices, bios, err = arm64.appendProtectionDevice(devices, firmware, "")
-	assert.Empty(devices)
+	devices, bios, err = arm64.appendProtectionDevice(devices, firmware, "", []byte(""))
+	assert.Error(err)
 	assert.Empty(bios)
-	assert.NoError(err)
 
 	// TDX protection
 	arm64.(*qemuArm64).protection = tdxProtection
-	devices, bios, err = arm64.appendProtectionDevice(devices, firmware, "")
-	assert.Empty(devices)
+	devices, bios, err = arm64.appendProtectionDevice(devices, firmware, "", []byte(""))
+	assert.Error(err)
+	assert.Empty(bios)
+
+	// CCA RME protection
+	arm64.(*qemuArm64).protection = ccaProtection
+	devices, bios, err = arm64.appendProtectionDevice(devices, firmware, "", []byte(""))
 	assert.Empty(bios)
 	assert.NoError(err)
+
+	expectedOut := []govmmQemu.Device{
+		govmmQemu.Object{
+			Type:            govmmQemu.CCAGuest,
+			ID:              "rme0",
+			Debug:           false,
+			File:            firmware,
+			MeasurementAlgo: "",
+			InitdataDigest:  []byte(""),
+		},
+	}
+	assert.Equal(expectedOut, devices)
 }

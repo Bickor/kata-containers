@@ -5,11 +5,18 @@
 //
 
 use std::fmt;
+use std::sync::Arc;
 
+use tokio::sync::Mutex;
+
+use crate::device::driver::vfio_device::VfioDeviceModern;
 use crate::device::driver::vhost_user_blk::VhostUserBlkDevice;
+use crate::device::driver::virtio_blk_modern::BlockDeviceModern;
+use crate::vfio_device::VfioDeviceBase;
 use crate::{
-    BlockConfig, BlockDevice, HybridVsockConfig, HybridVsockDevice, Hypervisor as hypervisor,
-    NetworkConfig, NetworkDevice, ShareFsConfig, ShareFsDevice, VfioConfig, VfioDevice,
+    BlockConfig, BlockConfigModern, BlockDevice, HybridVsockConfig, HybridVsockDevice,
+    Hypervisor as hypervisor, NetworkConfig, NetworkDevice, PCIePortDevice, PortDeviceConfig,
+    ProtectionDevice, ProtectionDeviceConfig, ShareFsConfig, ShareFsDevice, VfioConfig, VfioDevice,
     VhostUserConfig, VhostUserNetDevice, VsockConfig, VsockDevice,
 };
 use anyhow::Result;
@@ -20,19 +27,25 @@ use self::topology::PCIeTopology;
 pub mod device_manager;
 pub mod driver;
 pub mod pci_path;
+mod tap;
+pub use self::tap::{Error as TapError, Tap};
 pub mod topology;
 pub mod util;
 
 #[derive(Debug)]
 pub enum DeviceConfig {
     BlockCfg(BlockConfig),
+    BlockCfgModern(BlockConfigModern),
     VhostUserBlkCfg(VhostUserConfig),
     NetworkCfg(NetworkConfig),
     VhostUserNetworkCfg(VhostUserConfig),
     ShareFsCfg(ShareFsConfig),
     VfioCfg(VfioConfig),
+    VfioModernCfg(VfioDeviceBase),
     VsockCfg(VsockConfig),
     HybridVsockCfg(HybridVsockConfig),
+    ProtectionDevCfg(ProtectionDeviceConfig),
+    PortDeviceCfg(PortDeviceConfig),
 }
 
 #[derive(Debug, Clone)]
@@ -45,11 +58,15 @@ pub enum DeviceType {
     ShareFs(ShareFsDevice),
     HybridVsock(HybridVsockDevice),
     Vsock(VsockDevice),
+    Protection(ProtectionDevice),
+    PortDevice(PCIePortDevice),
+    VfioModern(Arc<Mutex<VfioDeviceModern>>),
+    BlockModern(Arc<Mutex<BlockDeviceModern>>),
 }
 
 impl fmt::Display for DeviceType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:?}", self)
+        write!(f, "{self:?}")
     }
 }
 

@@ -15,6 +15,7 @@ import (
 
 	"github.com/sirupsen/logrus"
 
+	pkgDevice "github.com/kata-containers/kata-containers/src/runtime/pkg/device"
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/api"
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/config"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/utils"
@@ -64,9 +65,21 @@ func (device *VFIODevice) Attach(ctx context.Context, devReceiver api.DeviceRece
 		}
 	}()
 
-	device.VfioDevs, err = GetAllVFIODevicesFromIOMMUGroup(*device.DeviceInfo)
-	if err != nil {
-		return err
+	// This work for IOMMUFD enabled kernels > 6.x
+	// In the case of IOMMUFD the device.HostPath will look like
+	// /dev/vfio/devices/vfio0
+	// (1) Check if we have the new IOMMUFD or old container based VFIO
+	if strings.HasPrefix(device.DeviceInfo.HostPath, pkgDevice.IommufdDevPath) {
+		device.VfioDevs, err = GetDeviceFromVFIODev(*device.DeviceInfo)
+		if err != nil {
+			return err
+		}
+	} else {
+		// Once we have
+		device.VfioDevs, err = GetAllVFIODevicesFromIOMMUGroup(*device.DeviceInfo)
+		if err != nil {
+			return err
+		}
 	}
 
 	for _, vfio := range device.VfioDevs {
@@ -77,11 +90,17 @@ func (device *VFIODevice) Attach(ctx context.Context, devReceiver api.DeviceRece
 		}
 
 		if vfio.IsPCIe {
-			busIndex := len(config.PCIeDevicesPerPort[vfio.Port])
-			vfio.Bus = fmt.Sprintf("%s%d", config.PCIePortPrefixMapping[vfio.Port], busIndex)
-			// We need to keep track the number of devices per port to deduce
-			// the corectu bus number, additionally we can use the VFIO device
-			// info to act upon different Vendor IDs and Device IDs.
+			// When pxb-pcie NUMA topology is active, assign the device
+			// to a root port on the pxb-pcie bridge for its host NUMA
+			// node instead of the default rp/swdp numbering.
+			if rpIDs, ok := config.NUMARootPorts[vfio.NUMANode]; ok && len(rpIDs) > 0 {
+				idx := config.NUMARootPortDeviceCount[vfio.NUMANode]
+				vfio.Bus = rpIDs[idx%len(rpIDs)]
+				config.NUMARootPortDeviceCount[vfio.NUMANode] = idx + 1
+			} else {
+				busIndex := len(config.PCIeDevicesPerPort[vfio.Port])
+				vfio.Bus = fmt.Sprintf("%s%d", config.PCIePortPrefixMapping[vfio.Port], busIndex)
+			}
 			config.PCIeDevicesPerPort[vfio.Port] = append(config.PCIeDevicesPerPort[vfio.Port], *vfio)
 		}
 	}
@@ -126,7 +145,7 @@ func (device *VFIODevice) Detach(ctx context.Context, devReceiver api.DeviceRece
 		}
 	}()
 
-	if device.GenericDevice.DeviceInfo.ColdPlug {
+	if device.DeviceInfo.ColdPlug {
 		// nothing to detach, device was cold plugged
 		deviceLogger().WithFields(logrus.Fields{
 			"device-group": device.DeviceInfo.HostPath,
@@ -251,7 +270,7 @@ func GetVFIODetails(deviceFileName, iommuDevicesPath string) (deviceBDF, deviceS
 // getMediatedBDF returns the BDF of a VF
 // Expected input string format is /sys/devices/pci0000:d7/BDF0/BDF1/.../MDEVBDF/UUID
 func getMediatedBDF(deviceSysfsDev string) string {
-	tokens := strings.SplitN(deviceSysfsDev, "/", -1)
+	tokens := strings.Split(deviceSysfsDev, "/")
 	if len(tokens) < 4 {
 		return ""
 	}

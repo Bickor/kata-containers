@@ -7,12 +7,10 @@
 #[macro_use]
 #[cfg(test)]
 extern crate serial_test;
-extern crate serde;
-extern crate serde_json;
-#[macro_use]
-extern crate serde_derive;
 extern crate caps;
 extern crate protocols;
+extern crate serde;
+extern crate serde_json;
 #[macro_use]
 extern crate scopeguard;
 extern crate capctl;
@@ -29,8 +27,6 @@ extern crate regex;
 
 pub mod capabilities;
 pub mod cgroups;
-#[cfg(feature = "standard-oci-runtime")]
-pub mod console;
 pub mod container;
 pub mod mount;
 pub mod pipestream;

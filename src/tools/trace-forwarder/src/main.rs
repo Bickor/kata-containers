@@ -1,15 +1,17 @@
 // Copyright (c) 2020-2021 Intel Corporation
+// Copyright (c) 2025 IBM Corporation
 //
 // SPDX-License-Identifier: Apache-2.0
 //
 
 #![warn(unused_extern_crates)]
 use anyhow::{anyhow, Result};
-use clap::{crate_name, crate_version, App, Arg};
+use clap::{crate_name, crate_version, Arg, Command};
 use slog::{error, info, Logger};
 use std::env;
 use std::io;
 use std::process::exit;
+use tokio::runtime::Runtime;
 
 // Traces will be created using this program name
 const DEFAULT_TRACE_NAME: &str = "kata-agent";
@@ -23,8 +25,7 @@ const DEFAULT_LOG_LEVEL: slog::Level = slog::Level::Info;
 // Must match the number used by the agent
 const DEFAULT_KATA_VSOCK_TRACING_PORT: &str = "10240";
 
-const DEFAULT_JAEGER_HOST: &str = "127.0.0.1";
-const DEFAULT_JAEGER_PORT: &str = "6831";
+const DEFAULT_OTLP_ENDPOINT: &str = "http://localhost:4317";
 
 mod handler;
 mod server;
@@ -136,78 +137,66 @@ fn real_main() -> Result<()> {
     let version = crate_version!();
     let name = crate_name!();
 
-    let args = App::new(name)
+    let args = Command::new(name)
         .version(version)
-        .version_short("v")
         .about(ABOUT_TEXT)
-        .long_about(&*make_description_text())
-        .after_help(&*make_examples_text(name))
+        .long_about(make_description_text())
+        .after_help(make_examples_text(name))
         .arg(
-            Arg::with_name("dump-only")
+            Arg::new("dump-only")
                 .long("dump-only")
                 .help("Disable forwarding of spans and write to stdout (for testing)"),
         )
         .arg(
-            Arg::with_name("trace-name")
+            Arg::new("trace-name")
                 .long("trace-name")
                 .help("Specify name for traces")
                 .required(false)
-                .takes_value(true)
                 .default_value(DEFAULT_TRACE_NAME),
         )
         .arg(
-            Arg::with_name("jaeger-host")
-                .long("jaeger-host")
-                .help("Jaeger host address")
-                .takes_value(true)
-                .default_value(DEFAULT_JAEGER_HOST),
+            Arg::new("otlp-endpoint")
+                .long("otlp-endpoint")
+                .help("OTLP endpoint URL (e.g., http://localhost:4317)")
+                .default_value(DEFAULT_OTLP_ENDPOINT),
         )
         .arg(
-            Arg::with_name("jaeger-port")
-                .long("jaeger-port")
-                .help("Jaeger port number")
-                .takes_value(true)
-                .default_value(DEFAULT_JAEGER_PORT),
-        )
-        .arg(
-            Arg::with_name("log-level")
+            Arg::new("log-level")
                 .long("log-level")
-                .short("l")
+                .short('l')
                 .help("specific log level")
                 .default_value(logging::slog_level_to_level_name(DEFAULT_LOG_LEVEL).unwrap())
-                .possible_values(&logging::get_log_levels())
-                .takes_value(true)
+                .value_parser(logging::get_log_levels())
                 .required(false),
         )
         .arg(
-            Arg::with_name("socket-path")
+            Arg::new("socket-path")
                 .long("socket-path")
                 .help("Full path to hypervisor socket (needs root! cloud-hypervisor and firecracker hypervisors only)")
-                .takes_value(true)
                 .required(false),
         )
         .arg(
-            Arg::with_name("vsock-cid")
+            Arg::new("vsock-cid")
                 .long("vsock-cid")
-                .help(&format!(
-                    "VSOCK CID number (or {:?}) (QEMU hypervisor only)",
-                    VSOCK_CID_ANY_STR
+                .help(format!(
+                    "VSOCK CID number (or {VSOCK_CID_ANY_STR:?}) (QEMU hypervisor only)"
                 ))
-                .takes_value(true)
                 .required(false)
                 .default_value(VSOCK_CID_ANY_STR),
         )
         .arg(
-            Arg::with_name("vsock-port")
+            Arg::new("vsock-port")
                 .long("vsock-port")
                 .help("VSOCK port number (QEMU hypervisor only)")
-                .takes_value(true)
                 .default_value(DEFAULT_KATA_VSOCK_TRACING_PORT),
         )
         .get_matches();
 
     // Cannot fail as a default has been specified
-    let log_level_name = args.value_of("log-level").unwrap();
+    let log_level_name = args
+        .get_one::<String>("log-level")
+        .map(|s| s.as_str())
+        .unwrap();
 
     let log_level = logging::level_name_to_slog_level(log_level_name).map_err(|e| anyhow!(e))?;
 
@@ -215,12 +204,13 @@ fn real_main() -> Result<()> {
     let writer = io::stdout();
     let (logger, _logger_guard) = logging::create_logger(name, name, log_level, writer);
 
-    let dump_only = args.is_present("dump-only");
+    let dump_only = args.contains_id("dump-only");
 
     announce(&logger, version, dump_only);
 
     let trace_name: &str = args
-        .value_of("trace-name")
+        .get_one::<String>("trace-name")
+        .map(|s| s.as_str())
         .ok_or(anyhow!("BUG: trace name not set"))
         .map_or_else(
             |e| Err(anyhow!(e)),
@@ -234,40 +224,36 @@ fn real_main() -> Result<()> {
         )?;
 
     // Handle the Hybrid VSOCK option first (since it cannot be defaulted).
-    let vsock = if let Some(socket_path) = args.value_of("socket-path") {
-        handle_hybrid_vsock(socket_path, args.value_of("vsock-port"))
+    let vsock = if let Some(socket_path) = args.get_one::<String>("socket-path").map(|s| s.as_str())
+    {
+        handle_hybrid_vsock(
+            socket_path,
+            args.get_one::<String>("vsock-port").map(|s| s.as_str()),
+        )
     } else {
         // The default is standard VSOCK
-        handle_standard_vsock(args.value_of("vsock-cid"), args.value_of("vsock-port"))
+        handle_standard_vsock(
+            args.get_one::<String>("vsock-cid").map(|s| s.as_str()),
+            args.get_one::<String>("vsock-port").map(|s| s.as_str()),
+        )
     }?;
 
-    let jaeger_port: u32 = args
-        .value_of("jaeger-port")
-        .ok_or("Need Jaeger port number")
-        .map(|p| p.parse::<u32>().unwrap())
-        .map_err(|e| anyhow!("Jaeger port number must be an integer: {:?}", e))?;
+    let otlp_endpoint = args
+        .get_one::<String>("otlp-endpoint")
+        .map(|s| s.as_str())
+        .ok_or("Need OTLP endpoint")
+        .map_err(|e: &str| anyhow!(e))?;
 
-    if jaeger_port == 0 {
-        return Err(anyhow!("Jaeger port number cannot be zero"));
+    if otlp_endpoint.is_empty() {
+        return Err(anyhow!("OTLP endpoint cannot be blank"));
     }
 
-    let jaeger_host = args
-        .value_of("jaeger-host")
-        .ok_or("Need Jaeger host")
-        .map_err(|e| anyhow!(e))?;
+    // OTLP gRPC exporter uses hyper/tonic and requires a Tokio reactor context.
+    let tokio_rt = Runtime::new().map_err(|e| anyhow!("failed to create tokio runtime: {e}"))?;
+    let _tokio_enter_guard = tokio_rt.enter();
 
-    if jaeger_host.is_empty() {
-        return Err(anyhow!("Jaeger host cannot be blank"));
-    }
-
-    let server = server::VsockTraceServer::new(
-        &logger,
-        vsock,
-        jaeger_host,
-        jaeger_port,
-        trace_name,
-        dump_only,
-    );
+    let server =
+        server::VsockTraceServer::new(&logger, vsock, otlp_endpoint, trace_name, dump_only);
 
     let result = server.start();
 
@@ -282,7 +268,7 @@ fn real_main() -> Result<()> {
 
 fn main() {
     if let Err(e) = real_main() {
-        eprintln!("ERROR: {:#?}", e);
+        eprintln!("ERROR: {e:#?}");
         exit(1);
     }
     exit(0);
@@ -316,7 +302,7 @@ mod tests {
                 socket_path: "/foo/bar",
                 port: None,
                 result: Ok(VsockType::Hybrid {
-                    socket_path: format!("/foo/bar_{}", DEFAULT_KATA_VSOCK_TRACING_PORT),
+                    socket_path: format!("/foo/bar_{DEFAULT_KATA_VSOCK_TRACING_PORT}"),
                 }),
             },
             TestData {
@@ -339,11 +325,11 @@ mod tests {
         ];
 
         for (i, d) in tests.iter().enumerate() {
-            let msg = format!("test[{}]: {:?}", i, d);
+            let msg = format!("test[{i}]: {d:?}");
 
             let result = handle_hybrid_vsock(d.socket_path, d.port);
 
-            let msg = format!("{}: result: {:?}", msg, result);
+            let msg = format!("{msg}: result: {result:?}");
 
             assert_result!(d.result, result, msg);
         }
@@ -419,11 +405,11 @@ mod tests {
         ];
 
         for (i, d) in tests.iter().enumerate() {
-            let msg = format!("test[{}]: {:?}", i, d);
+            let msg = format!("test[{i}]: {d:?}");
 
             let result = handle_standard_vsock(d.cid, d.port);
 
-            let msg = format!("{}: result: {:?}", msg, result);
+            let msg = format!("{msg}: result: {result:?}");
 
             assert_result!(d.result, result, msg);
         }

@@ -8,17 +8,21 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use hypervisor::{
     device::{
-        device_manager::{do_handle_device, get_block_driver, DeviceManager},
+        device_manager::{do_handle_device, get_block_device_info, DeviceManager},
         DeviceConfig,
     },
-    BlockConfig,
+    BlockConfigModern, BlockDeviceAio,
 };
 use kata_types::mount::DirectVolumeMountInfo;
 use nix::sys::{stat, stat::SFlag};
 use oci_spec::runtime as oci;
 use tokio::sync::RwLock;
 
-use crate::volume::{direct_volumes::KATA_DIRECT_VOLUME_TYPE, utils::handle_block_volume, Volume};
+use crate::volume::{
+    direct_volumes::KATA_DIRECT_VOLUME_TYPE,
+    utils::{handle_block_volume, is_block_device_readonly},
+    Volume,
+};
 
 #[derive(Clone)]
 pub(crate) struct RawblockVolume {
@@ -36,7 +40,7 @@ impl RawblockVolume {
         read_only: bool,
         sid: &str,
     ) -> Result<Self> {
-        let block_driver = get_block_driver(d).await;
+        let blkdev_info = get_block_device_info(d).await;
 
         // check volume type
         if mount_info.volume_type != KATA_DIRECT_VOLUME_TYPE {
@@ -58,14 +62,36 @@ impl RawblockVolume {
             ));
         }
 
-        let block_config = BlockConfig {
+        // For a real block device, honor its host read-only flag (BLKROGET) in
+        // addition to the mount-derived intent, so a device marked read-only on
+        // the host is exposed read-only to the guest. (Not applicable to
+        // regular-file backed images.)
+        let read_only = read_only
+            || (SFlag::from_bits_truncate(fstat.st_mode) == SFlag::S_IFBLK
+                && is_block_device_readonly(mount_info.device.as_str()).unwrap_or_else(|e| {
+                    warn!(
+                        sl!(),
+                        "could not query block device read-only flag for {}: {:?}",
+                        mount_info.device,
+                        e
+                    );
+                    false
+                }));
+
+        let block_config = BlockConfigModern {
             path_on_host: mount_info.device.clone(),
-            driver_option: block_driver,
+            is_readonly: read_only,
+            driver_option: blkdev_info.block_device_driver,
+            blkdev_aio: BlockDeviceAio::new(&blkdev_info.block_device_aio),
+            num_queues: blkdev_info.num_queues,
+            queue_size: blkdev_info.queue_size,
+            logical_sector_size: blkdev_info.block_device_logical_sector_size,
+            physical_sector_size: blkdev_info.block_device_physical_sector_size,
             ..Default::default()
         };
 
         // create and insert block device into Kata VM
-        let device_info = do_handle_device(d, &DeviceConfig::BlockCfg(block_config.clone()))
+        let device_info = do_handle_device(d, &DeviceConfig::BlockCfgModern(block_config.clone()))
             .await
             .context("do handle device failed.")?;
 

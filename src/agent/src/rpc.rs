@@ -4,16 +4,22 @@
 //
 
 use async_trait::async_trait;
+#[cfg(feature = "agent-policy")]
+use kata_agent_policy::policy::PolicyCopyFileRequest;
 use rustjail::{pipestream::PipeStream, process::StreamType};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf};
 use tokio::sync::Mutex;
+use tokio::time::{timeout, Duration};
 
 use std::convert::TryFrom;
+#[cfg(feature = "agent-policy")]
+use std::convert::TryInto as _;
 use std::ffi::{CString, OsStr};
 use std::fmt::Debug;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
+#[cfg(target_arch = "s390x")]
 use std::str::FromStr;
 use std::sync::Arc;
 use ttrpc::{
@@ -26,11 +32,13 @@ use anyhow::{anyhow, Context, Result};
 use cgroups::freezer::FreezerState;
 use oci::{Hooks, LinuxNamespace, Spec};
 use oci_spec::runtime as oci;
+#[cfg(feature = "agent-policy")]
+use protobuf::MessageDyn;
 use protobuf::MessageField;
 use protocols::agent::{
-    AddSwapRequest, AgentDetails, CopyFileRequest, GetIPTablesRequest, GetIPTablesResponse,
-    GuestDetailsResponse, Interfaces, Metrics, OOMEvent, ReadStreamResponse, Routes,
-    SetIPTablesRequest, SetIPTablesResponse, StatsContainerResponse, VolumeStatsRequest,
+    AddSwapPathRequest, AddSwapRequest, AgentDetails, CopyFileRequest, GetIPTablesRequest,
+    GetIPTablesResponse, GuestDetailsResponse, Interfaces, Metrics, OOMEvent, ReadStreamResponse,
+    Routes, SetIPTablesRequest, SetIPTablesResponse, StatsContainerResponse, VolumeStatsRequest,
     WaitProcessResponse, WriteStreamResponse,
 };
 use protocols::csi::{
@@ -54,14 +62,23 @@ use nix::mount::MsFlags;
 use nix::sys::{stat, statfs};
 use nix::unistd::{self, Pid};
 use rustjail::process::ProcessOperations;
+#[cfg(all(test, not(target_arch = "powerpc64")))]
+use std::os::fd::AsRawFd;
+use std::os::fd::BorrowedFd;
 
-use crate::cdh;
+#[cfg(target_arch = "s390x")]
+use crate::ccw;
+use crate::confidential_data_hub::image::KATA_IMAGE_WORK_DIR;
 use crate::device::block_device_handler::get_virtio_blk_pci_device_name;
-use crate::device::network_device_handler::wait_for_net_interface;
-use crate::device::{add_devices, update_env_pci};
+#[cfg(target_arch = "s390x")]
+use crate::device::network_device_handler::wait_for_ccw_net_interface;
+#[cfg(not(target_arch = "s390x"))]
+use crate::device::network_device_handler::wait_for_pci_net_interface;
+use crate::device::{
+    add_devices, cdi_devices_from_visible_devices, dump_nvidia_cdi_yaml, handle_cdi_devices,
+    update_env_pci,
+};
 use crate::features::get_build_features;
-use crate::image::KATA_IMAGE_WORK_DIR;
-use crate::linux_abi::*;
 use crate::metrics::get_metrics;
 use crate::mount::baremount;
 use crate::namespace::{NSTYPEIPC, NSTYPEPID, NSTYPEUTS};
@@ -69,20 +86,18 @@ use crate::network::setup_guest_dns;
 use crate::passfd_io;
 use crate::pci;
 use crate::random;
-use crate::sandbox::Sandbox;
+use crate::sandbox::{Sandbox, SandboxError};
 use crate::storage::{add_storages, update_ephemeral_mounts, STORAGE_HANDLERS};
 use crate::util;
 use crate::version::{AGENT_VERSION, API_VERSION};
 use crate::AGENT_CONFIG;
+use crate::{confidential_data_hub, linux_abi::*};
 
 use crate::trace_rpc_call;
 use crate::tracer::extract_carrier_from_ttrpc;
 
 #[cfg(feature = "agent-policy")]
-use crate::policy::{do_set_policy, is_allowed};
-
-#[cfg(feature = "guest-pull")]
-use crate::image;
+use crate::policy::{do_set_policy, is_allowed, is_allowed_with_entrypoint};
 
 use opentelemetry::global;
 use tracing::span;
@@ -94,7 +109,6 @@ use libc::{self, c_char, c_ushort, pid_t, winsize, TIOCSWINSZ};
 use std::fs;
 use std::os::unix::prelude::PermissionsExt;
 use std::process::{Command, Stdio};
-use std::time::Duration;
 
 use nix::unistd::{Gid, Uid};
 use std::fs::{File, OpenOptions};
@@ -137,7 +151,17 @@ fn sl() -> slog::Logger {
 
 // Convenience function to wrap an error and response to ttrpc client
 pub fn ttrpc_error(code: ttrpc::Code, err: impl Debug) -> ttrpc::Error {
-    get_rpc_status(code, format!("{:?}", err))
+    get_rpc_status(code, format!("{err:?}"))
+}
+
+/// Convert SandboxError to ttrpc error with appropriate code.
+/// Process not found errors map to NOT_FOUND, others to INVALID_ARGUMENT.
+fn sandbox_err_to_ttrpc(err: SandboxError) -> ttrpc::Error {
+    let code = match &err {
+        SandboxError::InitProcessNotFound | SandboxError::InvalidExecId => ttrpc::Code::NOT_FOUND,
+        SandboxError::InvalidContainerId => ttrpc::Code::INVALID_ARGUMENT,
+    };
+    ttrpc_error(code, err)
 }
 
 #[cfg(not(feature = "agent-policy"))]
@@ -179,6 +203,7 @@ impl<T> OptionToTtrpcResult<T> for Option<T> {
 pub struct AgentService {
     sandbox: Arc<Mutex<Sandbox>>,
     init_mode: bool,
+    oma: Option<mem_agent::agent::MemAgent>,
 }
 
 impl AgentService {
@@ -222,56 +247,37 @@ impl AgentService {
         // updates the devices listed in the OCI spec, so that they actually
         // match real devices inside the VM. This step is necessary since we
         // cannot predict everything from the caller.
-        add_devices(&sl(), &req.devices, &mut oci, &self.sandbox).await?;
+        add_devices(&cid, &sl(), &req.devices, &mut oci, &self.sandbox).await?;
 
-        let process = oci
-            .process_mut()
-            .as_mut()
-            .ok_or_else(|| anyhow!("Spec didn't contain process field"))?;
-        if cdh::is_cdh_client_initialized().await {
-            if let Some(envs) = process.env_mut().as_mut() {
-                for env in envs.iter_mut() {
-                    match cdh::unseal_env(env).await {
-                        Ok(unsealed_env) => *env = unsealed_env.to_string(),
-                        Err(e) => {
-                            warn!(sl(), "Failed to unseal secret: {}", e)
-                        }
-                    }
-                }
-            }
-        }
+        // In guest-kernel mode some devices need extra handling. Taking the
+        // GPU as an example the shim will inject CDI annotations that will
+        // be used by the kata-agent to do containerEdits according to the
+        // CDI spec coming from a registry that is created on the fly by UDEV
+        // or other entities for a specifc device.
+        // In Kata we only consider the directory "/var/run/cdi", "/etc" may be
+        // readonly
+        dump_nvidia_cdi_yaml(&sl())?;
+        // When enabled, translate the container's VISIBLE_CDI_DEVICES
+        // environment variable into CDI GPU device requests, so that a
+        // container can select which of the VM's GPUs it sees at runtime.
+        let visible_cdi_devices = if AGENT_CONFIG.visible_cdi_devices {
+            cdi_devices_from_visible_devices(&oci)?
+        } else {
+            Vec::new()
+        };
+        handle_cdi_devices(
+            &sl(),
+            &mut oci,
+            "/var/run/cdi",
+            AGENT_CONFIG.cdi_timeout,
+            &visible_cdi_devices,
+        )
+        .await?;
 
-        let linux = oci
-            .linux()
-            .as_ref()
-            .ok_or_else(|| anyhow!("Spec didn't contain linux field"))?;
-
-        if cdh::is_cdh_client_initialized().await {
-            if let Some(devices) = linux.devices() {
-                for specdev in devices.iter() {
-                    if specdev.path().as_path().to_str() == Some(TRUSTED_IMAGE_STORAGE_DEVICE) {
-                        let dev_major_minor = format!("{}:{}", specdev.major(), specdev.minor());
-                        let secure_storage_integrity =
-                            AGENT_CONFIG.secure_storage_integrity.to_string();
-                        info!(
-                            sl(),
-                            "trusted_store device major:min {}, enable data integrity {}",
-                            dev_major_minor,
-                            secure_storage_integrity
-                        );
-
-                        let options = std::collections::HashMap::from([
-                            ("deviceId".to_string(), dev_major_minor),
-                            ("encryptType".to_string(), "LUKS".to_string()),
-                            ("dataIntegrity".to_string(), secure_storage_integrity),
-                        ]);
-                        cdh::secure_mount("BlockDevice", &options, vec![], KATA_IMAGE_WORK_DIR)
-                            .await?;
-                        break;
-                    }
-                }
-            }
-        }
+        // Handle trusted storage configuration before mounting any storage
+        cdh_handler_trusted_storage(&mut oci)
+            .await
+            .map_err(|e| anyhow!("failed to handle trusted storage: {}", e))?;
 
         // Both rootfs and volumes (invoked with --volume for instance) will
         // be processed the same way. The idea is to always mount any provided
@@ -280,7 +286,18 @@ impl AgentService {
         // After all those storages have been processed, no matter the order
         // here, the agent will rely on rustjail (using the oci.Mounts
         // list) to bind mount all of them inside the container.
-        let m = add_storages(sl(), req.storages, &self.sandbox, Some(req.container_id)).await?;
+        let m = add_storages(
+            sl(),
+            req.storages.clone(),
+            &self.sandbox,
+            Some(req.container_id),
+        )
+        .await?;
+
+        // Handle sealed secrets after storage is mounted
+        cdh_handler_sealed_secrets(&mut oci)
+            .await
+            .map_err(|e| anyhow!("failed to handle sealed secrets: {}", e))?;
 
         let mut s = self.sandbox.lock().await;
         s.container_mounts.insert(cid.clone(), m);
@@ -334,12 +351,13 @@ impl AgentService {
 
         let pipe_size = AGENT_CONFIG.container_pipe_size;
 
-        let p = if let Some(p) = oci.process() {
-            Process::new(&sl(), p, cid.as_str(), true, pipe_size, proc_io)?
-        } else {
+        let Some(p) = oci.process() else {
             info!(sl(), "no process configurations!");
             return Err(anyhow!(nix::Error::EINVAL));
         };
+
+        let new_p = confidential_data_hub::image::get_process(p, &oci, req.storages.clone())?;
+        let p = Process::new(&sl(), &new_p, cid.as_str(), true, pipe_size, proc_io)?;
 
         // if starting container failed, we will do some rollback work
         // to ensure no resources are leaked.
@@ -366,24 +384,25 @@ impl AgentService {
     async fn do_start_container(&self, req: protocols::agent::StartContainerRequest) -> Result<()> {
         let mut s = self.sandbox.lock().await;
         let sid = s.id.clone();
-        let cid = req.container_id;
+        let cid = req.container_id.clone();
 
         let ctr = s
             .get_container(&cid)
             .ok_or_else(|| anyhow!("Invalid container id"))?;
-        ctr.exec().await?;
 
-        if sid == cid {
-            return Ok(());
+        if sid != cid {
+            // start oom event loop
+            if let Ok(cg_path) = ctr.cgroup_manager.as_ref().get_cgroup_path("memory") {
+                let rx = notifier::notify_oom(cid.as_str(), cg_path.to_string()).await?;
+                s.run_oom_event_monitor(rx, cid.clone()).await;
+            }
         }
 
-        // start oom event loop
-        if let Ok(cg_path) = ctr.cgroup_manager.as_ref().get_cgroup_path("memory") {
-            let rx = notifier::notify_oom(cid.as_str(), cg_path.to_string()).await?;
-            s.run_oom_event_monitor(rx, cid).await;
-        }
+        let ctr = s
+            .get_container(&cid)
+            .ok_or_else(|| anyhow!("Invalid container id"))?;
 
-        Ok(())
+        ctr.exec().await
     }
 
     #[instrument]
@@ -392,6 +411,9 @@ impl AgentService {
         req: protocols::agent::RemoveContainerRequest,
     ) -> Result<()> {
         let cid = req.container_id;
+
+        // Drop the host guest mapping for this container so we can reuse the
+        // PCI slots for the next containers
 
         if req.timeout == 0 {
             let mut sandbox = self.sandbox.lock().await;
@@ -448,7 +470,7 @@ impl AgentService {
             .ok_or_else(|| anyhow!("Unable to parse process from ExecProcessRequest"))?;
 
         // Apply any necessary corrections for PCI addresses
-        update_env_pci(&mut process.Env, &sandbox.pcimap)?;
+        update_env_pci(&cid, &mut process.Env, &sandbox.pcimap)?;
 
         let pipe_size = AGENT_CONFIG.container_pipe_size;
         let ocip = process.into();
@@ -477,7 +499,9 @@ impl AgentService {
         let mut sig: libc::c_int = req.signal as libc::c_int;
         {
             let mut sandbox = self.sandbox.lock().await;
-            let p = sandbox.find_container_process(cid.as_str(), eid.as_str())?;
+            let p = sandbox
+                .find_container_process(cid.as_str(), eid.as_str())
+                .map_err(sandbox_err_to_ttrpc)?;
             // For container initProcess, if it hasn't installed handler for "SIGTERM" signal,
             // it will ignore the "SIGTERM" signal sent to it, thus send it "SIGKILL" signal
             // instead of "SIGTERM" to terminate it.
@@ -571,7 +595,7 @@ impl AgentService {
         req: protocols::agent::WaitProcessRequest,
     ) -> Result<protocols::agent::WaitProcessResponse> {
         let cid = req.container_id;
-        let eid = req.exec_id;
+        let mut eid = req.exec_id;
         let mut resp = WaitProcessResponse::new();
 
         info!(
@@ -585,7 +609,9 @@ impl AgentService {
         let (exit_send, mut exit_recv) = tokio::sync::mpsc::channel(100);
         let exit_rx = {
             let mut sandbox = self.sandbox.lock().await;
-            let p = sandbox.find_container_process(cid.as_str(), eid.as_str())?;
+            let p = sandbox
+                .find_container_process(cid.as_str(), eid.as_str())
+                .map_err(sandbox_err_to_ttrpc)?;
 
             p.exit_watchers.push(exit_send);
             pid = p.pid;
@@ -604,7 +630,7 @@ impl AgentService {
             .get_container(&cid)
             .ok_or_else(|| anyhow!("Invalid container id"))?;
 
-        let p = match ctr.processes.get_mut(&pid) {
+        let p = match ctr.processes.values_mut().find(|p| p.pid == pid) {
             Some(p) => p,
             None => {
                 // Lost race, pick up exit code from channel
@@ -617,6 +643,8 @@ impl AgentService {
             }
         };
 
+        eid = p.exec_id.clone();
+
         // need to close all fd
         // ignore errors for some fd might be closed by stream
         p.cleanup_process_stream();
@@ -628,8 +656,71 @@ impl AgentService {
             let _ = s.send(p.exit_code).await;
         }
 
-        ctr.processes.remove(&pid);
+        ctr.processes.remove(&eid);
 
+        Ok(resp)
+    }
+
+    async fn do_read_termination_log(
+        &self,
+        container_id: &str,
+    ) -> Result<protocols::agent::GetDiagnosticDataResponse> {
+        let host_path = {
+            let sandbox = self.sandbox.lock().await;
+            let ctr = sandbox
+                .containers
+                .get(container_id)
+                .ok_or_else(|| anyhow!("Invalid container id: {}", container_id))?;
+
+            let spec = ctr
+                .config
+                .spec
+                .as_ref()
+                .ok_or_else(|| anyhow!("No OCI spec for container {}", container_id))?;
+
+            let annotations = spec.annotations().as_ref();
+            let termination_path = annotations
+                .and_then(|a| a.get("io.kubernetes.container.terminationMessagePath"))
+                .ok_or_else(|| anyhow!("No terminationMessagePath annotation"))?;
+
+            // The path is the *container* destination (e.g. /dev/termination-log). The agent
+            // runs outside the container mount namespace; the file is on the guest at the
+            // bind-mount source (e.g. /run/kata-containers/shared/containers/...-termination-log).
+            let term_dest = Path::new(termination_path.as_str());
+            spec.mounts()
+                .as_ref()
+                .and_then(|mounts| {
+                    mounts.iter().find_map(|m| {
+                        if m.destination() == term_dest {
+                            m.source().clone()
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .ok_or_else(|| {
+                    anyhow!(
+                        "termination message mount not found for {}",
+                        termination_path
+                    )
+                })?
+        };
+
+        // Kubernetes caps termination messages at 4 KiB; read raw bytes with
+        // the same limit so a malicious workload cannot exhaust agent memory,
+        // and handle non-UTF-8 content gracefully.
+        const MAX_TERMINATION_MSG: usize = 4096;
+        let contents = match tokio::fs::read(&host_path).await {
+            Ok(mut buf) => {
+                buf.truncate(MAX_TERMINATION_MSG);
+                String::from_utf8_lossy(&buf).into_owned()
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(anyhow!("Failed to read termination log: {}", e)),
+        };
+
+        let mut resp = protocols::agent::GetDiagnosticDataResponse::new();
+        resp.data = contents;
         Ok(resp)
     }
 
@@ -671,16 +762,18 @@ impl AgentService {
 
     async fn do_read_stream(
         &self,
-        req: protocols::agent::ReadStreamRequest,
+        req: &protocols::agent::ReadStreamRequest,
         stdout: bool,
     ) -> Result<protocols::agent::ReadStreamResponse> {
-        let cid = req.container_id;
-        let eid = req.exec_id;
+        let cid = &req.container_id;
+        let eid = &req.exec_id;
 
         let term_exit_notifier;
         let reader = {
             let mut sandbox = self.sandbox.lock().await;
-            let p = sandbox.find_container_process(cid.as_str(), eid.as_str())?;
+            let p = sandbox
+                .find_container_process(cid.as_str(), eid.as_str())
+                .map_err(sandbox_err_to_ttrpc)?;
 
             term_exit_notifier = p.term_exit_notifier.clone();
 
@@ -699,25 +792,99 @@ impl AgentService {
 
         let reader = reader.ok_or_else(|| anyhow!("cannot get stream reader"))?;
 
-        tokio::select! {
-            // Poll the futures in the order they appear from top to bottom
-            // it is very important to avoid data loss. If there is still
-            // data in the buffer and read_stream branch will return
-            // Poll::Ready so that the term_exit_notifier will never polled
-            // before all data were read.
+        // Create one in-flight read future and reuse it in both branches.
+        let read_fut = read_stream(&reader, req.len as usize);
+        tokio::pin!(read_fut);
+
+        // Cancellation and polling model: Rust async is polled, not preempted.
+        // `Future::poll()` is a synchronous function call that runs to completion and
+        // returns Ready or Pending (`std::future::Future`).
+        // Readiness notifications (Waker::wake / Tokio Notify) only schedule the task
+        // to be polled again later; they do not interrupt an in-progress poll.
+        // Therefore, a Notify becoming ready while `poll_read()` is executing cannot cause
+        // the read future to be dropped mid-way; cancellation can only happen when the branch
+        // is still pending between polls (Tokio `select!` cancels by dropping non-selected futures).
+        // Detailed information, please refer to Tokio doc for more information:
+        // - Future::poll: https://doc.rust-lang.org/std/future/trait.Future.html
+        // - Waker: https://doc.rust-lang.org/std/task/struct.Waker.html
+        // - Tokio select!: https://docs.rs/tokio/latest/tokio/macro.select.html
+        let data = tokio::select! {
+            // Use `biased` to make the polling order deterministic (top-to-bottom).
+            // This ensures that *when multiple branches are ready at the same time*,
+            // we prefer reading pending output over reacting to the exit notification.
+            //
+            // Note: `biased` does NOT guarantee that we won't lose output. If the exit
+            // notification becomes ready while `read_stream` is still pending, the
+            // exit branch may be selected and we may stop reading before draining the
+            // remaining buffered data.
+            //
+            // Detailed information, please refer to Tokio doc for more information:
+            // https://docs.rs/tokio/latest/src/tokio/macros/select.rs.html#67
             biased;
-            v = read_stream(&reader, req.len as usize)  => {
-                let vector = v?;
 
-                let mut resp = ReadStreamResponse::new();
-                resp.set_data(vector);
-
-                Ok(resp)
-            }
+            v = &mut read_fut => v?,
             _ = term_exit_notifier.notified() => {
-                Err(anyhow!("eof"))
+                // Drain-after-exit rationale:
+                // The process has exited, but the data may still be buffered in the pipe/pty.
+                // We should keep waiting for the same in-flight read for a bounded window to drain the data.
+                //
+                // It enters this branch only if `term_exit_notifier.notified()` fires. It then try to "drain"
+                // any remaining buffered output for a short, bounded time window:
+                // - If non-empty data is read: return immediately.
+                // - else then return empty data as EOF.
+
+                const DRAIN_DEADLINE_MS: u64 = 500; // 500ms
+                let deadline = Duration::from_millis(DRAIN_DEADLINE_MS);
+
+                // Attempt to drain remaining buffered output after process exit
+                // Try reading with timeout
+                match timeout(deadline, &mut read_fut).await {
+                    Ok(v) => v?, // got data or EOF (empty)
+                    _ => {
+                        warn!(sl(), "exit-drain timeout, return EOF"; "container-id" => cid, "exec-id" => eid);
+                        Vec::new() // Return empty as EOF
+                    }
+                }
             }
-        }
+        };
+
+        let mut resp = ReadStreamResponse::new();
+        resp.set_data(data);
+
+        Ok(resp)
+    }
+}
+
+fn mem_agent_memcgconfig_to_memcg_optionconfig(
+    mc: &protocols::agent::MemAgentMemcgConfig,
+) -> mem_agent::memcg::OptionConfig {
+    mem_agent::memcg::OptionConfig {
+        default: mem_agent::memcg::SingleOptionConfig {
+            disabled: mc.disabled,
+            swap: mc.swap,
+            swappiness_max: mc.swappiness_max.map(|x| x as u8),
+            period_secs: mc.period_secs,
+            period_psi_percent_limit: mc.period_psi_percent_limit.map(|x| x as u8),
+            eviction_psi_percent_limit: mc.eviction_psi_percent_limit.map(|x| x as u8),
+            eviction_run_aging_count_min: mc.eviction_run_aging_count_min,
+        },
+        ..Default::default()
+    }
+}
+
+fn mem_agent_compactconfig_to_compact_optionconfig(
+    cc: &protocols::agent::MemAgentCompactConfig,
+) -> mem_agent::compact::OptionConfig {
+    mem_agent::compact::OptionConfig {
+        disabled: cc.disabled,
+        period_secs: cc.period_secs,
+        period_psi_percent_limit: cc.period_psi_percent_limit.map(|x| x as u8),
+        compact_psi_percent_limit: cc.compact_psi_percent_limit.map(|x| x as u8),
+        compact_sec_max: cc.compact_sec_max,
+        compact_order: cc.compact_order.map(|x| x as u8),
+        compact_threshold: cc.compact_threshold,
+        compact_force_times: cc.compact_force_times,
+        ..Default::default()
     }
 }
 
@@ -891,8 +1058,12 @@ impl agent_ttrpc::AgentService for AgentService {
         _ctx: &TtrpcContext,
         req: protocols::agent::ReadStreamRequest,
     ) -> ttrpc::Result<ReadStreamResponse> {
-        is_allowed(&req).await?;
-        self.do_read_stream(req, true).await.map_ttrpc_err(same)
+        let mut response = self.do_read_stream(&req, true).await.map_ttrpc_err(same)?;
+        if is_allowed(&req).await.is_err() {
+            // Policy does not allow reading logs, so we redact the log messages.
+            response.clear_data();
+        }
+        Ok(response)
     }
 
     async fn read_stderr(
@@ -900,8 +1071,12 @@ impl agent_ttrpc::AgentService for AgentService {
         _ctx: &TtrpcContext,
         req: protocols::agent::ReadStreamRequest,
     ) -> ttrpc::Result<ReadStreamResponse> {
-        is_allowed(&req).await?;
-        self.do_read_stream(req, false).await.map_ttrpc_err(same)
+        let mut response = self.do_read_stream(&req, false).await.map_ttrpc_err(same)?;
+        if is_allowed(&req).await.is_err() {
+            // Policy does not allow reading logs, so we redact the log messages.
+            response.clear_data();
+        }
+        Ok(response)
     }
 
     async fn close_stdin(
@@ -921,12 +1096,7 @@ impl agent_ttrpc::AgentService for AgentService {
 
         let p = sandbox
             .find_container_process(cid.as_str(), eid.as_str())
-            .map_err(|e| {
-                ttrpc_error(
-                    ttrpc::Code::INVALID_ARGUMENT,
-                    format!("invalid argument: {:?}", e),
-                )
-            })?;
+            .map_err(sandbox_err_to_ttrpc)?;
 
         p.close_stdin().await;
 
@@ -944,12 +1114,7 @@ impl agent_ttrpc::AgentService for AgentService {
         let mut sandbox = self.sandbox.lock().await;
         let p = sandbox
             .find_container_process(req.container_id(), req.exec_id())
-            .map_err(|e| {
-                ttrpc_error(
-                    ttrpc::Code::UNAVAILABLE,
-                    format!("invalid argument: {:?}", e),
-                )
-            })?;
+            .map_err(sandbox_err_to_ttrpc)?;
 
         let fd = p
             .term_master
@@ -964,7 +1129,7 @@ impl agent_ttrpc::AgentService for AgentService {
         let err = unsafe { libc::ioctl(fd, TIOCSWINSZ, &win) };
         Errno::result(err)
             .map(drop)
-            .map_ttrpc_err(|e| format!("ioctl error: {:?}", e))?;
+            .map_ttrpc_err(|e| format!("ioctl error: {e:?}"))?;
 
         Ok(Empty::new())
     }
@@ -982,24 +1147,79 @@ impl agent_ttrpc::AgentService for AgentService {
             "empty update interface request",
         )?;
 
-        // For network devices passed on the pci bus, check for the network interface
+        // For network devices passed, check for the network interface
         // to be available first.
-        if !interface.pciPath.is_empty() {
-            let pcipath = pci::Path::from_str(&interface.pciPath)
-                .map_ttrpc_err(|e| format!("Unexpected pci-path for network interface: {:?}", e))?;
-
-            wait_for_net_interface(&self.sandbox, &pcipath)
-                .await
-                .map_ttrpc_err(|e| format!("interface not available: {:?}", e))?;
+        if !interface.devicePath.is_empty() {
+            #[cfg(not(target_arch = "s390x"))]
+            {
+                let (root_complex, pcipath) = pcipath_from_dev_tree_path(&interface.devicePath)
+                    .map_ttrpc_err(|e| {
+                        format!("Invalid PCI path for network interface: {:?}", e)
+                    })?;
+                wait_for_pci_net_interface(&self.sandbox, root_complex, &pcipath)
+                    .await
+                    .map_ttrpc_err(|e| format!("interface not available: {e:?}"))?;
+            }
+            #[cfg(target_arch = "s390x")]
+            {
+                let ccw_dev = ccw::Device::from_str(&interface.devicePath).map_ttrpc_err(|e| {
+                    format!("Unexpected CCW path for network interface: {e:?}")
+                })?;
+                wait_for_ccw_net_interface(&self.sandbox, &ccw_dev)
+                    .await
+                    .map_ttrpc_err(|e| format!("interface not available: {e:?}"))?;
+            }
         }
 
-        self.sandbox
-            .lock()
-            .await
+        let mut sandbox = self.sandbox.lock().await;
+
+        #[cfg(not(target_arch = "s390x"))]
+        if !interface.devicePath.is_empty() && !interface.hwAddr.is_empty() {
+            match sandbox
+                .rtnl
+                .netdev_name_from_pci_path(&interface.devicePath)
+            {
+                Ok(Some(netdev_name)) => {
+                    if let Err(err) = sandbox
+                        .rtnl
+                        .set_link_mac_by_name(&netdev_name, &interface.hwAddr)
+                        .await
+                    {
+                        warn!(
+                            sl(),
+                            "update_interface: VFIO MAC reconciliation failed, fallback to by-MAC lookup";
+                            "device-path" => interface.devicePath.as_str(),
+                            "target-mac" => interface.hwAddr.as_str(),
+                            "netdev" => netdev_name.as_str(),
+                            "error" => format!("{:?}", err),
+                        );
+                    }
+                }
+                Ok(None) => {
+                    info!(
+                        sl(),
+                        "update_interface: no netdev found for PCI path before by-MAC lookup";
+                        "device-path" => interface.devicePath.as_str(),
+                        "target-mac" => interface.hwAddr.as_str(),
+                    );
+                }
+                Err(err) => {
+                    warn!(
+                        sl(),
+                        "update_interface: unable to resolve netdev from PCI path, fallback to by-MAC lookup";
+                        "device-path" => interface.devicePath.as_str(),
+                        "target-mac" => interface.hwAddr.as_str(),
+                        "error" => format!("{:?}", err),
+                    );
+                }
+            }
+        }
+
+        sandbox
             .rtnl
             .update_interface(&interface)
             .await
-            .map_ttrpc_err(|e| format!("update interface: {:?}", e))?;
+            .map_ttrpc_err(|e| format!("update interface: {e:?}"))?;
 
         Ok(interface)
     }
@@ -1024,13 +1244,13 @@ impl agent_ttrpc::AgentService for AgentService {
             .rtnl
             .update_routes(new_routes)
             .await
-            .map_ttrpc_err(|e| format!("Failed to update routes: {:?}", e))?;
+            .map_ttrpc_err(|e| format!("Failed to update routes: {e:?}"))?;
 
         let list = sandbox
             .rtnl
             .list_routes()
             .await
-            .map_ttrpc_err(|e| format!("Failed to list routes after update: {:?}", e))?;
+            .map_ttrpc_err(|e| format!("Failed to list routes after update: {e:?}"))?;
 
         Ok(protocols::agent::Routes {
             Routes: list,
@@ -1048,7 +1268,7 @@ impl agent_ttrpc::AgentService for AgentService {
 
         update_ephemeral_mounts(sl(), &req.storages, &self.sandbox)
             .await
-            .map_ttrpc_err(|e| format!("Failed to update mounts: {:?}", e))?;
+            .map_ttrpc_err(|e| format!("Failed to update mounts: {e:?}"))?;
         Ok(Empty::new())
     }
 
@@ -1199,7 +1419,7 @@ impl agent_ttrpc::AgentService for AgentService {
             .rtnl
             .list_interfaces()
             .await
-            .map_ttrpc_err(|e| format!("Failed to list interfaces: {:?}", e))?;
+            .map_ttrpc_err(|e| format!("Failed to list interfaces: {e:?}"))?;
 
         Ok(protocols::agent::Interfaces {
             Interfaces: list,
@@ -1222,7 +1442,7 @@ impl agent_ttrpc::AgentService for AgentService {
             .rtnl
             .list_routes()
             .await
-            .map_ttrpc_err(|e| format!("list routes: {:?}", e))?;
+            .map_ttrpc_err(|e| format!("list routes: {e:?}"))?;
 
         Ok(protocols::agent::Routes {
             Routes: list,
@@ -1339,7 +1559,7 @@ impl agent_ttrpc::AgentService for AgentService {
             .rtnl
             .add_arp_neighbors(neighs)
             .await
-            .map_ttrpc_err(|e| format!("Failed to add ARP neighbours: {:?}", e))?;
+            .map_ttrpc_err(|e| format!("Failed to add ARP neighbours: {e:?}"))?;
 
         Ok(Empty::new())
     }
@@ -1432,6 +1652,15 @@ impl agent_ttrpc::AgentService for AgentService {
         req: protocols::agent::CopyFileRequest,
     ) -> ttrpc::Result<Empty> {
         trace_rpc_call!(ctx, "copy_file", req);
+        #[cfg(feature = "agent-policy")]
+        {
+            let req_for_policy: PolicyCopyFileRequest = (&req)
+                .try_into()
+                .context("parsing CopyFileRequest for policy")
+                .map_ttrpc_err(same)?;
+            is_allowed_with_entrypoint(req.descriptor_dyn().name(), &req_for_policy).await?;
+        }
+        #[cfg(not(feature = "agent-policy"))]
         is_allowed(&req).await?;
 
         do_copy_file(&req).map_ttrpc_err(same)?;
@@ -1459,10 +1688,11 @@ impl agent_ttrpc::AgentService for AgentService {
         req: protocols::agent::GetOOMEventRequest,
     ) -> ttrpc::Result<OOMEvent> {
         is_allowed(&req).await?;
-        let s = self.sandbox.lock().await;
-        let event_rx = &s.event_rx.clone();
+        let event_rx = {
+            let s = self.sandbox.lock().await;
+            s.event_rx.clone()
+        };
         let mut event_rx = event_rx.lock().await;
-        drop(s);
 
         let container_id = event_rx
             .recv()
@@ -1524,6 +1754,19 @@ impl agent_ttrpc::AgentService for AgentService {
         Ok(Empty::new())
     }
 
+    async fn add_swap_path(
+        &self,
+        ctx: &TtrpcContext,
+        req: protocols::agent::AddSwapPathRequest,
+    ) -> ttrpc::Result<Empty> {
+        trace_rpc_call!(ctx, "add_swap_path", req);
+        is_allowed(&req).await?;
+
+        do_add_swap_path(&req).await.map_ttrpc_err(same)?;
+
+        Ok(Empty::new())
+    }
+
     #[cfg(feature = "agent-policy")]
     async fn set_policy(
         &self,
@@ -1534,6 +1777,74 @@ impl agent_ttrpc::AgentService for AgentService {
 
         do_set_policy(&req).await?;
 
+        Ok(Empty::new())
+    }
+
+    async fn get_diagnostic_data(
+        &self,
+        ctx: &TtrpcContext,
+        req: protocols::agent::GetDiagnosticDataRequest,
+    ) -> ttrpc::Result<protocols::agent::GetDiagnosticDataResponse> {
+        trace_rpc_call!(ctx, "get_diagnostic_data", req);
+        is_allowed(&req).await?;
+
+        match req.log_type.as_str() {
+            "termination_log" => self
+                .do_read_termination_log(&req.container_id)
+                .await
+                .map_ttrpc_err(same),
+            other => Err(ttrpc_error(
+                ttrpc::Code::INVALID_ARGUMENT,
+                format!("unsupported diagnostic log_type: {other}"),
+            )),
+        }
+    }
+
+    async fn mem_agent_memcg_set(
+        &self,
+        _ctx: &::ttrpc::r#async::TtrpcContext,
+        config: protocols::agent::MemAgentMemcgConfig,
+    ) -> ::ttrpc::Result<Empty> {
+        if let Some(ma) = &self.oma {
+            ma.memcg_set_config_async(mem_agent_memcgconfig_to_memcg_optionconfig(&config))
+                .await
+                .map_err(|e| {
+                    let estr = format!("ma.memcg_set_config_async fail: {e}");
+                    error!(sl(), "{}", estr);
+                    ttrpc::Error::RpcStatus(ttrpc::get_status(ttrpc::Code::INTERNAL, estr))
+                })?;
+        } else {
+            let estr = "mem-agent is disabled";
+            error!(sl(), "{}", estr);
+            return Err(ttrpc::Error::RpcStatus(ttrpc::get_status(
+                ttrpc::Code::INTERNAL,
+                estr,
+            )));
+        }
+        Ok(Empty::new())
+    }
+
+    async fn mem_agent_compact_set(
+        &self,
+        _ctx: &::ttrpc::r#async::TtrpcContext,
+        config: protocols::agent::MemAgentCompactConfig,
+    ) -> ::ttrpc::Result<Empty> {
+        if let Some(ma) = &self.oma {
+            ma.compact_set_config_async(mem_agent_compactconfig_to_compact_optionconfig(&config))
+                .await
+                .map_err(|e| {
+                    let estr = format!("ma.compact_set_config_async fail: {e}");
+                    error!(sl(), "{}", estr);
+                    ttrpc::Error::RpcStatus(ttrpc::get_status(ttrpc::Code::INTERNAL, estr))
+                })?;
+        } else {
+            let estr = "mem-agent is disabled";
+            error!(sl(), "{}", estr);
+            return Err(ttrpc::Error::RpcStatus(ttrpc::get_status(
+                ttrpc::Code::INTERNAL,
+                estr,
+            )));
+        }
         Ok(Empty::new())
     }
 }
@@ -1668,10 +1979,6 @@ async fn read_stream(reader: &Mutex<ReadHalf<PipeStream>>, l: usize) -> Result<V
     let len = reader.read(&mut content).await?;
     content.resize(len, 0);
 
-    if len == 0 {
-        return Err(anyhow!("read meet eof"));
-    }
-
     Ok(content)
 }
 
@@ -1679,18 +1986,17 @@ pub async fn start(
     s: Arc<Mutex<Sandbox>>,
     server_address: &str,
     init_mode: bool,
+    oma: Option<mem_agent::agent::MemAgent>,
 ) -> Result<TtrpcServer> {
     let agent_service = Box::new(AgentService {
         sandbox: s,
         init_mode,
-    }) as Box<dyn agent_ttrpc::AgentService + Send + Sync>;
-    let aservice = agent_ttrpc::create_agent_service(Arc::new(agent_service));
+        oma,
+    });
+    let aservice = agent_ttrpc::create_agent_service(Arc::new(*agent_service));
 
-    let health_service = Box::new(HealthService {}) as Box<dyn health_ttrpc::Health + Send + Sync>;
-    let hservice = health_ttrpc::create_health(Arc::new(health_service));
-
-    #[cfg(feature = "guest-pull")]
-    image::init_image_service().await;
+    let health_service = Box::new(HealthService {});
+    let hservice = health_ttrpc::create_health(Arc::new(*health_service));
 
     let server = TtrpcServer::new()
         .bind(server_address)?
@@ -1726,13 +2032,19 @@ fn update_container_namespaces(
     if let Some(namespaces) = linux.namespaces_mut() {
         for namespace in namespaces.iter_mut() {
             if namespace.typ().to_string() == NSTYPEIPC {
-                namespace.set_path(Some(PathBuf::from(&sandbox.shared_ipcns.path.clone())));
-                namespace.set_path(None);
+                namespace.set_path(if !sandbox.shared_ipcns.path.is_empty() {
+                    Some(PathBuf::from(&sandbox.shared_ipcns.path))
+                } else {
+                    None
+                });
                 continue;
             }
             if namespace.typ().to_string() == NSTYPEUTS {
-                namespace.set_path(Some(PathBuf::from(&sandbox.shared_utsns.path.clone())));
-                namespace.set_path(None);
+                namespace.set_path(if !sandbox.shared_utsns.path.is_empty() {
+                    Some(PathBuf::from(&sandbox.shared_utsns.path))
+                } else {
+                    None
+                });
                 continue;
             }
         }
@@ -1750,7 +2062,7 @@ fn update_container_namespaces(
                 if !pidns.path.is_empty() {
                     pid_ns.set_path(Some(PathBuf::from(&pidns.path)));
                 }
-            } else {
+            } else if !sandbox.containers.is_empty() {
                 return Err(anyhow!(ERR_NO_SANDBOX_PIDNS));
             }
         }
@@ -1787,6 +2099,8 @@ async fn remove_container_resources(sandbox: &mut Sandbox, cid: &str) -> Result<
 
     sandbox.container_mounts.remove(cid);
     sandbox.containers.remove(cid);
+    // Remove any host -> guest mappings for this container
+    sandbox.pcimap.remove(cid);
     Ok(())
 }
 
@@ -1895,22 +2209,35 @@ fn do_copy_file(req: &CopyFileRequest) -> Result<()> {
         ));
     }
 
+    // Create parent directories if missing
     if let Some(parent) = path.parent() {
         if !parent.exists() {
             let dir = parent.to_path_buf();
+            // Attempt to create directory, ignore AlreadyExists errors
             if let Err(e) = fs::create_dir_all(&dir) {
                 if e.kind() != std::io::ErrorKind::AlreadyExists {
                     return Err(e.into());
                 }
-            } else {
-                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(req.dir_mode))?;
             }
+
+            // Set directory permissions and ownership
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(req.dir_mode))?;
+            unistd::chown(
+                &dir,
+                Some(Uid::from_raw(req.uid as u32)),
+                Some(Gid::from_raw(req.gid as u32)),
+            )?;
         }
     }
 
     let sflag = stat::SFlag::from_bits_truncate(req.file_mode);
 
     if sflag.contains(stat::SFlag::S_IFDIR) {
+        // Remove existing non-directory file if present
+        if path.exists() && !path.is_dir() {
+            fs::remove_file(&path)?;
+        }
+
         fs::create_dir(&path).or_else(|e| {
             if e.kind() != std::io::ErrorKind::AlreadyExists {
                 return Err(e);
@@ -1929,16 +2256,27 @@ fn do_copy_file(req: &CopyFileRequest) -> Result<()> {
         return Ok(());
     }
 
+    // Handle symlink creation
     if sflag.contains(stat::SFlag::S_IFLNK) {
-        // After kubernetes secret's volume update, the '..data' symlink should point to
-        // the new timestamped directory.
-        // TODO:The old and deleted timestamped dir still exists due to missing DELETE api in agent.
-        // Hence, Unlink the existing symlink.
-        if path.is_symlink() && path.exists() {
-            unistd::unlink(&path)?;
+        // Clean up existing path (whether symlink, dir, or file)
+        if path.exists() || path.is_symlink() {
+            // Use appropriate removal method based on path type
+            if path.is_symlink() {
+                unistd::unlink(&path)?;
+            } else if path.is_dir() {
+                fs::remove_dir_all(&path)?;
+            } else {
+                fs::remove_file(&path)?;
+            }
         }
-        let src = PathBuf::from(OsStr::from_bytes(&req.data));
-        unistd::symlinkat(&src, None, &path)?;
+
+        // Create new symbolic link
+        let symlink_target = PathBuf::from(OsStr::from_bytes(&req.data));
+        // Use BorrowedFd to wrap AT_FDCWD for symlinkat
+        let cwd_fd = unsafe { BorrowedFd::borrow_raw(libc::AT_FDCWD) };
+        unistd::symlinkat(&symlink_target, cwd_fd, &path)?;
+
+        // Set symlink ownership (permissions not supported for symlinks)
         let path_str = CString::new(path.as_os_str().as_bytes())?;
 
         let ret = unsafe { libc::lchown(path_str.as_ptr(), req.uid as u32, req.gid as u32) };
@@ -1953,7 +2291,7 @@ fn do_copy_file(req: &CopyFileRequest) -> Result<()> {
     let file = OpenOptions::new()
         .write(true)
         .create(true)
-        .truncate(false)
+        .truncate(req.offset == 0) // Only truncate when offset is 0
         .open(&tmpfile)?;
 
     file.write_all_at(req.data.as_slice(), req.offset as u64)?;
@@ -1971,6 +2309,15 @@ fn do_copy_file(req: &CopyFileRequest) -> Result<()> {
         Some(Gid::from_raw(req.gid as u32)),
     )?;
 
+    // Remove existing target path before rename
+    if path.exists() || path.is_symlink() {
+        if path.is_dir() {
+            fs::remove_dir_all(&path)?;
+        } else {
+            fs::remove_file(&path)?;
+        }
+    }
+
     fs::rename(tmpfile, path)?;
 
     Ok(())
@@ -1982,9 +2329,24 @@ async fn do_add_swap(sandbox: &Arc<Mutex<Sandbox>>, req: &AddSwapRequest) -> Res
         slots.push(pci::SlotFn::new(*slot, 0)?);
     }
     let pcipath = pci::Path::new(slots)?;
-    let dev_name = get_virtio_blk_pci_device_name(sandbox, &pcipath).await?;
+    // Default all virtio devices to root_complex 00 aka pcie.0
+    let root_complex = "00";
+    let dev_name = get_virtio_blk_pci_device_name(sandbox, root_complex, &pcipath).await?;
 
     let c_str = CString::new(dev_name)?;
+    let ret = unsafe { libc::swapon(c_str.as_ptr() as *const c_char, 0) };
+    if ret != 0 {
+        return Err(anyhow!(
+            "libc::swapon get error {}",
+            io::Error::last_os_error()
+        ));
+    }
+
+    Ok(())
+}
+
+async fn do_add_swap_path(req: &AddSwapPathRequest) -> Result<()> {
+    let c_str = CString::new(req.path.clone())?;
     let ret = unsafe { libc::swapon(c_str.as_ptr() as *const c_char, 0) };
     if ret != 0 {
         return Err(anyhow!(
@@ -2083,14 +2445,161 @@ fn load_kernel_module(module: &protocols::agent::KernelModule) -> Result<()> {
         Some(code) => {
             let std_out = String::from_utf8_lossy(&output.stdout);
             let std_err = String::from_utf8_lossy(&output.stderr);
-            let msg = format!(
-                "load_kernel_module return code: {} stdout:{} stderr:{}",
-                code, std_out, std_err
-            );
+            let msg =
+                format!("load_kernel_module return code: {code} stdout:{std_out} stderr:{std_err}");
             Err(anyhow!(msg))
         }
         None => Err(anyhow!("Process terminated by signal")),
     }
+}
+
+fn is_sealed_secret_path(source_path: &str) -> bool {
+    // Base path to check
+    let base_path = "/run/kata-containers/shared/containers";
+    // Paths to exclude
+    let excluded_suffixes = [
+        "resolv.conf",
+        "termination-log",
+        "hostname",
+        "hosts",
+        "serviceaccount",
+    ];
+
+    // Ensure the path starts with the base path and does not end with any excluded suffix
+    source_path.starts_with(base_path)
+        && !excluded_suffixes
+            .iter()
+            .any(|suffix| source_path.ends_with(suffix))
+}
+
+async fn cdh_handler_trusted_storage(oci: &mut Spec) -> Result<()> {
+    let linux = oci
+        .linux()
+        .as_ref()
+        .ok_or_else(|| anyhow!("Spec didn't contain linux field"))?;
+
+    if let Some(devices) = linux.devices() {
+        for specdev in devices.iter() {
+            if specdev.path().as_path().to_str() == Some(TRUSTED_IMAGE_STORAGE_DEVICE) {
+                let dev_major_minor = format!("{}:{}", specdev.major(), specdev.minor());
+                cdh_secure_mount(
+                    "block-device",
+                    &dev_major_minor,
+                    "luks2",
+                    KATA_IMAGE_WORK_DIR,
+                    "-E lazy_journal_init",
+                )
+                .await?;
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) async fn cdh_secure_mount(
+    device_type: &str,
+    device_id: &str,
+    encrypt_type: &str,
+    mount_point: &str,
+    mkfs_opts: &str,
+) -> Result<()> {
+    if !confidential_data_hub::is_cdh_client_initialized() {
+        return Ok(());
+    }
+
+    let integrity = AGENT_CONFIG.secure_storage_integrity.to_string();
+
+    info!(
+        sl(),
+        "cdh_secure_mount: device_type {}, device_id {}, encrypt_type {}, integrity {}, mkfs_opts {}",
+        device_type,
+        device_id,
+        encrypt_type,
+        integrity,
+        mkfs_opts
+    );
+
+    let options = std::collections::HashMap::from([
+        ("deviceId".to_string(), device_id.to_string()),
+        ("sourceType".to_string(), "empty".to_string()),
+        ("targetType".to_string(), "fileSystem".to_string()),
+        ("filesystemType".to_string(), "ext4".to_string()),
+        ("mkfsOpts".to_string(), mkfs_opts.to_string()),
+        ("encryptionType".to_string(), encrypt_type.to_string()),
+        ("dataIntegrity".to_string(), integrity),
+    ]);
+
+    std::fs::create_dir_all(mount_point).inspect_err(|e| {
+        error!(
+            sl(),
+            "Failed to create mount point directory {}: {:?}", mount_point, e
+        );
+    })?;
+
+    confidential_data_hub::secure_mount(device_type, &options, vec![], mount_point).await?;
+
+    Ok(())
+}
+
+async fn cdh_handler_sealed_secrets(oci: &mut Spec) -> Result<()> {
+    if !confidential_data_hub::is_cdh_client_initialized() {
+        return Ok(());
+    }
+    let process = oci
+        .process_mut()
+        .as_mut()
+        .ok_or_else(|| anyhow!("Spec didn't contain process field"))?;
+    if let Some(envs) = process.env_mut().as_mut() {
+        for env in envs.iter_mut() {
+            match confidential_data_hub::unseal_env(env).await {
+                Ok(unsealed_env) => *env = unsealed_env.to_string(),
+                Err(e) => {
+                    warn!(sl(), "Failed to unseal secret: {}", e)
+                }
+            }
+        }
+    }
+
+    let mounts = oci
+        .mounts_mut()
+        .as_mut()
+        .ok_or_else(|| anyhow!("Spec didn't contain mounts field"))?;
+
+    for m in mounts.iter_mut() {
+        let Some(source_path) = m.source().as_ref().and_then(|p| p.to_str()) else {
+            warn!(sl(), "Mount source is None or invalid");
+            continue;
+        };
+
+        // Check if source_path starts with "/run/kata-containers/shared/containers"
+        // For a volume mount path /mydir,
+        // the secret file path will be like this under the /run/kata-containers/shared/containers dir
+        // a128482812bad768f404e063f225decd425fc94a673aec4add45a9caa1122ccb-75490e32e51da3ff-mydir
+        // We can ignore few paths like: resolv.conf, termination-log, hostname,hosts,serviceaccount
+        if is_sealed_secret_path(source_path) {
+            debug!(
+                sl(),
+                "Calling unseal_file for - source: {:?} destination: {:?}",
+                source_path,
+                m.destination()
+            );
+            // Call unseal_file. This function checks the files under the source_path
+            // for the sealed secret header and unseal it if the header is present.
+            // This is suboptimal as we are going through every file under the source_path.
+            // But currently there is no quick way to determine which volume-mount is referring
+            // to a sealed secret without reading the file.
+            // And relying on file naming heuristic is inflexible. So we are going with this approach.
+            if let Err(e) = confidential_data_hub::unseal_file(source_path).await {
+                warn!(
+                    sl(),
+                    "Failed to unseal file: {:?}, Error: {:?}", source_path, e
+                );
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2148,7 +2657,7 @@ mod tests {
         let cgroups_path = format!(
             "/{}/dummycontainer{}",
             CGROUP_PARENT,
-            since_the_epoch.as_millis()
+            since_the_epoch.as_micros()
         );
 
         let spec = SpecBuilder::default()
@@ -2212,6 +2721,26 @@ mod tests {
         // normally this module should eixsts...
         m.name = "bridge".to_string();
         let result = load_kernel_module(&m);
+
+        // Skip test if loading kernel modules is not permitted
+        // or kernel module is not found
+        if let Err(e) = &result {
+            let error_string = format!("{e:?}");
+            // Let's print out the error message first
+            println!("DEBUG: error: {error_string}");
+            if error_string.contains("Operation not permitted")
+                || error_string.contains("EPERM")
+                || error_string.contains("Permission denied")
+            {
+                println!("INFO: skipping test - loading kernel modules is not permitted in this environment");
+                return;
+            }
+            if error_string.contains("not found") {
+                println!("INFO: skipping test - kernel module is not found in this environment");
+                return;
+            }
+        }
+
         assert!(result.is_ok(), "load module should success");
     }
 
@@ -2241,6 +2770,7 @@ mod tests {
         let agent_service = Box::new(AgentService {
             sandbox: Arc::new(Mutex::new(sandbox)),
             init_mode: true,
+            oma: None,
         });
 
         let req = protocols::agent::UpdateInterfaceRequest::default();
@@ -2258,6 +2788,7 @@ mod tests {
         let agent_service = Box::new(AgentService {
             sandbox: Arc::new(Mutex::new(sandbox)),
             init_mode: true,
+            oma: None,
         });
 
         let req = protocols::agent::UpdateRoutesRequest::default();
@@ -2275,6 +2806,7 @@ mod tests {
         let agent_service = Box::new(AgentService {
             sandbox: Arc::new(Mutex::new(sandbox)),
             init_mode: true,
+            oma: None,
         });
 
         let req = protocols::agent::AddARPNeighborsRequest::default();
@@ -2337,12 +2869,12 @@ mod tests {
             },
             TestData {
                 create_container: false,
-                result: Err(anyhow!(crate::sandbox::ERR_INVALID_CONTAINER_ID)),
+                result: Err(anyhow!(crate::sandbox::SandboxError::InvalidContainerId)),
                 ..Default::default()
             },
             TestData {
                 container_id: "8181",
-                result: Err(anyhow!(crate::sandbox::ERR_INVALID_CONTAINER_ID)),
+                result: Err(anyhow!(crate::sandbox::SandboxError::InvalidContainerId)),
                 ..Default::default()
             },
             TestData {
@@ -2353,23 +2885,21 @@ mod tests {
                 }),
                 ..Default::default()
             },
-            TestData {
-                has_fd: false,
-                result: Err(anyhow!(ERR_CANNOT_GET_WRITER)),
-                ..Default::default()
-            },
         ];
 
         for (i, d) in tests.iter().enumerate() {
-            let msg = format!("test[{}]: {:?}", i, d);
+            let msg = format!("test[{i}]: {d:?}");
 
             let logger = slog::Logger::root(slog::Discard, o!());
             let mut sandbox = Sandbox::new(&logger).unwrap();
 
             let (rfd, wfd) = unistd::pipe().unwrap();
-            if d.break_pipe {
-                unistd::close(rfd).unwrap();
-            }
+            let rfd = if d.break_pipe {
+                drop(rfd); // OwnedFd closes automatically on drop
+                None
+            } else {
+                Some(rfd)
+            };
 
             if d.create_container {
                 let (mut linux_container, _root) = create_linuxcontainer();
@@ -2387,13 +2917,14 @@ mod tests {
                 )
                 .unwrap();
 
-                let fd = {
-                    if d.has_fd {
-                        Some(wfd)
-                    } else {
-                        unistd::close(wfd).unwrap();
-                        None
-                    }
+                let fd = if d.has_fd {
+                    let raw_fd = wfd.as_raw_fd();
+                    std::mem::forget(wfd); // Prevent OwnedFd from closing the fd
+                    Some(raw_fd)
+                } else {
+                    // Let wfd drop naturally to close the fd
+                    drop(wfd);
+                    None
                 };
 
                 if d.has_tty {
@@ -2405,7 +2936,7 @@ mod tests {
                 }
                 linux_container
                     .processes
-                    .insert(exec_process_id, exec_process);
+                    .insert(exec_process.exec_id.clone(), exec_process);
 
                 sandbox.add_container(linux_container);
             }
@@ -2413,6 +2944,7 @@ mod tests {
             let agent_service = Box::new(AgentService {
                 sandbox: Arc::new(Mutex::new(sandbox)),
                 init_mode: true,
+                oma: None,
             });
 
             let result = agent_service
@@ -2424,14 +2956,12 @@ mod tests {
                 })
                 .await;
 
-            if !d.break_pipe {
-                unistd::close(rfd).unwrap();
-            }
+            drop(rfd);
             // XXX: Do not close wfd.
             // the fd will be closed on Process's dropping.
             // unistd::close(wfd).unwrap();
 
-            let msg = format!("{}, result: {:?}", msg, result);
+            let msg = format!("{msg}, result: {result:?}");
             assert_result!(d.result, result, msg);
         }
     }
@@ -2528,14 +3058,6 @@ mod tests {
                 ..Default::default()
             },
             TestData {
-                namespaces: vec![],
-                sandbox_pidns_path: None,
-                use_sandbox_pidns: true,
-                result: Err(anyhow!(ERR_NO_SANDBOX_PIDNS)),
-                expected_namespaces: vec![],
-                ..Default::default()
-            },
-            TestData {
                 has_linux_in_spec: false,
                 result: Err(anyhow!(ERR_NO_LINUX_FIELD)),
                 ..Default::default()
@@ -2543,7 +3065,7 @@ mod tests {
         ];
 
         for (i, d) in tests.iter().enumerate() {
-            let msg = format!("test[{}]: {:?}", i, d);
+            let msg = format!("test[{i}]: {d:?}");
 
             let logger = slog::Logger::root(slog::Discard, o!());
             let mut sandbox = Sandbox::new(&logger).unwrap();
@@ -2563,15 +3085,14 @@ mod tests {
 
             let result = update_container_namespaces(&sandbox, &mut oci, d.use_sandbox_pidns);
 
-            let msg = format!("{}, result: {:?}", msg, result);
+            let msg = format!("{msg}, result: {result:?}");
 
             assert_result!(d.result, result, msg);
             if let Some(linux) = oci.linux() {
                 assert_eq!(
                     d.expected_namespaces,
                     linux.namespaces().clone().unwrap(),
-                    "{}",
-                    msg
+                    "{msg}"
                 );
             }
         }
@@ -2664,7 +3185,7 @@ mod tests {
         ];
 
         for (i, d) in tests.iter().enumerate() {
-            let msg = format!("test[{}]: {:?}", i, d);
+            let msg = format!("test[{i}]: {d:?}");
 
             let dir = tempdir().expect("failed to make tempdir");
             let block_size_path = dir.path().join("block_size_bytes");
@@ -2684,7 +3205,7 @@ mod tests {
                 hotplug_probe_path.to_str().unwrap(),
             );
 
-            let msg = format!("{}, result: {:?}", msg, result);
+            let msg = format!("{msg}, result: {result:?}");
 
             assert_result!(d.result, result, msg);
         }
@@ -2794,7 +3315,7 @@ OtherField:other
         ];
 
         for (i, d) in tests.iter().enumerate() {
-            let msg = format!("test[{}]: {:?}", i, d);
+            let msg = format!("test[{i}]: {d:?}");
 
             let dir = tempdir().expect("failed to make tempdir");
             let proc_status_file_path = dir.path().join("status");
@@ -2805,9 +3326,9 @@ OtherField:other
 
             let result = is_signal_handled(proc_status_file_path.to_str().unwrap(), d.signum);
 
-            let msg = format!("{}, result: {:?}", msg, result);
+            let msg = format!("{msg}, result: {result:?}");
 
-            assert_eq!(d.result, result, "{}", msg);
+            assert_eq!(d.result, result, "{msg}");
         }
     }
 
@@ -2911,6 +3432,7 @@ OtherField:other
         let agent_service = Box::new(AgentService {
             sandbox: Arc::new(Mutex::new(sandbox)),
             init_mode: true,
+            oma: None,
         });
 
         let ctx = mk_ttrpc_context();
@@ -3059,5 +3581,126 @@ COMMIT
                 .contains("INPUT -s 2001:db8:100::1/128 -i sit+ -p tcp -m tcp --sport 512:65535"),
             "We should see the resulting rule"
         );
+    }
+
+    #[tokio::test]
+    async fn test_is_sealed_secret_path() {
+        #[derive(Debug)]
+        struct TestData<'a> {
+            source_path: &'a str,
+            result: bool,
+        }
+
+        let tests = &[
+            TestData {
+                source_path: "/run/kata-containers/shared/containers/somefile",
+                result: true,
+            },
+            TestData {
+                source_path: "/run/kata-containers/shared/containers/a128482812bad768f404e063f225decd425fc94a673aec4add45a9caa1122ccb-75490e32e51da3ff-resolv.conf",
+                result: false,
+            },
+            TestData {
+                source_path: "/run/kata-containers/shared/containers/a128482812bad768f404e063f225decd425fc94a673aec4add45a9caa1122ccb-75490e32e51da3ff-termination-log",
+                result: false,
+            },
+            TestData {
+                source_path: "/run/kata-containers/shared/containers/a128482812bad768f404e063f225decd425fc94a673aec4add45a9caa1122ccb-75490e32e51da3ff-hostname",
+                result: false,
+            },
+            TestData {
+                source_path: "/run/kata-containers/shared/containers/a128482812bad768f404e063f225decd425fc94a673aec4add45a9caa1122ccb-75490e32e51da3ff-hosts",
+                result: false,
+            },
+            TestData {
+                source_path: "/run/kata-containers/shared/containers/a128482812bad768f404e063f225decd425fc94a673aec4add45a9caa1122ccb-75490e32e51da3ff-serviceaccount",
+                result: false,
+            },
+            TestData {
+                source_path: "/run/kata-containers/shared/containers/a128482812bad768f404e063f225decd425fc94a673aec4add45a9caa1122ccb-75490e32e51da3ff-mysecret",
+                result: true,
+            },
+            TestData {
+                source_path: "/some/other/path",
+                result: false,
+            },
+        ];
+
+        for (i, d) in tests.iter().enumerate() {
+            let msg = format!("test[{i}]: {d:?}");
+            let result = is_sealed_secret_path(d.source_path);
+            assert_eq!(d.result, result, "{msg}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_oom_event_no_deadlock() {
+        let logger = slog::Logger::root(slog::Discard, o!());
+        let sandbox = Sandbox::new(&logger).unwrap();
+
+        let agent_service = Arc::new(AgentService {
+            sandbox: Arc::new(Mutex::new(sandbox)),
+            init_mode: true,
+            oma: None,
+        });
+
+        let svc1 = agent_service.clone();
+        let handle1 = tokio::spawn(async move {
+            let ctx = mk_ttrpc_context();
+            let req = protocols::agent::GetOOMEventRequest::default();
+            svc1.get_oom_event(&ctx, req).await
+        });
+
+        // Yield until handler #1 has released the sandbox lock (entered recv()).
+        // Each yield_now() gives the spawned task a chance to make progress.
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                tokio::task::yield_now().await;
+                if agent_service.sandbox.try_lock().is_ok() {
+                    return;
+                }
+            }
+        })
+        .await
+        .expect("sandbox lock should be free while get_oom_event waits");
+
+        let svc2 = agent_service.clone();
+        let handle2 = tokio::spawn(async move {
+            let ctx = mk_ttrpc_context();
+            let req = protocols::agent::GetOOMEventRequest::default();
+            svc2.get_oom_event(&ctx, req).await
+        });
+
+        // Yield until handler #2 has also released the sandbox lock (entered recv()).
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                tokio::task::yield_now().await;
+                if agent_service.sandbox.try_lock().is_ok() {
+                    return;
+                }
+            }
+        })
+        .await
+        .expect("sandbox lock should be free with two concurrent get_oom_event handlers");
+
+        let tx = {
+            let s = agent_service.sandbox.lock().await;
+            s.event_tx.as_ref().unwrap().clone()
+        };
+        tx.send("container-1".to_string()).await.unwrap();
+        tx.send("container-2".to_string()).await.unwrap();
+
+        let result1 = tokio::time::timeout(std::time::Duration::from_secs(5), handle1).await;
+        let result2 = tokio::time::timeout(std::time::Duration::from_secs(5), handle2).await;
+
+        assert!(result1.is_ok(), "handler #1 timed out — possible deadlock");
+        assert!(result2.is_ok(), "handler #2 timed out — possible deadlock");
+
+        let resp1 = result1.unwrap().unwrap().unwrap();
+        let resp2 = result2.unwrap().unwrap().unwrap();
+
+        let mut ids: Vec<String> = vec![resp1.container_id, resp2.container_id];
+        ids.sort();
+        assert_eq!(ids, vec!["container-1", "container-2"]);
     }
 }

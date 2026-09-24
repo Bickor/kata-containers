@@ -9,8 +9,11 @@ set -o nounset
 set -o pipefail
 
 kata_tarball_dir="${2:-kata-artifacts}"
+export kata_tarball_dir
 kata_agent_apis_dir="$(dirname "$(readlink -f "$0")")"
+# shellcheck source=/dev/null
 source "${kata_agent_apis_dir}/../../common.bash"
+# shellcheck source=/dev/null
 source "${kata_agent_apis_dir}/../../gha-run-k8s-common.sh"
 
 function install_dependencies() {
@@ -18,8 +21,12 @@ function install_dependencies() {
 
 	# Dependency list of projects that we can rely on the system packages
 	# - jq
+	# - skopeo (for container image operations)
+	# - umoci (for OCI image unpacking)
 	declare -a deps=(
 		jq
+		skopeo
+		umoci
 	)
 
 	sudo apt-get update
@@ -30,7 +37,7 @@ function install_dependencies() {
 }
 
 function run() {
-	bash -c ${kata_agent_apis_dir}/run-agent-api-tests.sh
+	bash -c "${kata_agent_apis_dir}/run-agent-api-tests.sh"
 }
 
 function main() {
@@ -38,6 +45,7 @@ function main() {
 	case "${action}" in
 		install-dependencies) install_dependencies ;;
 		install-kata) install_kata ;;
+		install-kata-tools) install_kata_tools "${2:-}" ;;
 		run) run ;;
 		*) >&2 die "Invalid argument" ;;
 	esac

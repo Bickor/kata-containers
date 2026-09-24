@@ -3,11 +3,8 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 //
-
-use std::{
-    os::unix::prelude::{AsRawFd, FromRawFd},
-    time::Duration,
-};
+use std::os::unix::prelude::AsRawFd;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -31,53 +28,95 @@ impl Vsock {
 #[async_trait]
 impl Sock for Vsock {
     async fn connect(&self, config: &ConnectConfig) -> Result<Stream> {
-        let retry_times = config.reconnect_timeout_ms / config.dial_timeout_ms;
         let sock_addr = VsockAddr::new(self.vsock_cid, self.port);
-        let connect_once = || {
-            // Create socket fd
-            let socket = socket(
-                AddressFamily::Vsock,
-                SockType::Stream,
-                SockFlag::empty(),
-                None,
-            )
-            .context("failed to create vsock socket")?;
+        let deadline = Instant::now() + Duration::from_millis(config.reconnect_timeout_ms);
 
-            // Wrap the socket fd in a UnixStream, so that it is closed when
-            // anything fails.
-            // We MUST NOT reuse a vsock socket which has failed a connection
-            // attempt before, since a ECONNRESET error marks the whole socket as
-            // broken and non-reusable.
-            let socket = unsafe { std::os::unix::net::UnixStream::from_raw_fd(socket) };
+        let mut backoff = Duration::from_millis(config.dial_timeout_ms);
 
-            // Connect the socket to vsock server.
-            connect(socket.as_raw_fd(), &sock_addr)
-                .with_context(|| format!("failed to connect to {}", sock_addr))?;
+        let min_backoff = Duration::from_millis(10);
+        let max_backoff = Duration::from_millis(500);
+        if backoff < min_backoff {
+            backoff = min_backoff;
+        } else if backoff > max_backoff {
+            backoff = max_backoff;
+        }
 
-            // Finally, convert the std UnixSocket to tokio's UnixSocket.
-            UnixStream::from_std(socket).context("from_std")
-        };
+        let mut last_err: Option<anyhow::Error> = None;
+        let mut attempts: u64 = 0;
 
-        for i in 0..retry_times {
-            match connect_once() {
+        while Instant::now() < deadline {
+            attempts += 1;
+
+            let sa = sock_addr;
+            let res: Result<UnixStream> =
+                tokio::task::spawn_blocking(move || -> Result<UnixStream> {
+                    // Create socket fd
+                    let fd = socket(
+                        AddressFamily::Vsock,
+                        SockType::Stream,
+                        SockFlag::empty(),
+                        None,
+                    )
+                    .context("failed to create vsock socket")?;
+
+                    // Blocking connect (usually returns quickly for vsock)
+                    connect(fd.as_raw_fd(), &sa)
+                        .with_context(|| format!("failed to connect to {sa}"))?;
+
+                    // Wrap fd so it closes on error
+                    let socket = std::os::unix::net::UnixStream::from(fd);
+
+                    // Tokio requires non-blocking std socket before from_std()
+                    socket
+                        .set_nonblocking(true)
+                        .context("failed to set non-blocking")?;
+
+                    UnixStream::from_std(socket).context("from_std")
+                })
+                .await
+                .context("vsock: connect task join failed")?;
+
+            match res {
                 Ok(stream) => {
                     info!(
                         sl!(),
-                        "connect vsock success on {} current client fd {}",
-                        i,
-                        stream.as_raw_fd()
+                        "vsock: connected to {:?} after {} attempts", self, attempts
                     );
                     return Ok(Stream::Vsock(stream));
                 }
                 Err(e) => {
-                    debug!(sl!(), "retry after {} ms: failed to connect to agent via vsock at {} attempts: {:?}", config.dial_timeout_ms, i, e);
-                    tokio::time::sleep(Duration::from_millis(config.dial_timeout_ms)).await;
+                    last_err = Some(e);
+
+                    let now = Instant::now();
+                    if now >= deadline {
+                        break;
+                    }
+
+                    let remaining = deadline.saturating_duration_since(now);
+                    let sleep_dur = std::cmp::min(backoff, remaining);
+
+                    trace!(
+                        sl!(),
+                        "vsock: failed to connect to {:?}, attempts {}, retry after {:?}, err {:?}",
+                        self,
+                        attempts,
+                        sleep_dur,
+                        last_err.as_ref().unwrap(),
+                    );
+
+                    tokio::time::sleep(sleep_dur).await;
+
+                    backoff = std::cmp::min(backoff.saturating_mul(2), max_backoff);
                 }
             }
         }
+
         Err(anyhow!(
-            "cannot connect vsock to agent ttrpc server {:?}",
-            config
+            "vsock: failed to connect to {:?} within {:?} (attempts={}), last_err={:?}",
+            self,
+            Duration::from_millis(config.reconnect_timeout_ms),
+            attempts,
+            last_err
         ))
     }
 }

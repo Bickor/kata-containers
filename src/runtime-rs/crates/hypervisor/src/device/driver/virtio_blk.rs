@@ -13,16 +13,68 @@ use crate::device::DeviceType;
 use crate::Hypervisor as hypervisor;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+pub use kata_types::device::{
+    DRIVER_BLK_CCW_TYPE as KATA_CCW_DEV_TYPE, DRIVER_BLK_MMIO_TYPE as KATA_MMIO_BLK_DEV_TYPE,
+    DRIVER_BLK_PCI_TYPE as KATA_BLK_DEV_TYPE, DRIVER_NVDIMM_TYPE as KATA_NVDIMM_DEV_TYPE,
+    DRIVER_SCSI_TYPE as KATA_SCSI_DEV_TYPE,
+};
 
 /// VIRTIO_BLOCK_PCI indicates block driver is virtio-pci based
 pub const VIRTIO_BLOCK_PCI: &str = "virtio-blk-pci";
 pub const VIRTIO_BLOCK_MMIO: &str = "virtio-blk-mmio";
 pub const VIRTIO_BLOCK_CCW: &str = "virtio-blk-ccw";
 pub const VIRTIO_PMEM: &str = "virtio-pmem";
-pub const KATA_MMIO_BLK_DEV_TYPE: &str = "mmioblk";
-pub const KATA_BLK_DEV_TYPE: &str = "blk";
-pub const KATA_CCW_DEV_TYPE: &str = "ccw";
-pub const KATA_NVDIMM_DEV_TYPE: &str = "nvdimm";
+
+#[derive(Clone, Copy, Debug, Default)]
+pub enum BlockDeviceAio {
+    // IoUring is the Linux io_uring I/O implementation.
+    #[default]
+    IoUring,
+
+    // Native is the native Linux AIO implementation.
+    Native,
+
+    // Threads is the pthread asynchronous I/O implementation.
+    Threads,
+}
+
+impl BlockDeviceAio {
+    pub fn new(aio: &str) -> Self {
+        match aio {
+            "native" => BlockDeviceAio::Native,
+            "threads" => BlockDeviceAio::Threads,
+            _ => BlockDeviceAio::IoUring,
+        }
+    }
+}
+
+impl std::fmt::Display for BlockDeviceAio {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let to_string = match *self {
+            BlockDeviceAio::Native => "native".to_string(),
+            BlockDeviceAio::Threads => "threads".to_string(),
+            _ => "iouring".to_string(),
+        };
+        write!(f, "{to_string}")
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum BlockDeviceFormat {
+    #[default]
+    Raw,
+    Vmdk,
+}
+
+impl std::fmt::Display for BlockDeviceFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let to_string = match *self {
+            BlockDeviceFormat::Raw => "raw".to_string(),
+            BlockDeviceFormat::Vmdk => "vmdk".to_string(),
+        };
+        write!(f, "{to_string}")
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct BlockConfig {
@@ -36,8 +88,19 @@ pub struct BlockConfig {
     /// Don't close `path_on_host` file when dropping the device.
     pub no_drop: bool,
 
+    /// raw, vmdk, etc. And default to raw if not set.
+    pub format: BlockDeviceFormat,
+
+    /// Specifies cache-related options for block devices.
+    /// Denotes whether use of O_DIRECT (bypass the host page cache) is enabled.
+    /// If not set, use configurarion block_device_cache_direct.
+    pub is_direct: Option<bool>,
+
     /// device index
     pub index: u64,
+
+    /// blkdev_aio defines the type of asynchronous I/O the block device should use.
+    pub blkdev_aio: BlockDeviceAio,
 
     /// driver type for block device
     pub driver_option: String,
@@ -48,6 +111,13 @@ pub struct BlockConfig {
     /// pci path is the slot at which the drive is attached
     pub pci_path: Option<PciPath>,
 
+    /// scsi_addr of the block device, in case the device is attached using SCSI driver
+    /// scsi_addr is of the format SCSI-Id:LUN
+    pub scsi_addr: Option<String>,
+
+    /// CCW device address for virtio-blk-ccw on s390x (e.g., "0.0.0005")
+    pub ccw_addr: Option<String>,
+
     /// device attach count
     pub attach_count: u64,
 
@@ -56,6 +126,18 @@ pub struct BlockConfig {
 
     /// device minor number
     pub minor: i64,
+
+    /// virtio queue size. size: byte
+    pub queue_size: u32,
+
+    /// block device multi-queue
+    pub num_queues: usize,
+
+    /// Logical sector size in bytes reported to the guest. 0 means use hypervisor default.
+    pub logical_sector_size: u32,
+
+    /// Physical sector size in bytes reported to the guest. 0 means use hypervisor default.
+    pub physical_sector_size: u32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -94,7 +176,6 @@ impl Device for BlockDevice {
 
         match h.add_device(DeviceType::Block(self.clone())).await {
             Ok(dev) => {
-                // Update device info with the one received from device attach
                 if let DeviceType::Block(blk) = dev {
                     self.config = blk.config;
                 }

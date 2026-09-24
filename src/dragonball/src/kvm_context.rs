@@ -65,9 +65,14 @@ impl KvmContext {
         self.max_memslots
     }
 
-    /// Create a virtual machine object.
+    /// Create a virtual machine object of default type.
     pub fn create_vm(&self) -> Result<VmFd> {
         self.kvm.create_vm().map_err(Error::Kvm)
+    }
+
+    /// Create a virtual machine object with VM type specified.
+    pub fn create_vm_with_type(&self, vm_type: u64) -> Result<VmFd> {
+        self.kvm.create_vm_with_type(vm_type).map_err(Error::Kvm)
     }
 
     /// Get the max vcpu count supported by kvm
@@ -215,13 +220,13 @@ mod tests {
     use std::os::unix::io::{AsRawFd, FromRawFd};
 
     use kvm_ioctls::Kvm;
-    use test_utils::skip_if_not_root;
+    use test_utils::skip_if_kvm_unaccessable;
 
     use super::*;
 
     #[test]
     fn test_create_kvm_context() {
-        skip_if_not_root!();
+        skip_if_kvm_unaccessable!();
 
         let c = KvmContext::new(None).unwrap();
 
@@ -239,7 +244,7 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_get_supported_cpu_id() {
-        skip_if_not_root!();
+        skip_if_kvm_unaccessable!();
 
         let c = KvmContext::new(None).unwrap();
 
@@ -251,7 +256,7 @@ mod tests {
 
     #[test]
     fn test_create_vm() {
-        skip_if_not_root!();
+        skip_if_kvm_unaccessable!();
 
         let c = KvmContext::new(None).unwrap();
 

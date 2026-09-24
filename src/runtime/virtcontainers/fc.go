@@ -38,7 +38,7 @@ import (
 	"github.com/containerd/fifo"
 	httptransport "github.com/go-openapi/runtime/client"
 	"github.com/go-openapi/strfmt"
-	"github.com/opencontainers/selinux/go-selinux/label"
+	selinux "github.com/opencontainers/selinux/go-selinux"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
@@ -421,7 +421,53 @@ func (fc *firecracker) fcInit(ctx context.Context, timeout int) error {
 		fc.Logger().WithField("fcInit failed:", err).Debug()
 		return err
 	}
+
+	// When jailer is in use, cmd.Process.Pid is the jailer's PID, but jailer
+	// fork+execs firecracker as a separate child. The real fc PID lives in
+	// firecracker.pid inside the jail root; if we don't pick it up, fcEnd
+	// signals the (dead) jailer PID, gets ESRCH, returns nil, and the actual
+	// firecracker microVM is orphaned to init.
+	//
+	// Retry reading the PID file for up to 5 seconds; the jailer writes it
+	// after fork+exec so there can be a small delay. Falling back to the
+	// jailer PID would reintroduce the shutdown leak, so treat failure as
+	// fatal.
+	if fc.config.JailerPath != "" {
+		pid, err := fc.readJailedFirecrackerPID()
+		if err != nil {
+			deadline := time.Now().Add(5 * time.Second)
+			for time.Now().Before(deadline) {
+				time.Sleep(50 * time.Millisecond)
+				pid, err = fc.readJailedFirecrackerPID()
+				if err == nil {
+					break
+				}
+			}
+		}
+		if err != nil {
+			return fmt.Errorf("unable to determine firecracker PID from jailer root: %w", err)
+		}
+		fc.info.PID = pid
+	}
 	return nil
+}
+
+// readJailedFirecrackerPID returns the PID firecracker writes to
+// <jailerRoot>/firecracker.pid after the jailer's fork+exec.
+func (fc *firecracker) readJailedFirecrackerPID() (int, error) {
+	pidFile := filepath.Join(fc.jailerRoot, "firecracker.pid")
+	data, err := os.ReadFile(pidFile)
+	if err != nil {
+		return 0, fmt.Errorf("read %s: %w", pidFile, err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		return 0, fmt.Errorf("parse %s: %w", pidFile, err)
+	}
+	if pid <= 0 {
+		return 0, fmt.Errorf("invalid pid %d in %s", pid, pidFile)
+	}
+	return pid, nil
 }
 
 func (fc *firecracker) fcEnd(ctx context.Context, waitOnly bool) (err error) {
@@ -699,7 +745,12 @@ func (fc *firecracker) fcInitConfiguration(ctx context.Context) error {
 		return err
 	}
 
-	params, err := GetKernelRootParams(fc.config.RootfsType, true, false)
+	params, err := GetKernelRootParams(
+		fc.config.RootfsType,
+		true,
+		false,
+		fc.config.KernelVerityParams,
+	)
 	if err != nil {
 		return err
 	}
@@ -788,10 +839,10 @@ func (fc *firecracker) StartVM(ctx context.Context, timeout int) error {
 	// them under confinement.
 	if !fc.config.DisableSeLinux {
 
-		if err := label.SetProcessLabel(fc.config.SELinuxProcessLabel); err != nil {
+		if err := selinux.SetExecLabel(fc.config.SELinuxProcessLabel); err != nil {
 			return err
 		}
-		defer label.SetProcessLabel("")
+		defer selinux.SetExecLabel("")
 	}
 
 	err = fc.fcInit(ctx, fcTimeout)
@@ -932,7 +983,7 @@ func (fc *firecracker) fcAddNetDevice(ctx context.Context, endpoint Endpoint) {
 
 	// VMFds are not used by Firecracker, as it opens the tuntap
 	// device by its name.  Let's just close those.
-	for _, f := range endpoint.NetworkPair().TapInterface.VMFds {
+	for _, f := range endpoint.NetworkPair().VMFds {
 		f.Close()
 	}
 
@@ -982,7 +1033,7 @@ func (fc *firecracker) fcAddNetDevice(ctx context.Context, endpoint Endpoint) {
 	ifaceCfg := &models.NetworkInterface{
 		GuestMac:      endpoint.HardwareAddr(),
 		IfaceID:       &ifaceID,
-		HostDevName:   &endpoint.NetworkPair().TapInterface.TAPIface.Name,
+		HostDevName:   &endpoint.NetworkPair().TAPIface.Name,
 		RxRateLimiter: &rxRateLimiter,
 		TxRateLimiter: &txRateLimiter,
 	}
@@ -1282,4 +1333,8 @@ func (fc *firecracker) GenerateSocket(id string) (interface{}, error) {
 
 func (fc *firecracker) IsRateLimiterBuiltin() bool {
 	return true
+}
+
+func (fc *firecracker) ResolveColdPlugVFIOGuestPciPaths(_ context.Context, _ []*config.VFIODev) error {
+	return nil
 }

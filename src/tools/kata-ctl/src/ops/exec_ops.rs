@@ -10,15 +10,15 @@
 use std::{
     io::{self, BufRead, BufReader, Read, Write},
     os::unix::{
-        io::{AsRawFd, FromRawFd, RawFd},
+        io::{AsRawFd, FromRawFd, IntoRawFd, RawFd},
         net::UnixStream,
     },
     time::Duration,
 };
 
 use anyhow::{anyhow, Context};
+use hyper::StatusCode;
 use nix::sys::socket::{connect, socket, AddressFamily, SockFlag, SockType, VsockAddr};
-use reqwest::StatusCode;
 use slog::{debug, error, o};
 use vmm_sys_util::terminal::Terminal;
 
@@ -46,6 +46,7 @@ macro_rules! sl {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub enum Error {
     EpollWait(io::Error),
     EpollCreate(io::Error),
@@ -210,7 +211,7 @@ impl SockHandler for VsockConfig {
 
         // Wrap the socket fd in UnixStream, so that it is closed
         // when anything fails.
-        let stream = unsafe { UnixStream::from_raw_fd(vsock_fd) };
+        let stream = unsafe { UnixStream::from_raw_fd(vsock_fd.into_raw_fd()) };
         // Connect the socket to vsock server.
         connect(stream.as_raw_fd(), &sock_addr)
             .with_context(|| format!("failed to connect to server {:?}", &sock_addr))?;
@@ -266,7 +267,7 @@ impl SockHandler for HvsockConfig {
             if msg.starts_with(CMD_OK) {
                 let response = msg
                     .strip_prefix(CMD_OK)
-                    .ok_or(format!("invalid response: {:?}", msg))
+                    .ok_or(format!("invalid response: {msg:?}"))
                     .map_err(|e| anyhow!(e))?
                     .trim();
                 debug!(sl!(), "Hybrid Vsock host-side port: {:?}", response);
@@ -358,7 +359,6 @@ fn get_server_socket(sandbox_id: &str) -> anyhow::Result<String> {
 }
 
 fn do_run_exec(sandbox_id: &str, dbg_console_vport: u32) -> anyhow::Result<()> {
-    // sandbox_id MUST be a long ID.
     let server_url = get_server_socket(sandbox_id).context("get debug console socket URL")?;
     if server_url.is_empty() {
         return Err(anyhow!("server url is empty."));

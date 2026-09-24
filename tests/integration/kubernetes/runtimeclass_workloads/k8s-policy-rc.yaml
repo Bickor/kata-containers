@@ -17,11 +17,10 @@ spec:
       labels:
         app: policy-nginx-rc
     spec:
-      terminationGracePeriodSeconds: 0
       runtimeClassName: kata
       containers:
       - name: nginxtest
-        image: quay.io/fidencio/${nginx_version}
+        image: ${NGINX_IMAGE}
         ports:
         - containerPort: 80
         volumeMounts:
@@ -44,3 +43,4 @@ spec:
       - name: hostpath-vol-read-only
         hostPath:
           path: /tmp/results-read-only
+      preemptionPolicy: PreemptLowerPriority

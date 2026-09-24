@@ -17,14 +17,11 @@ import (
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.4.0"
-	"go.opentelemetry.io/otel/trace"
 	otelTrace "go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
 )
 
 // kataSpanExporter is used to ensure that Jaeger logs each span.
-// This is essential as it is used by:
-//
-// https://github.com/kata-containers/kata-containers/blob/main/tests/functional/tracing/tracing-test.sh
 type kataSpanExporter struct{}
 
 var _ sdktrace.SpanExporter = (*kataSpanExporter)(nil)
@@ -65,7 +62,7 @@ type JaegerConfig struct {
 // CreateTracer create a tracer
 func CreateTracer(name string, config *JaegerConfig) (*sdktrace.TracerProvider, error) {
 	if !tracing {
-		otel.SetTracerProvider(trace.NewNoopTracerProvider())
+		otel.SetTracerProvider(noop.NewTracerProvider())
 		return nil, nil
 	}
 
@@ -151,8 +148,6 @@ func Trace(parent context.Context, logger *logrus.Entry, name string, tags ...ma
 	// are still created - but the tracer used is a NOP. Therefore, only
 	// display the message when tracing is really enabled.
 	if tracing {
-		// This log message is *essential*: it is used by:
-		// https://github.com/kata-containers/kata-containers/blob/main/tests/functional/tracing/tracing-test.sh
 		kataTraceLogger.Debugf("created span %v", span)
 	}
 

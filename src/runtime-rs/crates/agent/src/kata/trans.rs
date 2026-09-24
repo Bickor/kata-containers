@@ -13,21 +13,23 @@ use protocols::{
 
 use crate::{
     types::{
-        ARPNeighbor, ARPNeighbors, AddArpNeighborRequest, AgentDetails, BlkioStats,
-        BlkioStatsEntry, CgroupStats, CheckRequest, CloseStdinRequest, ContainerID,
-        CopyFileRequest, CpuStats, CpuUsage, CreateContainerRequest, CreateSandboxRequest, Device,
-        Empty, ExecProcessRequest, FSGroup, FSGroupChangePolicy, GetIPTablesRequest,
-        GetIPTablesResponse, GuestDetailsResponse, HealthCheckResponse, HugetlbStats, IPAddress,
-        IPFamily, Interface, Interfaces, KernelModule, MemHotplugByProbeRequest, MemoryData,
-        MemoryStats, MetricsResponse, NetworkStats, OnlineCPUMemRequest, PidsStats,
-        ReadStreamRequest, ReadStreamResponse, RemoveContainerRequest, ReseedRandomDevRequest,
-        ResizeVolumeRequest, Route, Routes, SetGuestDateTimeRequest, SetIPTablesRequest,
-        SetIPTablesResponse, SharedMount, SignalProcessRequest, StatsContainerResponse, Storage,
-        StringUser, ThrottlingData, TtyWinResizeRequest, UpdateContainerRequest,
-        UpdateInterfaceRequest, UpdateRoutesRequest, VersionCheckResponse, VolumeStatsRequest,
-        VolumeStatsResponse, WaitProcessRequest, WriteStreamRequest,
+        ARPNeighbor, ARPNeighbors, AddArpNeighborRequest, AddSwapPathRequest, AddSwapRequest,
+        AgentDetails, BlkioStats, BlkioStatsEntry, CgroupStats, CheckRequest, CloseStdinRequest,
+        ContainerID, CopyFileRequest, CpuStats, CpuUsage, CreateContainerRequest,
+        CreateSandboxRequest, Device, Empty, ExecProcessRequest, FSGroup, FSGroupChangePolicy,
+        GetIPTablesRequest, GetIPTablesResponse, GuestDetailsResponse, HealthCheckResponse,
+        HugetlbStats, IPAddress, IPFamily, Interface, Interfaces, KernelModule,
+        MemHotplugByProbeRequest, MemoryData, MemoryStats, MetricsResponse, NetworkStats,
+        OnlineCPUMemRequest, PidsStats, ReadStreamRequest, ReadStreamResponse,
+        RemoveContainerRequest, ReseedRandomDevRequest, ResizeVolumeRequest, Route, Routes,
+        SetGuestDateTimeRequest, SetIPTablesRequest, SetIPTablesResponse, SharedMount,
+        SignalProcessRequest, StatsContainerResponse, Storage, StringUser, ThrottlingData,
+        TtyWinResizeRequest, UpdateContainerRequest, UpdateInterfaceRequest, UpdateRoutesRequest,
+        VersionCheckResponse, VolumeStatsRequest, VolumeStatsResponse, WaitProcessRequest,
+        WriteStreamRequest,
     },
-    GetGuestDetailsRequest, OomEventResponse, WaitProcessResponse, WriteStreamResponse,
+    GetDiagnosticDataRequest, GetDiagnosticDataResponse, GetGuestDetailsRequest, OomEventResponse,
+    SetPolicyRequest, WaitProcessResponse, WriteStreamResponse,
 };
 
 fn trans_vec<F: Sized + Clone, T: From<F>>(from: Vec<F>) -> Vec<T> {
@@ -112,6 +114,7 @@ impl From<Storage> for agent::Storage {
             fs_group: from_option(from.fs_group),
             options: trans_vec(from.options),
             mount_point: from.mount_point,
+            shared: from.shared,
             ..Default::default()
         }
     }
@@ -188,7 +191,7 @@ impl From<Interface> for types::Interface {
             IPAddresses: trans_vec(from.ip_addresses),
             mtu: from.mtu,
             hwAddr: from.hw_addr,
-            pciPath: from.pci_addr,
+            devicePath: from.device_path,
             type_: from.field_type,
             raw_flags: from.raw_flags,
             ..Default::default()
@@ -204,7 +207,7 @@ impl From<types::Interface> for Interface {
             ip_addresses: trans_vec(src.IPAddresses),
             mtu: src.mtu,
             hw_addr: src.hwAddr,
-            pci_addr: src.pciPath,
+            device_path: src.devicePath,
             field_type: src.type_,
             raw_flags: src.raw_flags,
         }
@@ -228,6 +231,8 @@ impl From<Route> for types::Route {
             source: from.source,
             scope: from.scope,
             family: protobuf::EnumOrUnknown::new(from.family.into()),
+            flags: from.flags,
+            mtu: from.mtu,
             ..Default::default()
         }
     }
@@ -242,6 +247,8 @@ impl From<types::Route> for Route {
             source: src.source,
             scope: src.scope,
             family: src.family.unwrap().into(),
+            flags: src.flags,
+            mtu: src.mtu,
         }
     }
 }
@@ -739,6 +746,31 @@ impl From<GetGuestDetailsRequest> for agent::GuestDetailsRequest {
     }
 }
 
+impl From<SetPolicyRequest> for agent::SetPolicyRequest {
+    fn from(from: SetPolicyRequest) -> Self {
+        Self {
+            policy: from.policy,
+            ..Default::default()
+        }
+    }
+}
+
+impl From<GetDiagnosticDataRequest> for agent::GetDiagnosticDataRequest {
+    fn from(from: GetDiagnosticDataRequest) -> Self {
+        Self {
+            log_type: from.log_type,
+            container_id: from.container_id,
+            ..Default::default()
+        }
+    }
+}
+
+impl From<agent::GetDiagnosticDataResponse> for GetDiagnosticDataResponse {
+    fn from(from: agent::GetDiagnosticDataResponse) -> Self {
+        Self { data: from.data }
+    }
+}
+
 impl From<agent::AgentDetails> for AgentDetails {
     fn from(src: agent::AgentDetails) -> Self {
         Self {
@@ -869,6 +901,24 @@ impl From<ResizeVolumeRequest> for agent::ResizeVolumeRequest {
         Self {
             volume_guest_path: from.volume_guest_path,
             size: from.size,
+            ..Default::default()
+        }
+    }
+}
+
+impl From<AddSwapRequest> for agent::AddSwapRequest {
+    fn from(from: AddSwapRequest) -> Self {
+        Self {
+            PCIPath: from.pci_path,
+            ..Default::default()
+        }
+    }
+}
+
+impl From<AddSwapPathRequest> for agent::AddSwapPathRequest {
+    fn from(from: AddSwapPathRequest) -> Self {
+        Self {
+            path: from.path,
             ..Default::default()
         }
     }

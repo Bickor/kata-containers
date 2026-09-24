@@ -310,7 +310,7 @@ impl MemDeviceMgr {
     pub fn remove_devices(&self, ctx: &mut DeviceOpContext) -> Result<(), DeviceMgrError> {
         for info in self.info_list.iter() {
             if let Some(device) = &info.device {
-                DeviceManager::destroy_mmio_virtio_device(device.clone(), ctx)?;
+                DeviceManager::destroy_mmio_device(device.clone(), ctx)?;
             }
         }
 
@@ -325,7 +325,7 @@ impl MemDeviceMgr {
         let device = self.info_list[index]
             .device
             .as_ref()
-            .ok_or_else(|| MemDeviceError::DeviceNotExist)?;
+            .ok_or(MemDeviceError::DeviceNotExist)?;
         if let Some(mmio_dev) = device.as_any().downcast_ref::<DbsMmioV2Device>() {
             let guard = mmio_dev.state();
             let inner_dev = guard.get_inner_device();
@@ -392,7 +392,7 @@ impl MemoryRegionFactory {
     fn configure_anon_mem(&self, mmap_reg: &MmapRegion) -> Result<(), VirtioError> {
         unsafe {
             mman::madvise(
-                mmap_reg.as_ptr() as *mut libc::c_void,
+                std::ptr::NonNull::new_unchecked(mmap_reg.as_ptr() as *mut libc::c_void),
                 mmap_reg.size(),
                 mman::MmapAdvise::MADV_DONTFORK,
             )
@@ -440,7 +440,7 @@ impl MemoryRegionFactory {
         // Safe because we just create the MmapRegion
         unsafe {
             mman::madvise(
-                mmap_reg.as_ptr() as *mut libc::c_void,
+                std::ptr::NonNull::new_unchecked(mmap_reg.as_ptr() as *mut libc::c_void),
                 mmap_reg.size(),
                 mman::MmapAdvise::MADV_HUGEPAGE,
             )
@@ -507,13 +507,10 @@ impl MemRegionFactory for MemoryRegionFactory {
                 error!(self.logger, "failed to insert address space region: {}", e);
                 // dbs-virtio-devices should not depend on dbs-address-space.
                 // So here io::Error is used instead of AddressSpaceError directly.
-                VirtioError::IOError(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!(
-                        "invalid address space region ({0:#x}, {1:#x})",
-                        guest_addr.0, region_len
-                    ),
-                ))
+                VirtioError::IOError(io::Error::other(format!(
+                    "invalid address space region ({0:#x}, {1:#x})",
+                    guest_addr.0, region_len
+                )))
             })?,
         );
         info!(
@@ -560,27 +557,23 @@ impl MemRegionFactory for MemoryRegionFactory {
         );
 
         // All value should be valid.
-        let memory_region = Arc::new(
-            GuestRegionMmap::new(mmap_region, guest_addr).map_err(VirtioError::InsertMmap)?,
-        );
+        let memory_region =
+            Arc::new(GuestRegionMmap::new(mmap_region, guest_addr).ok_or(VirtioError::InsertMmap)?);
 
         let vm_as_new = self
             .vm_as
             .memory()
             .insert_region(memory_region.clone())
-            .map_err(VirtioError::InsertMmap)?;
+            .map_err(|_| VirtioError::InsertMmap)?;
         self.vm_as.lock().unwrap().replace(vm_as_new);
         self.address_space.insert_region(region).map_err(|e| {
             error!(self.logger, "failed to insert address space region: {}", e);
             // dbs-virtio-devices should not depend on dbs-address-space.
             // So here io::Error is used instead of AddressSpaceError directly.
-            VirtioError::IOError(io::Error::new(
-                io::ErrorKind::Other,
-                format!(
-                    "invalid address space region ({0:#x}, {1:#x})",
-                    guest_addr.0, region_len
-                ),
-            ))
+            VirtioError::IOError(io::Error::other(format!(
+                "invalid address space region ({0:#x}, {1:#x})",
+                guest_addr.0, region_len
+            )))
         })?;
 
         Ok(memory_region)
@@ -618,6 +611,7 @@ impl MemRegionFactory for MemoryRegionFactory {
 
 #[cfg(test)]
 mod tests {
+    use test_utils::skip_if_kvm_unaccessable;
     use vm_memory::GuestMemoryRegion;
 
     use super::*;
@@ -656,6 +650,7 @@ mod tests {
 
     #[test]
     fn test_mem_insert_or_update_device() {
+        skip_if_kvm_unaccessable!();
         // Init vm for test.
         let mut vm = create_vm_for_test();
 
@@ -681,6 +676,7 @@ mod tests {
 
     #[test]
     fn test_mem_attach_device() {
+        skip_if_kvm_unaccessable!();
         // Init vm and insert mem config for test.
         let mut vm = create_vm_for_test();
         let dummy_mem_device = MemDeviceConfigInfo::default();
@@ -710,6 +706,7 @@ mod tests {
 
     #[test]
     fn test_mem_create_region() {
+        skip_if_kvm_unaccessable!();
         let vm = create_vm_for_test();
         let ctx = DeviceOpContext::new(
             Some(vm.epoll_manager().clone()),

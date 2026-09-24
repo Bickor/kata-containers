@@ -12,28 +12,25 @@ use crate::mount_and_storage;
 use crate::no_policy;
 use crate::pod;
 use crate::policy;
-use crate::registry;
 use crate::secret;
 use crate::utils;
 use crate::yaml;
 
 use anyhow::Result;
-use base64::{engine::general_purpose, Engine as _};
 use log::debug;
 use oci_spec::runtime as oci;
 use protocols::agent;
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
-use sha2::{Digest, Sha256};
 use std::boxed;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::read_to_string;
 use std::io::Write;
 
 /// Intermediary format of policy data.
 pub struct AgentPolicy {
     /// K8s resources described by the input YAML file.
-    resources: Vec<boxed::Box<dyn yaml::K8sResource + Send + Sync>>,
+    pub resources: Vec<boxed::Box<dyn yaml::K8sResource + Send + Sync>>,
 
     /// K8s ConfigMap resources described by an additional input YAML file
     /// or by the "main" input YAML file, containing additional pod settings.
@@ -58,9 +55,18 @@ pub struct PolicyData {
     /// Settings read from genpolicy-settings.json.
     pub common: CommonData,
 
+    /// Sandbox settings read from genpolicy-settings.json.
+    pub sandbox: SandboxData,
+
     /// Settings read from genpolicy-settings.json, related directly to each
     /// kata agent endpoint, that get added to the output policy.
     pub request_defaults: RequestDefaults,
+
+    /// Device settings read from genpolicy-settings.json.
+    pub devices: Devices,
+
+    /// Cluster-level settings read from genpolicy-settings.json.
+    pub cluster_config: ClusterConfig,
 }
 
 /// OCI Container spec. This struct is very similar to the Spec struct from
@@ -147,7 +153,7 @@ pub struct KataUser {
     pub GID: u32,
 
     /// AdditionalGids are additional group ids set for the container's process.
-    pub AdditionalGids: Vec<u32>,
+    pub AdditionalGids: BTreeSet<u32>,
 
     /// Username is the user name.
     pub Username: String,
@@ -177,14 +183,20 @@ pub struct KataLinux {
     pub Namespaces: Vec<KataLinuxNamespace>,
 
     /// MaskedPaths masks over the provided paths inside the container.
+    #[serde(default)]
     pub MaskedPaths: Vec<String>,
 
     /// ReadonlyPaths sets the provided paths as RO inside the container.
+    #[serde(default)]
     pub ReadonlyPaths: Vec<String>,
 
     /// Devices contains devices to be created inside the container.
     #[serde(default)]
     pub Devices: Vec<KataLinuxDevice>,
+
+    /// Sysctls contains sysctls to be applied inside the container.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub Sysctl: BTreeMap<String, String>,
 }
 
 /// OCI container LinuxNamespace struct. This struct is similar to the LinuxNamespace
@@ -269,14 +281,18 @@ pub struct ContainerPolicy {
     /// Data compared with req.sandbox_pidns for CreateContainerRequest calls.
     sandbox_pidns: bool,
 
-    /// Allow list of ommand lines that are allowed to be executed using
+    /// Allow list of command lines that are allowed to be executed using
     /// ExecProcessRequest. By default, all ExecProcessRequest calls are blocked
     /// by the policy.
     exec_commands: Vec<Vec<String>>,
+
+    /// Runtime-assigned annotation key-value pairs for validation of input annotations.
+    runtime_anno_patterns: BTreeMap<String, String>,
 }
 
 /// See Reference / Kubernetes API / Config and Storage Resources / Volume.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct Volumes {
     /// K8s EmptyDir Volume.
     pub emptyDir: Option<EmptyDirVolume>,
@@ -287,6 +303,7 @@ pub struct Volumes {
 
 /// See Reference / Kubernetes API / Config and Storage Resources / Volume.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct EmptyDirVolume {
     pub mount_type: String,
     pub mount_point: String,
@@ -299,6 +316,7 @@ pub struct EmptyDirVolume {
 
 /// See Reference / Kubernetes API / Config and Storage Resources / Volume.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct PersistentVolumeClaimVolume {
     pub mount_type: String,
     pub mount_source: String,
@@ -325,6 +343,42 @@ pub struct ExecProcessRequestDefaults {
     regex: Vec<String>,
 }
 
+/// UpdateRoutesRequest settings from genpolicy-settings.json.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UpdateRoutesRequestDefaults {
+    /// Forbid adding routes to devices of these names.
+    forbidden_device_names: Vec<String>,
+
+    /// Forbid adding routes originating from these addresses.
+    forbidden_source_regex: Vec<String>,
+}
+
+/// UpdateInterfaceRequest settings from genpolicy-settings.json.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UpdateInterfaceRequestDefaults {
+    /// Raw flag bitmask explicitly allowed to configure
+    allow_raw_flags: u32,
+
+    /// Explicitly blocked interface names. Intent is to block changes to loopback interface.
+    forbidden_names: Vec<String>,
+
+    /// Explicitly blocked mac addresses. Intent is to block changes to loopback interface.
+    forbidden_hw_addrs: Vec<String>,
+}
+
+/// UpdateInterfaceRequest settings from genpolicy-settings.json.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AddARPNeighborsRequestDefaults {
+    /// Explicitly blocked interface names. Intent is to block changes to loopback interface.
+    forbidden_device_names: Vec<String>,
+    /// Explicitly blocked IP address ranges.
+    /// Should include loopback addresses and other CIDRs that should not be routed outside the VM.
+    forbidden_cidrs_regex: Vec<String>,
+
+    /// Allowed neighbor states. See https://www.man7.org/linux/man-pages/man8/ip-neighbour.8.html
+    allowed_states: Vec<u32>,
+}
+
 /// Settings specific to each kata agent endpoint, loaded from
 /// genpolicy-settings.json.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -338,6 +392,15 @@ pub struct RequestDefaults {
     /// Commands allowed to be executed by the Host in all Guest containers.
     pub ExecProcessRequest: ExecProcessRequestDefaults,
 
+    /// Allow the host to update routes for devices other than the loopback.
+    pub UpdateRoutesRequest: UpdateRoutesRequestDefaults,
+
+    /// Allow the host to configure only used raw_flags and reject names/mac addresses of the loopback.
+    pub UpdateInterfaceRequest: UpdateInterfaceRequestDefaults,
+
+    /// Allow the host to configure only used raw_flags and reject names/mac addresses of the loopback.
+    pub AddARPNeighborsRequest: AddARPNeighborsRequestDefaults,
+
     /// Allow the Host to close stdin for a container. Typically used with WriteStreamRequest.
     pub CloseStdinRequest: bool,
 
@@ -349,6 +412,9 @@ pub struct RequestDefaults {
 
     /// Allow Host writing to Guest containers stdin.
     pub WriteStreamRequest: bool,
+
+    /// Allow Host to retrieve diagnostic data from the Guest.
+    pub GetDiagnosticDataRequest: bool,
 }
 
 /// Struct used to read data from the settings file and copy that data into the policy.
@@ -357,11 +423,14 @@ pub struct CommonData {
     /// Path to the shared container files - e.g., "/run/kata-containers/shared/containers".
     pub cpath: String,
 
-    /// Path to the shared container files for mount sources - e.g., "/run/kata-containers/shared/containers".
-    pub mount_source_cpath: String,
+    /// Path to the container root - e.g., "/run/kata-containers/$(bundle-id)/rootfs".
+    pub root_path: String,
 
     /// Regex prefix for shared file paths - e.g., "^$(cpath)/$(bundle-id)-[a-z0-9]{16}-".
     pub sfprefix: String,
+
+    /// Path to the shared sandbox storage - e.g., "/run/kata-containers/sandbox/storage".
+    pub spath: String,
 
     /// Regex for an IPv4 address.
     pub ipv4_a: String,
@@ -369,8 +438,8 @@ pub struct CommonData {
     /// Regex for an IP port number.
     pub ip_p: String,
 
-    /// Regex for a K8s service name.
-    pub svc_name: String,
+    /// Regex for a K8s service name (RFC 1035), after downward API transformation.
+    pub svc_name_downward_env: String,
 
     // Regex for a DNS label (e.g., host name).
     pub dns_label: String,
@@ -385,10 +454,87 @@ pub struct CommonData {
 /// Configuration from "kubectl config".
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ClusterConfig {
-    default_namespace: String,
-
     /// Pause container image reference.
     pub pause_container_image: String,
+
+    /// Whether or not the cluster uses the guest pull mechanism
+    /// In guest pull, host can't look into layers to determine GID.
+    /// See issue https://github.com/kata-containers/kata-containers/issues/11162
+    pub guest_pull: bool,
+
+    /// Supported values:
+    ///
+    /// "v1" - Pause container UID/GID/AdditionalGids handled as in AKS pre-October 2025:
+    ///         - Example container image reference: mcr.microsoft.com/oss/kubernetes/pause:3.6
+    ///         - Defaults: UID=65535, GID=65535, AdditionalGids=[65535].
+    ///         - When changing the GID via runAsUser or runAsGroup, the new GID value *replaces*
+    ///           the default value from AdditionalGids.
+    /// "v2" - Pause container UID/GID/AdditionalGids handled as in AKS post-October 2025:
+    ///         - Example container image reference: mcr.microsoft.com/oss/v2/kubernetes/pause:3.6
+    ///         - Defaults: UID=0, GID=0, AdditionalGids=[].
+    ///         - When changing the GID via runAsUser or runAsGroup, the new GID value *gets added
+    ///           as the only value* in AdditionalGids.
+    pub pause_container_id_policy: String,
+
+    /// Whether emptyDirs are encrypted with modified metadata in the
+    /// mount and a storage object for the block device.
+    pub encrypted_emptydir: bool,
+
+    /// Cgroup v2 mount options that may appear beyond what genpolicy embeds
+    /// (e.g. "nsdelegate", "memory_recursiveprot" on newer kernels).
+    #[serde(default)]
+    pub cgroup_mount_extras_allowed: Vec<String>,
+}
+
+/// Describes patterns for supported VFIO devices.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct VfioDevices {
+    /// Device path prefix for VFIO devices (without device number suffix).
+    pub device_path: String,
+
+    /// Regex pattern for VFIO CDI annotation keys.
+    #[serde(skip_serializing)]
+    pub anno_key_regex: String,
+
+    /// NVIDIA-specific VFIO settings.
+    pub nvidia: VfioNvidiaDevices,
+}
+
+/// Device-related settings for policy generation.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Devices {
+    pub vfio: VfioDevices,
+}
+
+/// Struct used to read data from the settings file and copy that data into the policy.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SandboxData {
+    /// Expected value of the CreateSandboxRequest storages field.
+    pub storages: Vec<agent::Storage>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct VfioNvidiaDevices {
+    /// Regex pattern for NVIDIA GPU CDI annotation values.
+    #[serde(skip_serializing)]
+    pub gpu_anno_value_regex: String,
+
+    /// Device type for NVIDIA GPU VFIO devices (gk variant).
+    #[serde(skip_serializing)]
+    pub gpu_gk_device_type: String,
+
+    /// Allowlist of K8s extended resource names that should be treated as NVIDIA
+    /// passthrough GPU (pGPU) requests when generating policy.
+    ///
+    /// This is generation-time configuration; policy enforcement does not need it.
+    /// We therefore skip serializing it into `policy_data`.
+    #[serde(skip_serializing)]
+    pub pgpu_resource_keys: Vec<String>,
+}
+
+enum K8sEnvFromSource {
+    ConfigMap(config_map::ConfigMap),
+    Secret(secret::Secret),
 }
 
 impl AgentPolicy {
@@ -441,9 +587,18 @@ impl AgentPolicy {
             }
         }
 
-        if let Some(config_map_files) = &config.config_map_files {
-            for file in config_map_files {
-                config_maps.push(config_map::ConfigMap::new(file)?);
+        if let Some(config_files) = &config.config_files {
+            for resource_file in config_files {
+                for config_resource in parse_config_file(resource_file.to_string(), config).await? {
+                    match config_resource {
+                        K8sEnvFromSource::ConfigMap(config_map) => {
+                            config_maps.push(config_map);
+                        }
+                        K8sEnvFromSource::Secret(secret) => {
+                            secrets.push(secret);
+                        }
+                    }
+                }
             }
         }
 
@@ -464,11 +619,8 @@ impl AgentPolicy {
     pub fn export_policy(&mut self) {
         let mut yaml_string = String::new();
         for i in 0..self.resources.len() {
-            let policy = self.resources[i].generate_policy(self);
-            if self.config.base64_out {
-                println!("{}", policy);
-            }
-            yaml_string += &self.resources[i].serialize(&policy);
+            let annotation = self.resources[i].generate_initdata_anno(self);
+            yaml_string += &self.resources[i].serialize(&annotation);
         }
 
         if let Some(yaml_file) = &self.config.yaml_file {
@@ -480,17 +632,17 @@ impl AgentPolicy {
                 .unwrap()
                 .write_all(yaml_string.as_bytes())
                 .unwrap();
-        } else {
-            // When input YAML came through stdin, print the output YAML to stdout.
+        } else if !self.config.base64_out && !self.config.raw_out {
             std::io::stdout().write_all(yaml_string.as_bytes()).unwrap();
         }
     }
 
-    pub fn generate_policy(&self, resource: &dyn yaml::K8sResource) -> String {
+    pub fn generate_initdata_anno(&self, resource: &dyn yaml::K8sResource) -> String {
         let yaml_containers = resource.get_containers();
         let mut policy_containers = Vec::new();
 
         for (i, yaml_container) in yaml_containers.iter().enumerate() {
+            debug!("generate_initdata_anno: ========================= Container {i}");
             policy_containers.push(self.get_container_policy(resource, yaml_container, i == 0));
         }
 
@@ -498,14 +650,25 @@ impl AgentPolicy {
             containers: policy_containers,
             request_defaults: self.config.settings.request_defaults.clone(),
             common: self.config.settings.common.clone(),
+            sandbox: self.config.settings.sandbox.clone(),
+            devices: self.config.settings.devices.clone(),
+            cluster_config: self.config.settings.cluster_config.clone(),
         };
 
         let json_data = serde_json::to_string_pretty(&policy_data).unwrap();
         let policy = format!("{}\npolicy_data := {json_data}", &self.rules);
+        let mut initdata = self.config.initdata.clone();
+        initdata.insert_data("policy.rego", policy.clone());
+        let encoded = kata_types::initdata::encode_initdata(&initdata);
+
         if self.config.raw_out {
             std::io::stdout().write_all(policy.as_bytes()).unwrap();
         }
-        general_purpose::STANDARD.encode(policy.as_bytes())
+        if self.config.base64_out {
+            std::io::stdout().write_all(encoded.as_bytes()).unwrap();
+        }
+
+        encoded
     }
 
     pub fn get_container_policy(
@@ -521,15 +684,7 @@ impl AgentPolicy {
         let mut root = c_settings.Root.clone();
         root.Readonly = yaml_container.read_only_root_filesystem();
 
-        let namespace = match resource.get_namespace() {
-            Some(ns) if !ns.is_empty() => ns,
-            _ => self
-                .config
-                .settings
-                .cluster_config
-                .default_namespace
-                .clone(),
-        };
+        let namespace = resource.get_namespace().unwrap_or_default();
 
         let use_host_network = resource.use_host_network();
         let annotations = get_container_annotations(
@@ -542,6 +697,9 @@ impl AgentPolicy {
         );
 
         let is_privileged = yaml_container.is_privileged();
+        let needs_privileged_mounts = is_privileged
+            || (is_pause_container && resource.get_containers().iter().any(|c| c.is_privileged()));
+
         let process = self.get_container_process(
             resource,
             yaml_container,
@@ -551,7 +709,7 @@ impl AgentPolicy {
             is_privileged,
         );
 
-        let mut mounts = containerd::get_mounts(is_pause_container, is_privileged);
+        let mut mounts = containerd::get_mounts(is_pause_container, needs_privileged_mounts);
         mount_and_storage::get_policy_mounts(
             &self.config.settings,
             &mut mounts,
@@ -559,9 +717,7 @@ impl AgentPolicy {
             is_pause_container,
         );
 
-        let image_layers = yaml_container.registry.get_image_layers();
         let mut storages = Default::default();
-        get_image_layer_storages(&mut storages, &image_layers, &root);
         resource.get_container_mounts_and_storages(
             &mut mounts,
             &mut storages,
@@ -591,6 +747,18 @@ impl AgentPolicy {
         let mut devices: Vec<agent::Device> = vec![];
         if let Some(volumeDevices) = &yaml_container.volumeDevices {
             for volumeDevice in volumeDevices {
+                if volumeDevice
+                    .devicePath
+                    .starts_with(&self.config.settings.devices.vfio.device_path)
+                {
+                    panic!(
+                        "Requested volume device file path '{}' conflicts with the file path reserved for VFIO device passthrough '{}'. \
+                         Note: for VFIO device passthrough, use resource limits (e.g., nvidia.com/gpu).",
+                        volumeDevice.devicePath,
+                        self.config.settings.devices.vfio.device_path
+                    );
+                }
+
                 let mut device = agent::Device::new();
                 device.set_container_path(volumeDevice.devicePath.clone());
                 devices.push(device);
@@ -601,8 +769,71 @@ impl AgentPolicy {
                 })
             }
         }
+
+        // Generate expected device entries and annotation key-value pairs for VFIO devices
+        let mut runtime_anno_patterns = BTreeMap::new();
+        if let Some(nvidia_pgpu_count) = yaml_container
+            .get_nvidia_pgpu_count(&self.config.settings.devices.vfio.nvidia.pgpu_resource_keys)
+        {
+            if nvidia_pgpu_count > 0 {
+                for _ in 0..nvidia_pgpu_count {
+                    let mut device = agent::Device::new();
+                    // The actual device number <device_path><device_number> is assigned at
+                    // runtime by the device plugin. Here at policy generation time, we set
+                    // the device path prefix <device_path>. When enforcing the policy, we
+                    // we validate against this prefix and compare the observed device
+                    // number with the number from the provided CDI annotations.
+                    device
+                        .set_container_path(self.config.settings.devices.vfio.device_path.clone());
+                    device.set_type(
+                        self.config
+                            .settings
+                            .devices
+                            .vfio
+                            .nvidia
+                            .gpu_gk_device_type
+                            .clone(),
+                    );
+                    device.set_vm_path("".to_string());
+                    devices.push(device);
+                }
+
+                runtime_anno_patterns.insert(
+                    self.config.settings.devices.vfio.anno_key_regex.clone(),
+                    self.config
+                        .settings
+                        .devices
+                        .vfio
+                        .nvidia
+                        .gpu_anno_value_regex
+                        .clone(),
+                );
+            }
+        }
+
+        // Whether these appear on the OCI spec depends on the container runtime configuration
+        // (e.g. containerd `container_annotations` allowlisting `io.kubernetes.container.*`).
+        // When allowed, the kubelet passes path/policy (defaults: /dev/termination-log, File).
+        // Do not put them in OCI.Annotations — that would require every CreateContainer input to
+        // carry the same keys. Optional keys are allowed via runtime_anno_patterns instead.
+        if !is_pause_container {
+            runtime_anno_patterns.insert(
+                "^io\\.kubernetes\\.container\\.terminationMessagePath$".to_string(),
+                "^/.*$".to_string(),
+            );
+            runtime_anno_patterns.insert(
+                "^io\\.kubernetes\\.container\\.terminationMessagePolicy$".to_string(),
+                "^(File|FallbackToLogsOnError)$".to_string(),
+            );
+        }
+
         for default_device in &c_settings.Linux.Devices {
             linux.Devices.push(default_device.clone())
+        }
+
+        linux.Sysctl.extend(c_settings.Linux.Sysctl.clone());
+        for sysctl in resource.get_sysctls() {
+            linux.Sysctl.insert(sysctl.name, sysctl.value);
         }
 
         ContainerPolicy {
@@ -619,6 +850,7 @@ impl AgentPolicy {
             devices,
             sandbox_pidns,
             exec_commands,
+            runtime_anno_patterns,
         }
     }
 
@@ -631,16 +863,34 @@ impl AgentPolicy {
         c_settings: &KataSpec,
         is_privileged: bool,
     ) -> KataProcess {
+        ///////////////////////////////////////////////////////////////////////////////////////
         // Start with the Default Unix Spec from
         // https://github.com/containerd/containerd/blob/release/1.6/oci/spec.go#L132
         let mut process = containerd::get_process(is_privileged, &self.config.settings.common);
+        debug!(
+            "get_container_process: after containerd::get_process: process = {:?}",
+            &process
+        );
 
+        ///////////////////////////////////////////////////////////////////////////////////////
+        // Container-level settings from user's YAML.
         yaml_container.apply_capabilities(&mut process.Capabilities, &self.config.settings.common);
+        debug!(
+            "get_container_process: after apply_capabilities: process = {:?}",
+            &process
+        );
 
         let (yaml_has_command, yaml_has_args) = yaml_container.get_process_args(&mut process.Args);
+
+        ///////////////////////////////////////////////////////////////////////////////////////
+        // Container image settings.
         yaml_container
             .registry
             .get_process(&mut process, yaml_has_command, yaml_has_args);
+        debug!(
+            "get_container_process: after registry.get_processs: process = {:?}",
+            &process
+        );
 
         if let Some(tty) = yaml_container.tty {
             process.Terminal = tty;
@@ -664,17 +914,116 @@ impl AgentPolicy {
             &self.config_maps,
             &self.secrets,
             namespace,
-            resource.get_annotations(),
+            resource,
             service_account_name,
+        );
+        debug!(
+            "get_container_process: after get_env_variables: User = {:?}",
+            &process.User
         );
 
         substitute_env_variables(&mut process.Env);
+        debug!(
+            "get_container_process: after substitute_env_variables: User = {:?}",
+            &process.User
+        );
+
         substitute_args_env_variables(&mut process.Args, &process.Env);
+        debug!(
+            "get_container_process: after substitute_args_env_variables: User = {:?}",
+            &process.User
+        );
 
-        c_settings.get_process_fields(&mut process);
-        resource.get_process_fields(&mut process);
+        ///////////////////////////////////////////////////////////////////////////////////////
+        // genpolicy-settings.json information.
+        let v1_policy = self
+            .config
+            .settings
+            .cluster_config
+            .pause_container_id_policy
+            == "v1";
+        if !v1_policy {
+            let v2_policy = self
+                .config
+                .settings
+                .cluster_config
+                .pause_container_id_policy
+                == "v2";
+            if !v2_policy {
+                panic!(
+                    "Unsupported pause_container_id_policy = {} - must be v1 or v2 in the settings file",
+                    self.config.settings.cluster_config.pause_container_id_policy
+                );
+            }
+        }
+        let update_additional_gids = !is_pause_container || v1_policy;
+        c_settings.get_process_fields(&mut process, update_additional_gids);
+        debug!(
+            "get_container_process: after c_settings.get_process_fields: User = {:?}",
+            &process.User
+        );
+
+        ///////////////////////////////////////////////////////////////////////////////////////
+        // Resource-level settings from user's YAML - e.g., pod-level or deployment-level.
+        let mut must_check_passwd = false;
+        resource.get_process_fields(&mut process, &mut must_check_passwd, is_pause_container);
+        debug!(
+            "get_container_process: after resource.get_process_fields: must_check_passwd = {must_check_passwd}, User = {:?}",
+            &process.User
+        );
+
+        if must_check_passwd {
+            ///////////////////////////////////////////////////////////////////////////////////
+            // Settings based on container image.
+            let uid = process.User.UID;
+            let gid = match yaml_container.registry.get_gid_from_passwd_uid(uid) {
+                Ok(g) => g,
+                Err(e) => {
+                    debug!("get_container_process: no GID for UID = {uid} in container image, error {e}");
+                    0
+                }
+            };
+            process.User.GID = gid;
+            debug!(
+                "get_container_process: after registry.get_gid_from_passwd_uid: User = {:?}",
+                &process.User
+            );
+
+            process.User.AdditionalGids.clear();
+            debug!(
+                "get_container_process: cleared AdditionalGids due to runAsUser = {}, User = {:?}",
+                process.User.UID, &process.User
+            );
+
+            process.User.AdditionalGids.insert(gid);
+            debug!(
+                "get_container_process: inserted GID = {gid} into AdditionalGids: User = {:?}",
+                &process.User
+            );
+        }
+
+        yaml::apply_pod_fs_group_and_supplemental_groups(
+            &mut process,
+            resource.get_pod_security_context(),
+            is_pause_container,
+        );
+        debug!(
+            "get_container_process: after apply_pod_fs_group_and_supplemental_groups: User = {:?}",
+            &process.User
+        );
+
+        ///////////////////////////////////////////////////////////////////////////////////////
+        // Container-level settings from user's YAML.
         yaml_container.get_process_fields(&mut process);
+        debug!(
+            "get_container_process: after yaml_container.get_process_fields: User = {:?}",
+            &process.User
+        );
 
+        debug!(
+            "get_container_process: returning: User = {:?}",
+            &process.User
+        );
         process
     }
 }
@@ -686,15 +1035,30 @@ impl KataSpec {
         }
     }
 
-    fn get_process_fields(&self, process: &mut KataProcess) {
+    fn get_process_fields(&self, process: &mut KataProcess, update_additional_gids: bool) {
         if process.User.UID == 0 {
             process.User.UID = self.Process.User.UID;
+            debug!(
+                "get_process_fields: set UID = {}: User = {:?}",
+                process.User.UID, &process.User
+            );
         }
         if process.User.GID == 0 {
             process.User.GID = self.Process.User.GID;
+            debug!(
+                "get_process_fields: set GID = {}: User = {:?}",
+                process.User.GID, &process.User
+            );
+
+            if update_additional_gids {
+                process.User.AdditionalGids.insert(process.User.GID);
+                debug!(
+                    "get_process_fields: inserted process.User.GID = {} into AdditionalGids: User = {:?}",
+                    process.User.GID, &process.User
+                );
+            }
         }
 
-        process.User.AdditionalGids = self.Process.User.AdditionalGids.to_vec();
         process.User.Username = String::from(&self.Process.User.Username);
         add_missing_strings(&self.Process.Args, &mut process.Args);
 
@@ -702,76 +1066,35 @@ impl KataSpec {
     }
 }
 
-fn get_image_layer_storages(
-    storages: &mut Vec<agent::Storage>,
-    image_layers: &Vec<registry::ImageLayer>,
-    root: &KataRoot,
-) {
-    let mut new_storages: Vec<agent::Storage> = Vec::new();
-    let mut layer_names: Vec<String> = Vec::new();
-    let mut layer_hashes: Vec<String> = Vec::new();
-    let mut previous_chain_id = String::new();
-    let layers_count = image_layers.len();
-    let mut layer_index = layers_count;
+async fn parse_config_file(
+    yaml_file: String,
+    config: &utils::Config,
+) -> Result<Vec<K8sEnvFromSource>> {
+    let mut k8sRes = Vec::new();
+    let yaml_contents = yaml::get_input_yaml(&Some(yaml_file))?;
+    for document in serde_yaml::Deserializer::from_str(&yaml_contents) {
+        let doc_mapping = Value::deserialize(document)?;
+        if doc_mapping != Value::Null {
+            let yaml_string = serde_yaml::to_string(&doc_mapping)?;
+            let silent = config.silent_unsupported_fields;
+            let (mut resource, kind) = yaml::new_k8s_resource(&yaml_string, silent)?;
 
-    for layer in image_layers {
-        // See https://github.com/opencontainers/image-spec/blob/main/config.md#layer-chainid
-        let chain_id = if previous_chain_id.is_empty() {
-            layer.diff_id.clone()
-        } else {
-            let mut hasher = Sha256::new();
-            hasher.update(format!("{previous_chain_id} {}", &layer.diff_id));
-            format!("sha256:{:x}", hasher.finalize())
-        };
-        debug!(
-            "previous_chain_id = {}, chain_id = {}",
-            &previous_chain_id, &chain_id
-        );
-        previous_chain_id.clone_from(&chain_id);
+            resource.init(config, &doc_mapping, silent).await;
 
-        layer_names.push(name_to_hash(&chain_id));
-        layer_hashes.push(layer.verity_hash.to_string());
-        layer_index -= 1;
-
-        new_storages.push(agent::Storage {
-            driver: "blk".to_string(),
-            driver_options: Vec::new(),
-            source: String::new(), // TODO
-            fstype: "tar".to_string(),
-            options: vec![format!("$(hash{layer_index})")],
-            mount_point: format!("$(layer{layer_index})"),
-            fs_group: protobuf::MessageField::none(),
-            special_fields: ::protobuf::SpecialFields::new(),
-        });
+            // ConfigMap and Secret documents contain additional input for policy generation.
+            if kind.eq("ConfigMap") {
+                let config_map: config_map::ConfigMap = serde_yaml::from_str(&yaml_string)?;
+                debug!("{:#?}", &config_map);
+                k8sRes.push(K8sEnvFromSource::ConfigMap(config_map));
+            } else if kind.eq("Secret") {
+                let secret: secret::Secret = serde_yaml::from_str(&yaml_string)?;
+                debug!("{:#?}", &secret);
+                k8sRes.push(K8sEnvFromSource::Secret(secret));
+            }
+        }
     }
 
-    new_storages.reverse();
-    for storage in new_storages {
-        storages.push(storage);
-    }
-
-    layer_names.reverse();
-    layer_hashes.reverse();
-
-    let overlay_storage = agent::Storage {
-        driver: "overlayfs".to_string(),
-        driver_options: Vec::new(),
-        source: String::new(), // TODO
-        fstype: "fuse3.kata-overlay".to_string(),
-        options: vec![layer_names.join(":"), layer_hashes.join(":")],
-        mount_point: root.Path.clone(),
-        fs_group: protobuf::MessageField::none(),
-        special_fields: ::protobuf::SpecialFields::new(),
-    };
-
-    storages.push(overlay_storage);
-}
-
-/// Converts the given name to a string representation of its sha256 hash.
-fn name_to_hash(name: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(name);
-    format!("{:x}", hasher.finalize())
+    Ok(k8sRes)
 }
 
 fn substitute_env_variables(env: &mut Vec<String>) {
@@ -914,7 +1237,7 @@ fn get_container_annotations(
     if let Some(name) = resource.get_sandbox_name() {
         annotations
             .entry("io.kubernetes.cri.sandbox-name".to_string())
-            .or_insert(name);
+            .or_insert(format!("^{name}$"));
     }
 
     if !is_pause_container {

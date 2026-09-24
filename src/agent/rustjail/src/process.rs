@@ -5,7 +5,7 @@
 
 use libc::pid_t;
 use std::fs::File;
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::{IntoRawFd, RawFd};
 use tokio::sync::mpsc::Sender;
 use tokio_vsock::VsockStream;
 
@@ -168,29 +168,28 @@ impl Process {
         info!(logger, "before create console socket!");
 
         if !p.tty {
-            if cfg!(feature = "standard-oci-runtime") {
-                p.stdin = Some(std::io::stdin().as_raw_fd());
-                p.stdout = Some(std::io::stdout().as_raw_fd());
-                p.stderr = Some(std::io::stderr().as_raw_fd());
-            } else {
-                info!(logger, "created console socket!");
+            info!(logger, "created console socket!");
 
-                let (stdin, pstdin) = unistd::pipe2(OFlag::O_CLOEXEC)?;
-                p.parent_stdin = Some(pstdin);
-                p.stdin = Some(stdin);
+            let (stdin, pstdin) = unistd::pipe2(OFlag::O_CLOEXEC)?;
+            p.parent_stdin = Some(pstdin.into_raw_fd());
+            p.stdin = Some(stdin.into_raw_fd());
 
-                // These pipes are necessary as the stdout/stderr of the child process
-                // cannot be a socket. Otherwise, some images relying on the /dev/stdout(stderr)
-                // and /proc/self/fd/1(2) will fail to boot as opening an existing socket
-                // is forbidden by the Linux kernel.
-                let (pstdout, stdout) = create_extended_pipe(OFlag::O_CLOEXEC, pipe_size)?;
-                p.parent_stdout = Some(pstdout);
-                p.stdout = Some(stdout);
+            // Make sure the parent stdin writer be inserted into
+            // p.writes hashmap, thus the cleanup_process_stream can
+            // cleanup and close the parent stdin fd.
+            let _ = p.get_writer(StreamType::ParentStdin);
 
-                let (pstderr, stderr) = create_extended_pipe(OFlag::O_CLOEXEC, pipe_size)?;
-                p.parent_stderr = Some(pstderr);
-                p.stderr = Some(stderr);
-            }
+            // These pipes are necessary as the stdout/stderr of the child process
+            // cannot be a socket. Otherwise, some images relying on the /dev/stdout(stderr)
+            // and /proc/self/fd/1(2) will fail to boot as opening an existing socket
+            // is forbidden by the Linux kernel.
+            let (pstdout, stdout) = create_extended_pipe(OFlag::O_CLOEXEC, pipe_size)?;
+            p.parent_stdout = Some(pstdout);
+            p.stdout = Some(stdout);
+
+            let (pstderr, stderr) = create_extended_pipe(OFlag::O_CLOEXEC, pipe_size)?;
+            p.parent_stderr = Some(pstderr);
+            p.stderr = Some(stderr);
         }
         Ok(p)
     }
@@ -274,9 +273,9 @@ impl Process {
 fn create_extended_pipe(flags: OFlag, pipe_size: i32) -> Result<(RawFd, RawFd)> {
     let (r, w) = unistd::pipe2(flags)?;
     if pipe_size > 0 {
-        fcntl(w, FcntlArg::F_SETPIPE_SZ(pipe_size))?;
+        fcntl(&w, FcntlArg::F_SETPIPE_SZ(pipe_size))?;
     }
-    Ok((r, w))
+    Ok((r.into_raw_fd(), w.into_raw_fd()))
 }
 
 #[cfg(test)]
@@ -308,8 +307,8 @@ mod tests {
         assert_eq!(max_size, actual_size);
     }
 
-    #[test]
-    fn test_process() {
+    #[tokio::test]
+    async fn test_process() {
         let id = "abc123rgb";
         let init = true;
         let process = Process::new(
@@ -331,11 +330,5 @@ mod tests {
         // group of the calling process.
         process.pid = 0;
         assert!(process.signal(libc::SIGCONT).is_ok());
-
-        if cfg!(feature = "standard-oci-runtime") {
-            assert_eq!(process.stdin.unwrap(), std::io::stdin().as_raw_fd());
-            assert_eq!(process.stdout.unwrap(), std::io::stdout().as_raw_fd());
-            assert_eq!(process.stderr.unwrap(), std::io::stderr().as_raw_fd());
-        }
     }
 }

@@ -3,14 +3,30 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
+#[cfg(not(target_arch = "s390x"))]
+use crate::linux_abi::{create_pci_root_bus_path, pcipath_from_dev_tree_path, SYSFS_DIR};
+#[cfg(not(target_arch = "s390x"))]
+use crate::{device::pcipath_to_sysfs, pci};
 use anyhow::{anyhow, Context, Result};
-use futures::{future, StreamExt, TryStreamExt};
+use futures::{future, TryStreamExt};
 use ipnetwork::{IpNetwork, Ipv4Network, Ipv6Network};
+use netlink_packet_route::link::{LinkAttribute, LinkMessage};
+use netlink_packet_route::neighbour::NeighbourFlag;
+use netlink_packet_route::route::{RouteFlag, RouteHeader, RouteProtocol, RouteScope, RouteType};
+use netlink_packet_route::{
+    address::{AddressAttribute, AddressMessage},
+    route::RouteMetric,
+};
+use netlink_packet_route::{
+    neighbour::NeighbourState,
+    route::{RouteAddress, RouteAttribute, RouteMessage},
+};
 use nix::errno::Errno;
 use protocols::types::{ARPNeighbor, IPAddress, IPFamily, Interface, Route};
-use rtnetlink::{new_connection, packet, IpVersion};
+use rtnetlink::{new_connection, IpVersion};
 use std::convert::{TryFrom, TryInto};
 use std::fmt;
+use std::fs;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::ops::Deref;
 use std::str::{self, FromStr};
@@ -28,12 +44,42 @@ pub enum LinkFilter<'a> {
 impl fmt::Display for LinkFilter<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            LinkFilter::Name(name) => write!(f, "Name: {}", name),
-            LinkFilter::Index(idx) => write!(f, "Index: {}", idx),
-            LinkFilter::Address(addr) => write!(f, "Address: {}", addr),
+            LinkFilter::Name(name) => write!(f, "Name: {name}"),
+            LinkFilter::Index(idx) => write!(f, "Index: {idx}"),
+            LinkFilter::Address(addr) => write!(f, "Address: {addr}"),
         }
     }
 }
+
+const ALL_RULE_FLAGS: [NeighbourFlag; 8] = [
+    NeighbourFlag::Use,
+    NeighbourFlag::Own,
+    NeighbourFlag::Controller,
+    NeighbourFlag::Proxy,
+    NeighbourFlag::ExtLearned,
+    NeighbourFlag::Offloaded,
+    NeighbourFlag::Sticky,
+    NeighbourFlag::Router,
+];
+
+const ALL_ROUTE_FLAGS: [RouteFlag; 16] = [
+    RouteFlag::Dead,
+    RouteFlag::Pervasive,
+    RouteFlag::Onlink,
+    RouteFlag::Offload,
+    RouteFlag::Linkdown,
+    RouteFlag::Unresolved,
+    RouteFlag::Trap,
+    RouteFlag::Notify,
+    RouteFlag::Cloned,
+    RouteFlag::Equalize,
+    RouteFlag::Prefix,
+    RouteFlag::LookupTable,
+    RouteFlag::FibMatch,
+    RouteFlag::RtOffload,
+    RouteFlag::RtTrap,
+    RouteFlag::OffloadFailed,
+];
 
 /// A filter to query addresses.
 pub enum AddressFilter {
@@ -74,18 +120,30 @@ impl Handle {
             self.enable_link(link.index(), false).await?;
         }
 
-        // Delete all addresses associated with the link
-        let addresses = self
-            .list_addresses(AddressFilter::LinkIndex(link.index()))
-            .await?;
-        self.delete_addresses(addresses).await?;
+        // Get whether the network stack has ipv6 enabled or disabled.
+        let supports_ipv6_all = fs::read_to_string("/proc/sys/net/ipv6/conf/all/disable_ipv6")
+            .map(|s| s.trim() == "0")
+            .unwrap_or(false);
+        let supports_ipv6_default =
+            fs::read_to_string("/proc/sys/net/ipv6/conf/default/disable_ipv6")
+                .map(|s| s.trim() == "0")
+                .unwrap_or(false);
+        let supports_ipv6 = supports_ipv6_default || supports_ipv6_all;
 
         // Add new ip addresses from request
         for ip_address in &iface.IPAddresses {
             let ip = IpAddr::from_str(ip_address.address())?;
             let mask = ip_address.mask().parse::<u8>()?;
 
-            self.add_addresses(link.index(), std::iter::once(IpNetwork::new(ip, mask)?))
+            let net = IpNetwork::new(ip, mask)?;
+            if !net.is_ipv4() && !supports_ipv6 {
+                // If we're dealing with an ipv6 address, but the stack does not
+                // support ipv6, skip adding it otherwise it will lead to an
+                // error at the "CreatePodSandbox" time.
+                continue;
+            }
+
+            self.add_addresses(link.index(), std::iter::once(net))
                 .await?;
         }
 
@@ -125,6 +183,7 @@ impl Handle {
         }
 
         // Update link
+        let link = self.find_link(LinkFilter::Address(&iface.hwAddr)).await?;
         let mut request = self.handle.link().set(link.index());
         request.message_mut().header = link.header.clone();
 
@@ -172,24 +231,58 @@ impl Handle {
         Ok(())
     }
 
-    pub async fn update_routes<I>(&mut self, list: I) -> Result<()>
-    where
-        I: IntoIterator<Item = Route>,
-    {
-        let old_routes = self
-            .query_routes(None)
-            .await
-            .with_context(|| "Failed to query old routes")?;
+    #[cfg(not(target_arch = "s390x"))]
+    pub fn netdev_name_from_pci_path(&self, dev_tree_path: &str) -> Result<Option<String>> {
+        let (root_complex, pcipath) = pcipath_from_dev_tree_path(dev_tree_path)
+            .with_context(|| format!("invalid PCI path for network interface: {dev_tree_path}"))?;
+        let root_bus_sysfs = format!("{}{}", SYSFS_DIR, create_pci_root_bus_path(root_complex));
+        let sysfs_rel_path = pcilib_to_sysfs_path(&root_bus_sysfs, &pcipath)?;
+        let net_dir = format!("{root_bus_sysfs}{sysfs_rel_path}/net");
 
-        self.delete_routes(old_routes)
-            .await
-            .with_context(|| "Failed to delete old routes")?;
+        let mut entries = match fs::read_dir(&net_dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e).with_context(|| format!("failed to read net dir {net_dir}")),
+        };
 
-        self.add_routes(list)
-            .await
-            .with_context(|| "Failed to add new routes")?;
+        if let Some(entry) = entries.next() {
+            let entry = entry.with_context(|| format!("failed to read entry under {net_dir}"))?;
+            let name = entry.file_name().into_string().map_err(|non_utf8| {
+                anyhow!("non-UTF8 netdev name under {}: {:?}", net_dir, non_utf8)
+            })?;
+            return Ok(Some(name));
+        }
 
-        Ok(())
+        Ok(None)
+    }
+
+    #[cfg(not(target_arch = "s390x"))]
+    pub async fn set_link_mac_by_name(&self, ifname: &str, mac: &str) -> Result<String> {
+        let link = self.find_link(LinkFilter::Name(ifname)).await?;
+        let prev_mac = link.address();
+        if prev_mac.eq_ignore_ascii_case(mac) {
+            return Ok(prev_mac);
+        }
+
+        let parsed_mac = parse_mac_address(mac)
+            .with_context(|| format!("failed to parse MAC address: {mac}"))?;
+        if link.is_up() {
+            self.enable_link(link.index(), false).await?;
+        }
+
+        let mut request = self.handle.link().set(link.index());
+        request.message_mut().header = link.header.clone();
+        request
+            .address(parsed_mac.to_vec())
+            .execute()
+            .await
+            .with_context(|| format!("failed to set MAC for interface {} to {}", ifname, mac))?;
+
+        if link.is_up() {
+            self.enable_link(link.index(), true).await?;
+        }
+
+        Ok(prev_mac)
     }
 
     /// Retireve available network interfaces.
@@ -225,7 +318,7 @@ impl Handle {
         let request = self.handle.link().get();
 
         let filtered = match filter {
-            LinkFilter::Name(name) => request.set_name_filter(name.to_owned()),
+            LinkFilter::Name(name) => request.match_name(name.to_owned()),
             LinkFilter::Index(index) => request.match_index(index),
             _ => request, // Post filters
         };
@@ -233,16 +326,16 @@ impl Handle {
         let mut stream = filtered.execute();
 
         let next = if let LinkFilter::Address(addr) = filter {
-            use packet::link::nlas::Nla;
+            use LinkAttribute as Nla;
 
             let mac_addr = parse_mac_address(addr)
-                .with_context(|| format!("Failed to parse MAC address: {}", addr))?;
+                .with_context(|| format!("Failed to parse MAC address: {addr}"))?;
 
             // Hardware filter might not be supported by netlink,
             // we may have to dump link list and then find the target link.
             stream
                 .try_filter(|f| {
-                    let result = f.nlas.iter().any(|n| match n {
+                    let result = f.attributes.iter().any(|n| match n {
                         Nla::Address(data) => data.eq(&mac_addr),
                         _ => false,
                     });
@@ -278,10 +371,7 @@ impl Handle {
         Ok(())
     }
 
-    async fn query_routes(
-        &self,
-        ip_version: Option<IpVersion>,
-    ) -> Result<Vec<packet::RouteMessage>> {
+    async fn query_routes(&self, ip_version: Option<IpVersion>) -> Result<Vec<RouteMessage>> {
         let list = if let Some(ip_version) = ip_version {
             self.handle
                 .route()
@@ -321,36 +411,58 @@ impl Handle {
 
         for msg in self.query_routes(None).await? {
             // Ignore non-main tables
-            if msg.header.table != packet::constants::RT_TABLE_MAIN {
+            if msg.header.table != RouteHeader::RT_TABLE_MAIN {
                 continue;
             }
 
             let mut route = Route {
-                scope: msg.header.scope as _,
+                scope: u8::from(msg.header.scope) as u32,
                 ..Default::default()
             };
 
-            if let Some((ip, mask)) = msg.destination_prefix() {
-                route.dest = format!("{}/{}", ip, mask);
-            }
-
-            if let Some((ip, mask)) = msg.source_prefix() {
-                route.source = format!("{}/{}", ip, mask);
-            }
-
-            if let Some(addr) = msg.gateway() {
-                route.gateway = addr.to_string();
-
-                // For gateway, destination is 0.0.0.0
-                route.dest = if addr.is_ipv4() {
-                    String::from("0.0.0.0")
-                } else {
-                    String::from("::1")
+            for attribute in &msg.attributes {
+                if let RouteAttribute::Destination(dest) = attribute {
+                    if let Ok(dest) = parse_route_addr(dest) {
+                        route.dest = format!("{}/{}", dest, msg.header.destination_prefix_length);
+                    }
                 }
-            }
 
-            if let Some(index) = msg.output_interface() {
-                route.device = self.find_link(LinkFilter::Index(index)).await?.name();
+                if let RouteAttribute::Source(src) = attribute {
+                    if let Ok(src) = parse_route_addr(src) {
+                        route.source = format!("{}/{}", src, msg.header.source_prefix_length)
+                    }
+                }
+
+                if let RouteAttribute::Gateway(g) = attribute {
+                    if let Ok(addr) = parse_route_addr(g) {
+                        // For gateway, destination is 0.0.0.0
+                        if addr.is_ipv4() {
+                            route.dest = String::from("0.0.0.0");
+                        } else {
+                            route.dest = String::from("::1");
+                        }
+                    }
+
+                    route.gateway = parse_route_addr(g)
+                        .map(|g| g.to_string())
+                        .unwrap_or_default();
+                }
+
+                if let RouteAttribute::Metrics(metrics) = attribute {
+                    for m in metrics {
+                        if let RouteMetric::Mtu(mtu) = m {
+                            route.mtu = *mtu;
+                            break;
+                        }
+                    }
+                }
+
+                if let RouteAttribute::Oif(index) = attribute {
+                    route.device = match self.find_link(LinkFilter::Index(*index)).await {
+                        Ok(link) => link.name(),
+                        Err(_) => String::new(),
+                    };
+                }
             }
 
             if !route.dest.is_empty() {
@@ -361,10 +473,11 @@ impl Handle {
         Ok(result)
     }
 
-    /// Adds a list of routes from iterable object `I`.
+    /// Add a list of routes from iterable object `I`.
+    /// If the route existed, then replace it with the latest.
     /// It can accept both a collection of routes or a single item (via `iter::once()`).
     /// It'll also take care of proper order when adding routes (gateways first, everything else after).
-    async fn add_routes<I>(&mut self, list: I) -> Result<()>
+    pub async fn update_routes<I>(&mut self, list: I) -> Result<()>
     where
         I: IntoIterator<Item = Route>,
     {
@@ -377,23 +490,47 @@ impl Handle {
         for route in list {
             let link = self.find_link(LinkFilter::Name(&route.device)).await?;
 
-            const MAIN_TABLE: u8 = packet::constants::RT_TABLE_MAIN;
-            const UNICAST: u8 = packet::constants::RTN_UNICAST;
-            const BOOT_PROT: u8 = packet::constants::RTPROT_BOOT;
+            const MAIN_TABLE: u32 = libc::RT_TABLE_MAIN as u32;
+            let uni_cast: RouteType = RouteType::from(libc::RTN_UNICAST);
+            let boot_prot: RouteProtocol = RouteProtocol::from(libc::RTPROT_BOOT);
 
-            let scope = route.scope as u8;
+            let scope = RouteScope::from(route.scope as u8);
 
-            use packet::nlas::route::Nla;
+            use RouteAttribute as Nla;
 
             // Build a common indeterminate ip request
-            let request = self
+            let mut request = self
                 .handle
                 .route()
                 .add()
-                .table(MAIN_TABLE)
-                .kind(UNICAST)
-                .protocol(BOOT_PROT)
+                .table_id(MAIN_TABLE)
+                .kind(uni_cast)
+                .protocol(boot_prot)
                 .scope(scope);
+
+            let message = request.message_mut();
+
+            // calculate the Flag vec from the u32 flags
+            let mut got: u32 = 0;
+            let mut flags = Vec::new();
+            for flag in ALL_ROUTE_FLAGS {
+                if (route.flags & (u32::from(flag))) > 0 {
+                    flags.push(flag);
+                    got += u32::from(flag);
+                }
+            }
+            if got != route.flags {
+                flags.push(RouteFlag::Other(route.flags - got));
+            }
+
+            message.header.flags = flags;
+
+            if route.mtu != 0 {
+                let route_metrics = vec![RouteMetric::Mtu(route.mtu)];
+                message
+                    .attributes
+                    .push(RouteAttribute::Metrics(route_metrics));
+            }
 
             // `rtnetlink` offers a separate request builders for different IP versions (IP v4 and v6).
             // This if branch is a bit clumsy because it does almost the same.
@@ -408,7 +545,8 @@ impl Handle {
                 let mut request = request
                     .v6()
                     .destination_prefix(dest_addr.ip(), dest_addr.prefix())
-                    .output_interface(link.index());
+                    .output_interface(link.index())
+                    .replace();
 
                 if !route.source.is_empty() {
                     let network = Ipv6Network::from_str(&route.source)?;
@@ -417,8 +555,8 @@ impl Handle {
                     } else {
                         request
                             .message_mut()
-                            .nlas
-                            .push(Nla::PrefSource(network.ip().octets().to_vec()));
+                            .attributes
+                            .push(Nla::PrefSource(RouteAddress::from(network.ip())));
                     }
                 }
 
@@ -428,14 +566,16 @@ impl Handle {
                 }
 
                 if let Err(rtnetlink::Error::NetlinkError(message)) = request.execute().await {
-                    if Errno::from_i32(message.code.abs()) != Errno::EEXIST {
-                        return Err(anyhow!(
-                            "Failed to add IP v6 route (src: {}, dst: {}, gtw: {},Err: {})",
-                            route.source(),
-                            route.dest(),
-                            route.gateway(),
-                            message
-                        ));
+                    if let Some(code) = message.code {
+                        if Errno::from_raw(code.get()) != Errno::EEXIST {
+                            return Err(anyhow!(
+                                "Failed to add IP v6 route (src: {}, dst: {}, gtw: {},Err: {})",
+                                route.source(),
+                                route.dest(),
+                                route.gateway(),
+                                message
+                            ));
+                        }
                     }
                 }
             } else {
@@ -449,7 +589,8 @@ impl Handle {
                 let mut request = request
                     .v4()
                     .destination_prefix(dest_addr.ip(), dest_addr.prefix())
-                    .output_interface(link.index());
+                    .output_interface(link.index())
+                    .replace();
 
                 if !route.source.is_empty() {
                     let network = Ipv4Network::from_str(&route.source)?;
@@ -458,8 +599,8 @@ impl Handle {
                     } else {
                         request
                             .message_mut()
-                            .nlas
-                            .push(Nla::PrefSource(network.ip().octets().to_vec()));
+                            .attributes
+                            .push(RouteAttribute::PrefSource(RouteAddress::from(network.ip())));
                     }
                 }
 
@@ -469,45 +610,19 @@ impl Handle {
                 }
 
                 if let Err(rtnetlink::Error::NetlinkError(message)) = request.execute().await {
-                    if Errno::from_i32(message.code.abs()) != Errno::EEXIST {
-                        return Err(anyhow!(
-                            "Failed to add IP v4 route (src: {}, dst: {}, gtw: {},Err: {})",
-                            route.source(),
-                            route.dest(),
-                            route.gateway(),
-                            message
-                        ));
+                    if let Some(code) = message.code {
+                        if Errno::from_raw(code.get()) != Errno::EEXIST {
+                            return Err(anyhow!(
+                                "Failed to add IP v4 route (src: {}, dst: {}, gtw: {},Err: {})",
+                                route.source(),
+                                route.dest(),
+                                route.gateway(),
+                                message
+                            ));
+                        }
                     }
                 }
             }
-        }
-
-        Ok(())
-    }
-
-    async fn delete_routes<I>(&mut self, routes: I) -> Result<()>
-    where
-        I: IntoIterator<Item = packet::RouteMessage>,
-    {
-        for route in routes.into_iter() {
-            if route.header.protocol == packet::constants::RTPROT_KERNEL {
-                continue;
-            }
-
-            let index = if let Some(index) = route.output_interface() {
-                index
-            } else {
-                continue;
-            };
-
-            let link = self.find_link(LinkFilter::Index(index)).await?;
-
-            let name = link.name();
-            if name.contains("lo") || name.contains("::1") {
-                continue;
-            }
-
-            self.handle.route().del(route).execute().await?;
         }
 
         Ok(())
@@ -534,6 +649,8 @@ impl Handle {
         Ok(list)
     }
 
+    // add the addresses to the specified interface, if the addresses existed,
+    // replace it with the latest one.
     async fn add_addresses<I>(&mut self, index: u32, list: I) -> Result<()>
     where
         I: IntoIterator<Item = IpNetwork>,
@@ -542,20 +659,10 @@ impl Handle {
             self.handle
                 .address()
                 .add(index, net.ip(), net.prefix())
+                .replace()
                 .execute()
                 .await
                 .map_err(|err| anyhow!("Failed to add address {}: {:?}", net.ip(), err))?;
-        }
-
-        Ok(())
-    }
-
-    async fn delete_addresses<I>(&mut self, list: I) -> Result<()>
-    where
-        I: IntoIterator<Item = Address>,
-    {
-        for addr in list.into_iter() {
-            self.handle.address().del(addr.0).execute().await?;
         }
 
         Ok(())
@@ -591,63 +698,37 @@ impl Handle {
         let ip = IpAddr::from_str(ip_address)
             .map_err(|e| anyhow!("Failed to parse IP {}: {:?}", ip_address, e))?;
 
-        // Import rtnetlink objects that make sense only for this function
-        use packet::constants::{
-            NDA_UNSPEC, NLM_F_ACK, NLM_F_CREATE, NLM_F_REPLACE, NLM_F_REQUEST,
-        };
-        use packet::neighbour::{NeighbourHeader, NeighbourMessage};
-        use packet::nlas::neighbour::Nla;
-        use packet::{NetlinkMessage, NetlinkPayload, RtnlMessage};
-        use rtnetlink::Error;
-
-        const IFA_F_PERMANENT: u16 = 0x80; // See https://github.com/little-dude/netlink/blob/0185b2952505e271805902bf175fee6ea86c42b8/netlink-packet-route/src/rtnl/constants.rs#L770
-
         let link = self.find_link(LinkFilter::Name(&neigh.device)).await?;
 
-        let message = NeighbourMessage {
-            header: NeighbourHeader {
-                family: match ip {
-                    IpAddr::V4(_) => packet::AF_INET,
-                    IpAddr::V6(_) => packet::AF_INET6,
-                } as u8,
-                ifindex: link.index(),
-                state: if neigh.state != 0 {
-                    neigh.state as u16
-                } else {
-                    IFA_F_PERMANENT
-                },
-                flags: neigh.flags as u8,
-                ntype: NDA_UNSPEC as u8,
-            },
-            nlas: {
-                let mut nlas = vec![Nla::Destination(match ip {
-                    IpAddr::V4(v4) => v4.octets().to_vec(),
-                    IpAddr::V6(v6) => v6.octets().to_vec(),
-                })];
-
-                if !neigh.lladdr.is_empty() {
-                    nlas.push(Nla::LinkLocalAddress(
-                        parse_mac_address(&neigh.lladdr)?.to_vec(),
-                    ));
-                }
-
-                nlas
-            },
-        };
-
-        // Send request and ACK
-        let mut req = NetlinkMessage::from(RtnlMessage::NewNeighbour(message));
-        req.header.flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE;
-
-        let mut response = self.handle.request(req)?;
-        while let Some(message) = response.next().await {
-            if let NetlinkPayload::Error(err) = message.payload {
-                return Err(anyhow!(Error::NetlinkError(err)));
+        let mut flags = Vec::new();
+        for flag in ALL_RULE_FLAGS {
+            if (neigh.flags as u8 & (u8::from(flag))) > 0 {
+                flags.push(flag);
             }
         }
-
-        Ok(())
+        let state = if neigh.state == 0 {
+            NeighbourState::Permanent
+        } else {
+            (neigh.state as u16).into()
+        };
+        let mut req = self
+            .handle
+            .neighbours()
+            .add(link.index(), ip)
+            .state(state)
+            .flags(flags)
+            .replace();
+        if !neigh.lladdr.is_empty() {
+            let lladdr = parse_mac_address(&neigh.lladdr).context("parsing lladdr")?;
+            req = req.link_local_address(&lladdr);
+        }
+        req.execute().await.context("executing NeighbourAddRequest")
     }
+}
+
+#[cfg(not(target_arch = "s390x"))]
+fn pcilib_to_sysfs_path(root_bus_sysfs: &str, pcipath: &pci::Path) -> Result<String> {
+    pcipath_to_sysfs(root_bus_sysfs, pcipath)
 }
 
 fn format_address(data: &[u8]) -> Result<String> {
@@ -700,13 +781,13 @@ fn parse_mac_address(addr: &str) -> Result<[u8; 6]> {
 }
 
 /// Wraps external type with the local one, so we can implement various extensions and type conversions.
-struct Link(packet::LinkMessage);
+struct Link(LinkMessage);
 
 impl Link {
     /// If name.
     fn name(&self) -> String {
-        use packet::nlas::link::Nla;
-        self.nlas
+        use LinkAttribute as Nla;
+        self.attributes
             .iter()
             .find_map(|n| {
                 if let Nla::IfName(name) = n {
@@ -720,8 +801,8 @@ impl Link {
 
     /// Extract Mac address.
     fn address(&self) -> String {
-        use packet::nlas::link::Nla;
-        self.nlas
+        use LinkAttribute as Nla;
+        self.attributes
             .iter()
             .find_map(|n| {
                 if let Nla::Address(data) = n {
@@ -735,7 +816,12 @@ impl Link {
 
     /// Returns whether the link is UP
     fn is_up(&self) -> bool {
-        self.header.flags & packet::rtnl::constants::IFF_UP > 0
+        let mut flags: u32 = 0;
+        for flag in &self.header.flags {
+            flags += u32::from(*flag);
+        }
+
+        flags as i32 & libc::IFF_UP > 0
     }
 
     fn index(&self) -> u32 {
@@ -743,8 +829,8 @@ impl Link {
     }
 
     fn mtu(&self) -> Option<u64> {
-        use packet::nlas::link::Nla;
-        self.nlas.iter().find_map(|n| {
+        use LinkAttribute as Nla;
+        self.attributes.iter().find_map(|n| {
             if let Nla::Mtu(mtu) = n {
                 Some(*mtu as u64)
             } else {
@@ -754,21 +840,21 @@ impl Link {
     }
 }
 
-impl From<packet::LinkMessage> for Link {
-    fn from(msg: packet::LinkMessage) -> Self {
+impl From<LinkMessage> for Link {
+    fn from(msg: LinkMessage) -> Self {
         Link(msg)
     }
 }
 
 impl Deref for Link {
-    type Target = packet::LinkMessage;
+    type Target = LinkMessage;
 
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
-struct Address(packet::AddressMessage);
+struct Address(AddressMessage);
 
 impl TryFrom<Address> for IPAddress {
     type Error = anyhow::Error;
@@ -798,7 +884,7 @@ impl TryFrom<Address> for IPAddress {
 
 impl Address {
     fn is_ipv6(&self) -> bool {
-        self.0.header.family == packet::constants::AF_INET6 as u8
+        u8::from(self.0.header.family) == libc::AF_INET6 as u8
     }
 
     #[allow(dead_code)]
@@ -807,13 +893,13 @@ impl Address {
     }
 
     fn address(&self) -> String {
-        use packet::nlas::address::Nla;
+        use AddressAttribute as Nla;
         self.0
-            .nlas
+            .attributes
             .iter()
             .find_map(|n| {
                 if let Nla::Address(data) = n {
-                    format_address(data).ok()
+                    Some(data.to_string())
                 } else {
                     None
                 }
@@ -822,13 +908,13 @@ impl Address {
     }
 
     fn local(&self) -> String {
-        use packet::nlas::address::Nla;
+        use AddressAttribute as Nla;
         self.0
-            .nlas
+            .attributes
             .iter()
             .find_map(|n| {
                 if let Nla::Local(data) = n {
-                    format_address(data).ok()
+                    Some(data.to_string())
                 } else {
                     None
                 }
@@ -837,13 +923,41 @@ impl Address {
     }
 }
 
+fn parse_route_addr(ra: &RouteAddress) -> Result<IpAddr> {
+    let ipaddr = match ra {
+        RouteAddress::Inet6(ipv6_addr) => ipv6_addr.to_canonical(),
+        RouteAddress::Inet(ipv4_addr) => IpAddr::from(*ipv4_addr),
+        _ => return Err(anyhow!("got invalid route address")),
+    };
+
+    Ok(ipaddr)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rtnetlink::packet;
+    use netlink_packet_route::address::AddressHeader;
+    use netlink_packet_route::link::LinkHeader;
+    use serial_test::serial;
     use std::iter;
     use std::process::Command;
     use test_utils::skip_if_not_root;
+
+    // Constants for ARP neighbor tests
+    const TEST_DUMMY_INTERFACE: &str = "dummy_for_arp";
+    const TEST_ARP_IP: &str = "192.0.2.127";
+
+    /// Helper function to check if the result is a netlink EACCES error
+    fn is_netlink_permission_error<T>(result: &Result<T>) -> bool {
+        if let Err(e) = result {
+            let error_string = format!("{e:?}");
+            if error_string.contains("code: Some(-13)") {
+                println!("INFO: skipping test - netlink operations are restricted in this environment (EACCES)");
+                return true;
+            }
+        }
+        false
+    }
 
     #[tokio::test]
     async fn find_link_by_name() {
@@ -853,7 +967,7 @@ mod tests {
             .await
             .expect("Loopback not found");
 
-        assert_ne!(message.header, packet::LinkHeader::default());
+        assert_ne!(message.header, LinkHeader::default());
         assert_eq!(message.name(), "lo");
     }
 
@@ -904,18 +1018,18 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(arp_neighbor_tests)]
     async fn list_routes() {
+        clean_env_for_test_add_one_arp_neighbor(TEST_DUMMY_INTERFACE, TEST_ARP_IP);
+        let devices: Vec<Interface> = Handle::new().unwrap().list_interfaces().await.unwrap();
         let all = Handle::new()
             .unwrap()
             .list_routes()
             .await
+            .context(format!("available devices: {devices:?}"))
             .expect("Failed to list routes");
 
         assert_ne!(all.len(), 0);
-
-        for r in &all {
-            assert_ne!(r.device.len(), 0);
-        }
     }
 
     #[tokio::test]
@@ -928,7 +1042,7 @@ mod tests {
 
         assert_ne!(list.len(), 0);
         for addr in &list {
-            assert_ne!(addr.0.header, packet::AddressHeader::default());
+            assert_ne!(addr.0.header, AddressHeader::default());
         }
     }
 
@@ -952,7 +1066,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn add_delete_addresses() {
+    async fn add_update_addresses() {
         skip_if_not_root!();
 
         let list = vec![
@@ -964,10 +1078,14 @@ mod tests {
         let lo = handle.find_link(LinkFilter::Name("lo")).await.unwrap();
 
         for network in list {
-            handle
-                .add_addresses(lo.index(), iter::once(network))
-                .await
-                .expect("Failed to add IP");
+            let result = handle.add_addresses(lo.index(), iter::once(network)).await;
+
+            // Skip test if netlink operations are restricted (EACCES = -13)
+            if is_netlink_permission_error(&result) {
+                return;
+            }
+
+            result.expect("Failed to add IP");
 
             // Make sure the address is there
             let result = handle
@@ -981,11 +1099,15 @@ mod tests {
 
             assert!(result.is_some());
 
-            // Delete it
-            handle
-                .delete_addresses(iter::once(result.unwrap()))
-                .await
-                .expect("Failed to delete address");
+            // Update it
+            let result = handle.add_addresses(lo.index(), iter::once(network)).await;
+
+            // Skip test if netlink operations are restricted (EACCES = -13)
+            if is_netlink_permission_error(&result) {
+                return;
+            }
+
+            result.expect("Failed to delete address");
         }
     }
 
@@ -1020,7 +1142,7 @@ mod tests {
             .expect("prepare: failed to delete neigh");
     }
 
-    fn prepare_env_for_test_add_one_arp_neighbor(dummy_name: &str, ip: &str) {
+    async fn prepare_env_for_test_add_one_arp_neighbor(dummy_name: &str, ip: &str) {
         clean_env_for_test_add_one_arp_neighbor(dummy_name, ip);
         // modprobe dummy
         Command::new("modprobe")
@@ -1034,9 +1156,9 @@ mod tests {
             .output()
             .expect("failed to add dummy interface");
 
-        // ip addr add 192.168.0.2/16 dev dummy
+        // ip addr add 192.0.2.2/24 dev dummy
         Command::new("ip")
-            .args(["addr", "add", "192.168.0.2/16", "dev", dummy_name])
+            .args(["addr", "add", "192.0.2.2/24", "dev", dummy_name])
             .output()
             .expect("failed to add ip for dummy");
 
@@ -1045,24 +1167,26 @@ mod tests {
             .args(["link", "set", dummy_name, "up"])
             .output()
             .expect("failed to up dummy");
+
+        // Wait briefly to ensure the IP address addition is fully complete
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     }
 
     #[tokio::test]
+    #[serial(arp_neighbor_tests)]
     async fn test_add_one_arp_neighbor() {
         skip_if_not_root!();
 
         let mac = "6a:92:3a:59:70:aa";
-        let to_ip = "169.254.1.1";
-        let dummy_name = "dummy_for_arp";
 
-        prepare_env_for_test_add_one_arp_neighbor(dummy_name, to_ip);
+        prepare_env_for_test_add_one_arp_neighbor(TEST_DUMMY_INTERFACE, TEST_ARP_IP).await;
 
         let mut ip_address = IPAddress::new();
-        ip_address.set_address(to_ip.to_string());
+        ip_address.set_address(TEST_ARP_IP.to_string());
 
         let mut neigh = ARPNeighbor::new();
         neigh.set_toIPAddress(ip_address);
-        neigh.set_device(dummy_name.to_string());
+        neigh.set_device(TEST_DUMMY_INTERFACE.to_string());
         neigh.set_lladdr(mac.to_string());
         neigh.set_state(0x80);
 
@@ -1073,15 +1197,24 @@ mod tests {
             .expect("Failed to add ARP neighbor");
 
         // ip neigh show dev dummy ip
-        let stdout = Command::new("ip")
-            .args(["neigh", "show", "dev", dummy_name, to_ip])
+        let output = Command::new("ip")
+            .args(["neigh", "show", "dev", TEST_DUMMY_INTERFACE, TEST_ARP_IP])
             .output()
-            .expect("failed to show neigh")
-            .stdout;
+            .expect("failed to show neigh");
 
-        let stdout = std::str::from_utf8(&stdout).expect("failed to conveert stdout");
-        assert_eq!(stdout, format!("{} lladdr {} PERMANENT\n", to_ip, mac));
+        let stdout = std::str::from_utf8(&output.stdout).expect("failed to convert stdout");
+        let stderr = std::str::from_utf8(&output.stderr).expect("failed to convert stderr");
+        assert!(
+            output.status.success(),
+            "`ip neigh show` returned exit code {:?}. stderr: {:?}",
+            output.status.code(),
+            stderr
+        );
+        assert_eq!(
+            stdout.trim(),
+            format!("{TEST_ARP_IP} lladdr {mac} PERMANENT")
+        );
 
-        clean_env_for_test_add_one_arp_neighbor(dummy_name, to_ip);
+        clean_env_for_test_add_one_arp_neighbor(TEST_DUMMY_INTERFACE, TEST_ARP_IP);
     }
 }

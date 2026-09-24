@@ -4,14 +4,13 @@
 //
 
 use std::fs::{self, File};
-use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::os::unix::io::{AsFd, AsRawFd, FromRawFd};
 use std::path::Path;
 
 use anyhow::{anyhow, Context, Result};
-use eventfd::{eventfd, EfdFlags};
 use futures::StreamExt as _;
 use inotify::{Inotify, WatchMask};
-use nix::sys::eventfd;
+use nix::sys::eventfd::{EfdFlags, EventFd};
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc::{channel, Receiver};
 
@@ -77,9 +76,17 @@ async fn register_memory_event_v2(
     let mut inotify = Inotify::init().context("Failed to initialize inotify")?;
 
     // watching oom kill
-    let ev_wd = inotify.add_watch(&event_control_path, WatchMask::MODIFY)?;
+    let ev_wd = inotify
+        .add_watch(&event_control_path, WatchMask::MODIFY)
+        .context(format!("failed to add watch for {:?}", &event_control_path))?;
+
     // Because no `unix.IN_DELETE|unix.IN_DELETE_SELF` event for cgroup file system, so watching all process exited
-    let cg_wd = inotify.add_watch(&cgroup_event_control_path, WatchMask::MODIFY)?;
+    let cg_wd = inotify
+        .add_watch(&cgroup_event_control_path, WatchMask::MODIFY)
+        .context(format!(
+            "failed to add watch for {:?}",
+            &cgroup_event_control_path
+        ))?;
 
     info!(sl(), "ev_wd: {:?}", ev_wd);
     info!(sl(), "cg_wd: {:?}", cg_wd);
@@ -147,19 +154,23 @@ async fn register_memory_event(
     let path = Path::new(&cg_dir).join(event_name);
     let event_file = File::open(path.clone())?;
 
-    let eventfd = eventfd(0, EfdFlags::EFD_CLOEXEC)?;
+    let eventfd = EventFd::from_value_and_flags(0, EfdFlags::EFD_CLOEXEC)?;
 
     let event_control_path = Path::new(&cg_dir).join("cgroup.event_control");
 
+    // Get raw fd and prevent eventfd from closing it when it drops
+    let eventfd_raw = eventfd.as_fd().as_raw_fd();
     let data = if arg.is_empty() {
-        format!("{} {}", eventfd, event_file.as_raw_fd())
+        format!("{} {}", eventfd_raw, event_file.as_raw_fd())
     } else {
-        format!("{} {} {}", eventfd, event_file.as_raw_fd(), arg)
+        format!("{} {} {}", eventfd_raw, event_file.as_raw_fd(), arg)
     };
 
     fs::write(&event_control_path, data)?;
 
-    let mut eventfd_stream = unsafe { PipeStream::from_raw_fd(eventfd) };
+    // Transfer ownership to PipeStream and prevent eventfd from closing the fd
+    let mut eventfd_stream = unsafe { PipeStream::from_raw_fd(eventfd_raw) };
+    std::mem::forget(eventfd);
 
     let (sender, receiver) = tokio::sync::mpsc::channel(100);
     let containere_id = cid.to_string();

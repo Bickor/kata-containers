@@ -16,13 +16,12 @@ use std::collections::HashMap;
 use std::ops::Deref;
 use std::os::fd::RawFd;
 use std::path::Path;
-use std::sync::{Arc, Weak};
+use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex, Weak};
 
-use crossbeam_channel::Sender;
 use dbs_device::resources::Resource::LegacyIrq;
 use dbs_device::resources::{DeviceResources, Resource, ResourceConstraint};
 use dbs_device::DeviceIo;
-use dbs_interrupt::KvmIrqManager;
 use dbs_pci::{VfioPciDevice, VENDOR_NVIDIA};
 use dbs_upcall::{DevMgrResponse, UpcallClientResponse};
 use kvm_ioctls::{DeviceFd, VmFd};
@@ -37,8 +36,8 @@ use vm_memory::{
 use super::StartMicroVmError;
 use crate::address_space_manager::{GuestAddressSpaceImpl, GuestMemoryImpl};
 use crate::config_manager::{ConfigItem, DeviceConfigInfo, DeviceConfigInfos};
-use crate::device_manager::{DeviceManagerContext, DeviceMgrError, DeviceOpContext};
-use crate::resource_manager::{ResourceError, ResourceManager};
+use crate::device_manager::{DeviceMgrError, DeviceOpContext};
+use crate::resource_manager::ResourceError;
 
 // The flag of whether to use the shared irq.
 const USE_SHARED_IRQ: bool = true;
@@ -230,7 +229,7 @@ pub struct VfioDeviceMgr {
     info_list: DeviceConfigInfos<HostDeviceConfig>,
     locked_vm_size: u64,
     vfio_container: Option<Arc<VfioContainer>>,
-    pci_vfio_manager: Option<Arc<PciSystemManager>>,
+    pci_system_manager: Arc<Mutex<PciSystemManager>>,
     pci_legacy_irqs: Option<HashMap<u8, u8>>,
     nvidia_shared_irq: Option<u32>,
     logger: slog::Logger,
@@ -238,13 +237,17 @@ pub struct VfioDeviceMgr {
 
 impl VfioDeviceMgr {
     /// Create a new VFIO device manager.
-    pub fn new(vm_fd: Arc<VmFd>, logger: &slog::Logger) -> Self {
+    pub fn new(
+        vm_fd: Arc<VmFd>,
+        pci_system_manager: Arc<Mutex<PciSystemManager>>,
+        logger: &slog::Logger,
+    ) -> Self {
         VfioDeviceMgr {
             vm_fd,
             info_list: DeviceConfigInfos::new(),
             locked_vm_size: 0,
             vfio_container: None,
-            pci_vfio_manager: None,
+            pci_system_manager,
             pci_legacy_irqs: Some(HashMap::new()),
             nvidia_shared_irq: None,
             logger: logger.new(slog::o!()),
@@ -288,17 +291,6 @@ impl VfioDeviceMgr {
         &mut self,
         ctx: &mut DeviceOpContext,
     ) -> std::result::Result<(), StartMicroVmError> {
-        // create and attach pci root bus
-        #[cfg(all(feature = "hotplug", feature = "host-device"))]
-        if ctx.pci_hotplug_enabled {
-            let _ = self
-                .create_pci_manager(
-                    ctx.irq_manager.clone(),
-                    ctx.io_context.clone(),
-                    ctx.res_manager.clone(),
-                )
-                .map_err(StartMicroVmError::CreateVfioDevice)?;
-        }
         for (idx, info) in self.info_list.clone().iter().enumerate() {
             self.create_device(&info.config, ctx, idx)
                 .map_err(StartMicroVmError::CreateVfioDevice)?;
@@ -357,13 +349,13 @@ impl VfioDeviceMgr {
                     UpcallClientResponse::DevMgr(response) => {
                         if let DevMgrResponse::Other(resp) = response {
                             if let Err(e) = result_sender.send(Some(resp.result)) {
-                                error!("send upcall result failed, due to {:?}!", e);
+                                error!("send upcall result failed, due to {e:?}!");
                             }
                         }
                     }
                     UpcallClientResponse::UpcallReset => {
                         if let Err(e) = result_sender.send(None) {
-                            error!("send upcall result failed, due to {:?}!", e);
+                            error!("send upcall result failed, due to {e:?}!");
                         }
                     }
                     #[allow(unreachable_patterns)]
@@ -414,9 +406,11 @@ impl VfioDeviceMgr {
         if let Some(vfio_container) = self.vfio_container.as_ref() {
             Ok(vfio_container.clone())
         } else {
-            let kvm_dev_fd = Arc::new(self.get_kvm_dev_fd()?);
-            let vfio_container =
-                Arc::new(VfioContainer::new(kvm_dev_fd).map_err(VfioDeviceError::VfioIoctlError)?);
+            let kvm_dev_fd = self.get_kvm_dev_fd()?;
+            let vfio_dev_fd = Arc::new(vfio_ioctls::VfioDeviceFd::new_from_kvm(kvm_dev_fd));
+            let vfio_container = Arc::new(
+                VfioContainer::new(Some(vfio_dev_fd)).map_err(VfioDeviceError::VfioIoctlError)?,
+            );
             self.vfio_container = Some(vfio_container.clone());
 
             Ok(vfio_container)
@@ -505,9 +499,11 @@ impl VfioDeviceMgr {
             "readonly" => readonly,
         );
         //FIXME: add readonly flag when related commit is pushed to upstream vfio-ioctls
-        self.get_vfio_container()?
-            .vfio_dma_map(iova, size, user_addr)
-            .map_err(VfioDeviceError::VfioIoctlError)?;
+        unsafe {
+            self.get_vfio_container()?
+                .vfio_dma_map(iova, size as usize, user_addr as *mut u8)
+        }
+        .map_err(VfioDeviceError::VfioIoctlError)?;
         self.locked_vm_size += size;
         Ok(())
     }
@@ -522,7 +518,7 @@ impl VfioDeviceMgr {
         let size = region.len();
 
         self.get_vfio_container()?
-            .vfio_dma_unmap(gpa, size)
+            .vfio_dma_unmap(gpa, size as usize)
             .map_err(VfioDeviceError::VfioIoctlError)?;
 
         self.locked_vm_size -= size;
@@ -546,9 +542,9 @@ impl VfioDeviceMgr {
             if len == 0 {
                 Err(VfioDeviceError::InvalidConfig)
             } else if len == 2 {
-                Ok(format!("/sys/bus/pci/devices/{:04}:{}", domain, bdf))
+                Ok(format!("/sys/bus/pci/devices/{domain:04}:{bdf}"))
             } else {
-                Ok(format!("/sys/bus/pci/devices/{}", bdf))
+                Ok(format!("/sys/bus/pci/devices/{bdf}"))
             }
         } else {
             Ok(cfg.sysfs_path.clone())
@@ -574,12 +570,9 @@ impl VfioDeviceMgr {
             "subsystem" => "vfio_dev_mgr",
              "host_bdf" => &cfg.bus_slot_func,
         );
-        // safe to get pci_manager
-        let pci_manager = self.create_pci_manager(
-            ctx.irq_manager.clone(),
-            ctx.io_context.clone(),
-            ctx.res_manager.clone(),
-        )?;
+
+        let pci_manager = self.get_pci_manager();
+        let pci_manager = pci_manager.lock().unwrap();
         let pci_bus = pci_manager.pci_root_bus();
         let id = pci_manager
             .new_device_id(cfg.guest_dev_id)
@@ -607,7 +600,7 @@ impl VfioDeviceMgr {
                 sysfs_path,
                 Arc::downgrade(&pci_bus),
                 vfio_dev,
-                Arc::downgrade(self.get_pci_manager().unwrap()),
+                self.get_pci_manager(),
                 ctx.vm_fd.clone(),
                 cfg.vendor_device_id,
                 cfg.clique_id,
@@ -665,8 +658,8 @@ impl VfioDeviceMgr {
 
         // safe to unwrap because pci vfio manager is already created
         let _ = self
-            .pci_vfio_manager
-            .as_mut()
+            .pci_system_manager
+            .lock()
             .unwrap()
             .free_device_id(device_id)
             .ok_or(VfioDeviceError::InvalidDeviceID(device_id))?;
@@ -698,27 +691,9 @@ impl VfioDeviceMgr {
         Ok(())
     }
 
-    pub(crate) fn create_pci_manager(
-        &mut self,
-        irq_manager: Arc<KvmIrqManager>,
-        io_context: DeviceManagerContext,
-        res_manager: Arc<ResourceManager>,
-    ) -> Result<&mut Arc<PciSystemManager>> {
-        if self.pci_vfio_manager.is_none() {
-            let mut mgr = PciSystemManager::new(irq_manager, io_context, res_manager.clone())?;
-            let requirements = mgr.resource_requirements();
-            let resources = res_manager
-                .allocate_device_resources(&requirements, USE_SHARED_IRQ)
-                .or(Err(VfioDeviceError::NoResource))?;
-            mgr.activate(resources)?;
-            self.pci_vfio_manager = Some(Arc::new(mgr));
-        }
-        Ok(self.pci_vfio_manager.as_mut().unwrap())
-    }
-
     /// Get the PCI manager to support PCI device passthrough
-    pub fn get_pci_manager(&mut self) -> Option<&mut Arc<PciSystemManager>> {
-        self.pci_vfio_manager.as_mut()
+    pub fn get_pci_manager(&mut self) -> Arc<Mutex<PciSystemManager>> {
+        self.pci_system_manager.clone()
     }
 }
 
@@ -729,10 +704,10 @@ mod tests {
     use vm_memory::{GuestAddress, GuestMemoryMmap, MmapRegion};
 
     use super::*;
-    use crate::config_manager::DeviceInfoGroup;
+    use crate::config_manager::DeviceConfigInfo;
     use crate::test_utils::tests::create_vm_for_test;
 
-    type VfioDeviceInfo = DeviceInfoGroup<VfioDeviceConfigInfo, VfioDeviceError>;
+    type VfioDeviceInfo = DeviceConfigInfo<VfioDeviceConfigInfo, VfioDeviceError>;
 
     fn get_vfio_dev_mgr() -> VfioDeviceMgr {
         let kvm = Kvm::new().unwrap();

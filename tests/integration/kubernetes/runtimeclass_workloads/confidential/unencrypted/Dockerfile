@@ -2,9 +2,8 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-# We know that using latest is error prone, we're taking the risk here.
-# hadolint ignore=DL3007
-FROM alpine:latest
+# alpine:3.20
+FROM alpine@sha256:b3119ef930faabb6b7b976780c0c7a9c1aa24d0c75e9179ac10e6bc9ac080d0d
 
 # We don't need a specific version of those packages
 # hadolint ignore=DL3018
@@ -33,5 +32,9 @@ RUN passwd -d root
 
 # Generated with `ssh-keygen -t ed25519 -f unencrypted -P "" -C ""`
 COPY ssh/unencrypted.pub /root/.ssh/authorized_keys
+
+# Set correct permissions for SSH folders and files
+RUN chmod 700 /root/.ssh
+RUN chmod 600 /root/.ssh/authorized_keys
 
 ENTRYPOINT ["/usr/sbin/sshd", "-D"]

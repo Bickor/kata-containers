@@ -5,6 +5,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use libc::uid_t;
+use nix::errno::Errno;
 use nix::fcntl::{self, OFlag};
 #[cfg(not(test))]
 use nix::mount;
@@ -18,12 +19,13 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::mem::MaybeUninit;
 use std::os::unix;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::RawFd;
 use std::path::{Component, Path, PathBuf};
 
 use path_absolutize::*;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, ErrorKind};
 
 use crate::container::DEFAULT_DEVICES;
 use crate::selinux;
@@ -31,6 +33,7 @@ use crate::sync::write_count;
 use std::string::ToString;
 
 use crate::log_child;
+use safe_path::scoped_join;
 
 // Info reveals information about a particular mounted filesystem. This
 // struct is populated from the content in the /proc/<pid>/mountinfo file.
@@ -233,7 +236,7 @@ pub fn init_rootfs(
         // bind may be only specified in the oci spec options -> flags update r#type
         let m = &{
             let mut mbind = m.clone();
-            if mbind.typ().is_none() && flags & MsFlags::MS_BIND == MsFlags::MS_BIND {
+            if is_none_mount_type(mbind.typ()) && flags & MsFlags::MS_BIND == MsFlags::MS_BIND {
                 mbind.set_typ(Some("bind".to_string()));
             }
             mbind
@@ -276,7 +279,10 @@ pub fn init_rootfs(
             // first check that we have non-default options required before attempting a
             // remount
             if mount_typ == "bind" && !pgflags.is_empty() {
-                let dest = secure_join(rootfs, mount_dest);
+                let dest = scoped_join(rootfs, mount_dest)?
+                    .to_str()
+                    .ok_or_else(|| anyhow::anyhow!("Failed to convert path to string"))?
+                    .to_string();
                 mount(
                     None::<&str>,
                     dest.as_str(),
@@ -331,25 +337,19 @@ fn check_proc_mount(m: &Mount) -> Result<()> {
 
     if mount_dest == PROC_PATH {
         // only allow a mount on-top of proc if it's source is "proc"
-        unsafe {
-            let mut stats = MaybeUninit::<libc::statfs>::uninit();
-            let mount_source = m.source().as_ref().unwrap().display().to_string();
-            if mount_source
-                .with_nix_path(|path| libc::statfs(path.as_ptr(), stats.as_mut_ptr()))
-                .is_ok()
-            {
-                if stats.assume_init().f_type == PROC_SUPER_MAGIC {
-                    return Ok(());
-                }
-            } else {
-                return Ok(());
-            }
+        let mount_source = m.source().as_ref().unwrap().display().to_string();
 
-            return Err(anyhow!(format!(
+        let mut stats = MaybeUninit::<libc::statfs>::uninit();
+        let statfs_ret = mount_source
+            .with_nix_path(|path| unsafe { libc::statfs(path.as_ptr(), stats.as_mut_ptr()) })?;
+
+        return match Errno::result(statfs_ret) {
+            Ok(_) if unsafe { stats.assume_init().f_type } == PROC_SUPER_MAGIC => Ok(()),
+            Ok(_) | Err(_) => Err(anyhow!(format!(
                 "{} cannot be mounted to {} because it is not of type proc",
                 &mount_source, &mount_dest
-            )));
-        }
+            ))),
+        };
     }
 
     if mount_dest.starts_with(PROC_PATH) {
@@ -395,6 +395,13 @@ fn mount_cgroups_v2(cfd_log: RawFd, m: &Mount, rootfs: &str, flags: MsFlags) -> 
     }
 
     Ok(())
+}
+
+fn is_none_mount_type(typ: &Option<String>) -> bool {
+    match typ {
+        Some(t) => t == "none",
+        None => true,
+    }
 }
 
 fn mount_cgroups(
@@ -469,16 +476,14 @@ fn mount_cgroups(
 
         if key != base {
             let src = format!("{}/{}", &mount_dest, key);
-            unix::fs::symlink(destination.as_str(), &src[1..]).map_err(|e| {
+            unix::fs::symlink(destination.as_str(), &src[1..]).inspect_err(|e| {
                 log_child!(
                     cfd_log,
                     "symlink: {} {} err: {}",
                     key,
                     destination.as_str(),
                     e.to_string()
-                );
-
-                e
+                )
             })?;
         }
     }
@@ -517,19 +522,18 @@ fn pivot_root<P1: ?Sized + NixPath, P2: ?Sized + NixPath>(
 
 pub fn pivot_rootfs<P: ?Sized + NixPath + std::fmt::Debug>(path: &P) -> Result<()> {
     let oldroot = fcntl::open("/", OFlag::O_DIRECTORY | OFlag::O_RDONLY, Mode::empty())?;
-    defer!(unistd::close(oldroot).unwrap());
     let newroot = fcntl::open(path, OFlag::O_DIRECTORY | OFlag::O_RDONLY, Mode::empty())?;
-    defer!(unistd::close(newroot).unwrap());
+    // OwnedFd will close automatically when they go out of scope
 
     // Change to the new root so that the pivot_root actually acts on it.
-    unistd::fchdir(newroot)?;
-    pivot_root(".", ".").context(format!("failed to pivot_root on {:?}", path))?;
+    unistd::fchdir(&newroot)?;
+    pivot_root(".", ".").context(format!("failed to pivot_root on {path:?}"))?;
 
     // Currently our "." is oldroot (according to the current kernel code).
     // However, purely for safety, we will fchdir(oldroot) since there isn't
     // really any guarantee from the kernel what /proc/self/cwd will be after a
     // pivot_root(2).
-    unistd::fchdir(oldroot)?;
+    unistd::fchdir(&oldroot)?;
 
     // Make oldroot rslave to make sure our unmounts don't propagate to the
     // host. We don't use rprivate because this is known to cause issues due
@@ -747,52 +751,6 @@ fn parse_mount(m: &Mount) -> (MsFlags, MsFlags, String) {
     (flags, pgflags, data.join(","))
 }
 
-// This function constructs a canonicalized path by combining the `rootfs` and `unsafe_path` elements.
-// The resulting path is guaranteed to be ("below" / "in a directory under") the `rootfs` directory.
-//
-// Parameters:
-//
-// - `rootfs` is the absolute path to the root of the containers root filesystem directory.
-// - `unsafe_path` is path inside a container. It is unsafe since it may try to "escape" from the containers
-//    rootfs by using one or more "../" path elements or is its a symlink to path.
-fn secure_join(rootfs: &str, unsafe_path: &str) -> String {
-    let mut path = PathBuf::from(format!("{}/", rootfs));
-    let unsafe_p = Path::new(&unsafe_path);
-
-    for it in unsafe_p.iter() {
-        let it_p = Path::new(&it);
-
-        // if it_p leads with "/", path.push(it) will be replace as it, so ignore "/"
-        if it_p.has_root() {
-            continue;
-        };
-
-        path.push(it);
-        if let Ok(v) = path.read_link() {
-            if v.is_absolute() {
-                path = PathBuf::from(format!("{}{}", rootfs, v.to_str().unwrap()));
-            } else {
-                path.pop();
-                for it in v.iter() {
-                    path.push(it);
-                    if path.exists() {
-                        path = path.canonicalize().unwrap();
-                        if !path.starts_with(rootfs) {
-                            path = PathBuf::from(rootfs.to_string());
-                        }
-                    }
-                }
-            }
-        }
-        // skip any ".."
-        if path.ends_with("..") {
-            path.pop();
-        }
-    }
-
-    path.to_str().unwrap().to_string()
-}
-
 fn mount_from(
     cfd_log: RawFd,
     m: &Mount,
@@ -804,7 +762,10 @@ fn mount_from(
     let mut d = String::from(data);
     let mount_dest = m.destination().display().to_string();
     let mount_typ = m.typ().as_ref().unwrap();
-    let dest = secure_join(rootfs, &mount_dest);
+    let dest = scoped_join(rootfs, mount_dest)?
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("Failed to convert path to string"))?
+        .to_string();
 
     let mount_source = m.source().as_ref().unwrap().display().to_string();
     let src = if mount_typ == "bind" {
@@ -815,20 +776,20 @@ fn mount_from(
             Path::new(&dest).parent().unwrap()
         };
 
-        fs::create_dir_all(dir).map_err(|e| {
+        fs::create_dir_all(dir).inspect_err(|e| {
             log_child!(
                 cfd_log,
                 "create dir {}: {}",
                 dir.to_str().unwrap(),
                 e.to_string()
-            );
-            e
+            )
         })?;
 
         // make sure file exists so we can bind over it
         if !src.is_dir() {
             let _ = OpenOptions::new()
                 .create(true)
+                .truncate(true)
                 .write(true)
                 .open(&dest)
                 .map_err(|e| {
@@ -851,10 +812,8 @@ fn mount_from(
         }
     };
 
-    let _ = stat::stat(dest.as_str()).map_err(|e| {
-        log_child!(cfd_log, "dest stat error. {}: {:?}", dest.as_str(), e);
-        e
-    })?;
+    let _ = stat::stat(dest.as_str())
+        .inspect_err(|e| log_child!(cfd_log, "dest stat error. {}: {:?}", dest.as_str(), e))?;
 
     // Set the SELinux context for the mounts
     let mut use_xattr = false;
@@ -897,12 +856,9 @@ fn mount_from(
         dest.as_str(),
         Some(mount_typ.as_str()),
         flags,
-        Some(d.as_str()),
+        Some(d.as_str()).filter(|s| !s.is_empty()),
     )
-    .map_err(|e| {
-        log_child!(cfd_log, "mount error: {:?}", e);
-        e
-    })?;
+    .inspect_err(|e| log_child!(cfd_log, "mount error: {:?}", e))?;
 
     if !label.is_empty() && selinux::is_enabled()? && use_xattr {
         xattr::set(dest.as_str(), "security.selinux", label.as_bytes())?;
@@ -925,10 +881,7 @@ fn mount_from(
             flags | MsFlags::MS_REMOUNT,
             None::<&str>,
         )
-        .map_err(|e| {
-            log_child!(cfd_log, "remout {}: {:?}", dest.as_str(), e);
-            e
-        })?;
+        .inspect_err(|e| log_child!(cfd_log, "remout {}: {:?}", dest.as_str(), e))?;
     }
     Ok(())
 }
@@ -966,7 +919,7 @@ fn create_devices(devices: &[LinuxDevice], bind: bool) -> Result<()> {
     for dev in DEFAULT_DEVICES.iter() {
         let dev_path = dev.path().display().to_string();
         let path = Path::new(&dev_path[1..]);
-        op(dev, path).context(format!("Creating container device {:?}", dev))?;
+        op(dev, path).context(format!("Creating container device {dev:?}"))?;
     }
     for dev in devices {
         let dev_path = &dev.path();
@@ -978,9 +931,9 @@ fn create_devices(devices: &[LinuxDevice], bind: bool) -> Result<()> {
             anyhow!(msg)
         })?;
         if let Some(dir) = path.parent() {
-            fs::create_dir_all(dir).context(format!("Creating container device {:?}", dev))?;
+            fs::create_dir_all(dir).context(format!("Creating container device {dev:?}"))?;
         }
-        op(dev, path).context(format!("Creating container device {:?}", dev))?;
+        op(dev, path).context(format!("Creating container device {dev:?}"))?;
     }
     stat::umask(old);
     Ok(())
@@ -1002,16 +955,29 @@ lazy_static! {
     };
 }
 
+fn permissions_from_path(path: &Path) -> Result<u32> {
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(metadata.permissions().mode()),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(0),
+        Err(e) => Err(e.into()),
+    }
+}
+
 fn mknod_dev(dev: &LinuxDevice, relpath: &Path) -> Result<()> {
     let f = match LINUXDEVICETYPE.get(dev.typ().as_str()) {
         Some(v) => v,
         None => return Err(anyhow!("invalid spec".to_string())),
     };
 
+    let file_mode = match dev.file_mode().unwrap_or(0) {
+        0 => permissions_from_path(Path::new(dev.path()))?,
+        x => x,
+    };
+
     stat::mknod(
         relpath,
         *f,
-        Mode::from_bits_truncate(dev.file_mode().unwrap_or(0)),
+        Mode::from_bits_truncate(file_mode),
         nix::sys::stat::makedev(dev.major() as u64, dev.minor() as u64),
     )?;
 
@@ -1049,7 +1015,7 @@ pub fn finish_rootfs(cfd_log: RawFd, spec: &Spec, process: &Process) -> Result<(
     unistd::chdir("/")?;
 
     let process_cwd = process.cwd().display().to_string();
-    if process_cwd.is_empty() {
+    if !process_cwd.is_empty() {
         // Although the process.cwd string can be unclean/malicious (../../dev, etc),
         // we are running on our own mount namespace and we just chrooted into the
         // container's root. It's safe to create CWD from there.
@@ -1163,7 +1129,6 @@ mod tests {
     use std::fs::remove_dir_all;
     use std::fs::remove_file;
     use std::io;
-    use std::os::unix::fs;
     use std::os::unix::io::AsRawFd;
     use tempfile::tempdir;
     use test_utils::assert_result;
@@ -1373,6 +1338,52 @@ mod tests {
         assert!(ret.is_ok(), "Should pass. Got: {:?}", ret);
     }
 
+    // Regression test for the bug where the create_dir_all guard was inverted
+    // and CWD was only created when process.cwd was empty (the opposite of
+    // what we want).  See PR #2375 (original fix for #2374) and the regression
+    // introduced by PR #9944 ("agent: Align agent OCI spec with oci-spec-rs").
+    #[test]
+    #[serial(chdir)]
+    fn test_finish_rootfs_creates_missing_cwd() {
+        let stdout_fd = std::io::stdout().as_raw_fd();
+
+        // Pick a unique absolute path that does not yet exist on disk.  The
+        // function chdirs to "/" before creating CWD, so the path is taken to
+        // be relative to the (test process's) filesystem root.
+        let unique = format!(
+            "kata-rustjail-cwd-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        );
+        let cwd_path = std::path::PathBuf::from("/tmp").join(&unique);
+        assert!(
+            !cwd_path.exists(),
+            "test cwd path unexpectedly already exists: {:?}",
+            cwd_path,
+        );
+
+        let mut spec = oci::Spec::default();
+        spec.set_linux(Some(oci::Linux::default()));
+
+        let mut process = oci::Process::default();
+        process.set_cwd(cwd_path.clone());
+
+        let ret = finish_rootfs(stdout_fd, &spec, &process);
+
+        let created = cwd_path.exists();
+        let _ = remove_dir_all(&cwd_path);
+
+        assert!(ret.is_ok(), "finish_rootfs failed: {:?}", ret);
+        assert!(
+            created,
+            "finish_rootfs did not create process.cwd: {:?}",
+            cwd_path,
+        );
+    }
+
     #[test]
     fn test_readonly_path() {
         let ret = readonly_path("abc");
@@ -1396,7 +1407,7 @@ mod tests {
             .typ(oci::LinuxDeviceType::C)
             .major(0)
             .minor(0)
-            .file_mode(0660 as u32)
+            .file_mode(0o660_u32)
             .uid(unistd::getuid().as_raw())
             .gid(unistd::getgid().as_raw())
             .build()
@@ -1596,91 +1607,6 @@ mod tests {
     }
 
     #[test]
-    fn test_secure_join() {
-        #[derive(Debug)]
-        struct TestData<'a> {
-            name: &'a str,
-            rootfs: &'a str,
-            unsafe_path: &'a str,
-            symlink_path: &'a str,
-            result: &'a str,
-        }
-
-        // create tempory directory to simulate container rootfs with symlink
-        let rootfs_dir = tempdir().expect("failed to create tmpdir");
-        let rootfs_path = rootfs_dir.path().to_str().unwrap();
-
-        let tests = &[
-            TestData {
-                name: "rootfs_not_exist",
-                rootfs: "/home/rootfs",
-                unsafe_path: "a/b/c",
-                symlink_path: "",
-                result: "/home/rootfs/a/b/c",
-            },
-            TestData {
-                name: "relative_path",
-                rootfs: "/home/rootfs",
-                unsafe_path: "../../../a/b/c",
-                symlink_path: "",
-                result: "/home/rootfs/a/b/c",
-            },
-            TestData {
-                name: "skip any ..",
-                rootfs: "/home/rootfs",
-                unsafe_path: "../../../a/../../b/../../c",
-                symlink_path: "",
-                result: "/home/rootfs/a/b/c",
-            },
-            TestData {
-                name: "rootfs is null",
-                rootfs: "",
-                unsafe_path: "",
-                symlink_path: "",
-                result: "/",
-            },
-            TestData {
-                name: "relative softlink beyond container rootfs",
-                rootfs: rootfs_path,
-                unsafe_path: "1",
-                symlink_path: "../../../",
-                result: rootfs_path,
-            },
-            TestData {
-                name: "abs softlink points to the non-exist directory",
-                rootfs: rootfs_path,
-                unsafe_path: "2",
-                symlink_path: "/dddd",
-                result: &format!("{}/dddd", rootfs_path).as_str().to_owned(),
-            },
-            TestData {
-                name: "abs softlink points to the root",
-                rootfs: rootfs_path,
-                unsafe_path: "3",
-                symlink_path: "/",
-                result: &format!("{}/", rootfs_path).as_str().to_owned(),
-            },
-        ];
-
-        for (i, t) in tests.iter().enumerate() {
-            // Create a string containing details of the test
-            let msg = format!("test[{}]: {:?}", i, t.name);
-
-            // if is_symlink, then should be prepare the softlink environment
-            if t.symlink_path != "" {
-                fs::symlink(t.symlink_path, format!("{}/{}", t.rootfs, t.unsafe_path)).unwrap();
-            }
-            let result = secure_join(t.rootfs, t.unsafe_path);
-
-            // Update the test details string with the results of the call
-            let msg = format!("{}, result: {:?}", msg, result);
-
-            // Perform the checks
-            assert!(result == t.result, "{}", msg);
-        }
-    }
-
-    #[test]
     fn test_parse_mount_table() {
         #[derive(Debug)]
         struct TestData<'a> {
@@ -1719,7 +1645,7 @@ mod tests {
             },
             TestData {
                 mountinfo_data: Some(
-                    "22 933 0:20 /foo\040-\040bar /sys rw,nodev shared:2 - sysfs sysfs rw,noexec",
+                    "22 933 0:20 /foo\x20-\x20bar /sys rw,nodev shared:2 - sysfs sysfs rw,noexec",
                 ),
                 result: Ok(vec![Info {
                     mount_point: "/sys".to_string(),

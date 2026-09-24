@@ -15,6 +15,8 @@ use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Barrier};
 use std::thread;
 
+#[cfg(target_arch = "x86_64")]
+use dbs_interrupt::{InterruptManager, IOAPIC_BASE, IOAPIC_SIZE};
 use dbs_utils::metric::IncMetric;
 use dbs_utils::time::TimestampUs;
 use kvm_bindings::{KVM_SYSTEM_EVENT_RESET, KVM_SYSTEM_EVENT_SHUTDOWN};
@@ -274,7 +276,7 @@ enum VcpuEmulation {
 /// A wrapper around creating and using a kvm-based VCPU.
 pub struct Vcpu {
     // vCPU fd used by the vCPU
-    fd: Arc<VcpuFd>,
+    fd: VcpuFd,
     // vCPU id info
     id: u8,
     // Io manager Cached for facilitating IO operations
@@ -314,13 +316,18 @@ pub struct Vcpu {
     /// Multiprocessor affinity register recorded for aarch64
     #[cfg(target_arch = "aarch64")]
     pub(crate) mpidr: u64,
+
+    // InterruptManager to handle IOAPIC operations for x86_64 CPU when userspace
+    // IOAPIC is used.
+    #[cfg(target_arch = "x86_64")]
+    irq_manager: Arc<Box<dyn InterruptManager>>,
 }
 
 // Using this for easier explicit type-casting to help IDEs interpret the code.
-type VcpuCell = Cell<Option<*const Vcpu>>;
+type VcpuCell = Cell<Option<*mut Vcpu>>;
 
 impl Vcpu {
-    thread_local!(static TLS_VCPU_PTR: VcpuCell = Cell::new(None));
+    thread_local!(static TLS_VCPU_PTR: VcpuCell = const { Cell::new(None) });
 
     /// Associates `self` with the current thread.
     ///
@@ -332,7 +339,7 @@ impl Vcpu {
             if cell.get().is_some() {
                 return Err(VcpuError::VcpuTlsInit);
             }
-            cell.set(Some(self as *const Vcpu));
+            cell.set(Some(self as *mut Vcpu));
             Ok(())
         })
     }
@@ -348,7 +355,7 @@ impl Vcpu {
         // _before_ running this, then there is nothing we can do.
         Self::TLS_VCPU_PTR.with(|cell: &VcpuCell| {
             if let Some(vcpu_ptr) = cell.get() {
-                if vcpu_ptr == self as *const Vcpu {
+                if std::ptr::eq(vcpu_ptr, self) {
                     Self::TLS_VCPU_PTR.with(|cell: &VcpuCell| cell.take());
                     return Ok(());
                 }
@@ -369,13 +376,13 @@ impl Vcpu {
     /// dereferencing from pointer an already borrowed `Vcpu`.
     unsafe fn run_on_thread_local<F>(func: F) -> Result<()>
     where
-        F: FnOnce(&Vcpu),
+        F: FnOnce(&mut Vcpu),
     {
         Self::TLS_VCPU_PTR.with(|cell: &VcpuCell| {
             if let Some(vcpu_ptr) = cell.get() {
                 // Dereferencing here is safe since `TLS_VCPU_PTR` is populated/non-empty,
                 // and it is being cleared on `Vcpu::drop` so there is no dangling pointer.
-                let vcpu_ref: &Vcpu = &*vcpu_ptr;
+                let vcpu_ref: &mut Vcpu = &mut *vcpu_ptr;
                 func(vcpu_ref);
                 Ok(())
             } else {
@@ -436,7 +443,7 @@ impl Vcpu {
 
     /// Extract the vcpu running logic for test mocking.
     #[cfg(not(test))]
-    pub fn emulate(fd: &VcpuFd) -> std::result::Result<VcpuExit<'_>, kvm_ioctls::Error> {
+    pub fn emulate(fd: &mut VcpuFd) -> std::result::Result<VcpuExit<'_>, kvm_ioctls::Error> {
         fd.run()
     }
 
@@ -444,7 +451,7 @@ impl Vcpu {
     ///
     /// Returns error or enum specifying whether emulation was handled or interrupted.
     fn run_emulation(&mut self) -> Result<VcpuEmulation> {
-        match Vcpu::emulate(&self.fd) {
+        match Vcpu::emulate(&mut self.fd) {
             Ok(run) => {
                 match run {
                     #[cfg(target_arch = "x86_64")]
@@ -455,18 +462,35 @@ impl Vcpu {
                     }
                     #[cfg(target_arch = "x86_64")]
                     VcpuExit::IoOut(addr, data) => {
-                        if !self.check_io_port_info(addr, data)? {
-                            let _ = self.io_mgr.pio_write(addr, data);
+                        let data = data.to_vec();
+                        if !self.check_io_port_info(addr, &data)? {
+                            let _ = self.io_mgr.pio_write(addr, &data);
                         }
                         self.metrics.exit_io_out.inc();
                         Ok(VcpuEmulation::Handled)
                     }
                     VcpuExit::MmioRead(addr, data) => {
+                        #[cfg(target_arch = "x86_64")]
+                        if addr >= IOAPIC_BASE as u64 && addr < (IOAPIC_BASE + IOAPIC_SIZE) as u64 {
+                            let irq_manager = self.irq_manager.clone();
+                            let _ = irq_manager.ioapic_read(addr, data);
+                            self.metrics.exit_mmio_read.inc();
+                            return Ok(VcpuEmulation::Handled);
+                        }
+
                         let _ = self.io_mgr.mmio_read(addr, data);
                         self.metrics.exit_mmio_read.inc();
                         Ok(VcpuEmulation::Handled)
                     }
                     VcpuExit::MmioWrite(addr, data) => {
+                        #[cfg(target_arch = "x86_64")]
+                        if addr >= IOAPIC_BASE as u64 && addr < (IOAPIC_BASE + IOAPIC_SIZE) as u64 {
+                            let irq_manager = self.irq_manager.clone();
+                            let _ = irq_manager.ioapic_write(addr, data);
+                            self.metrics.exit_mmio_write.inc();
+                            return Ok(VcpuEmulation::Handled);
+                        }
+
                         let _ = self.io_mgr.mmio_write(addr, data);
                         self.metrics.exit_mmio_write.inc();
                         Ok(VcpuEmulation::Handled)
@@ -493,16 +517,14 @@ impl Vcpu {
                     VcpuExit::SystemEvent(event_type, event_flags) => match event_type {
                         KVM_SYSTEM_EVENT_RESET | KVM_SYSTEM_EVENT_SHUTDOWN => {
                             info!(
-                                "Received KVM_SYSTEM_EVENT: type: {}, event: {}",
-                                event_type, event_flags
+                                "Received KVM_SYSTEM_EVENT: type: {event_type}, event: {event_flags:?}"
                             );
                             Ok(VcpuEmulation::Stopped)
                         }
                         _ => {
                             self.metrics.failures.inc();
                             error!(
-                                "Received KVM_SYSTEM_EVENT signal type: {}, flag: {}",
-                                event_type, event_flags
+                                "Received KVM_SYSTEM_EVENT signal type: {event_type}, flag: {event_flags:?}"
                             );
                             Err(VcpuError::VcpuUnhandledKvmExit)
                         }
@@ -511,7 +533,7 @@ impl Vcpu {
                         self.metrics.failures.inc();
                         // TODO: Are we sure we want to finish running a vcpu upon
                         // receiving a vm exit that is not necessarily an error?
-                        error!("Unexpected exit reason on vcpu run: {:?}", r);
+                        error!("Unexpected exit reason on vcpu run: {r:?}");
                         Err(VcpuError::VcpuUnhandledKvmExit)
                     }
                 }
@@ -528,7 +550,7 @@ impl Vcpu {
                     }
                     _ => {
                         self.metrics.failures.inc();
-                        error!("Failure during vcpu run: {}", e);
+                        error!("Failure during vcpu run: {e}");
                         #[cfg(target_arch = "x86_64")]
                         {
                             error!(
@@ -552,7 +574,7 @@ impl Vcpu {
         // debug info signal
         if addr == MAGIC_IOPORT_DEBUG_INFO && data.len() == 4 {
             let data = unsafe { std::ptr::read(data.as_ptr() as *const u32) };
-            log::warn!("KDBG: guest kernel debug info: 0x{:x}", data);
+            log::warn!("KDBG: guest kernel debug info: 0x{data:x}");
             checked = true;
         };
 
@@ -736,7 +758,7 @@ impl Vcpu {
         // trigger vmm to stop machine
         if let Err(e) = self.exit_evt.write(1) {
             self.metrics.failures.inc();
-            error!("Failed signaling vcpu exit event: {}", e);
+            error!("Failed signaling vcpu exit event: {e}");
         }
 
         let mut state = StateMachine::next(Self::waiting_exit);
@@ -767,7 +789,7 @@ impl Vcpu {
 
     /// Get vcpu file descriptor.
     pub fn vcpu_fd(&self) -> &VcpuFd {
-        self.fd.as_ref()
+        &self.fd
     }
 
     pub fn metrics(&self) -> Arc<VcpuMetrics> {
@@ -790,8 +812,10 @@ pub mod tests {
 
     use arc_swap::ArcSwap;
     use dbs_device::device_manager::IoManager;
+    #[cfg(target_arch = "x86_64")]
+    use dbs_interrupt::KvmIrqManager;
     use lazy_static::lazy_static;
-    use test_utils::skip_if_not_root;
+    use test_utils::skip_if_kvm_unaccessable;
 
     use super::*;
     use crate::kvm_context::KvmContext;
@@ -806,7 +830,7 @@ pub mod tests {
         FailEntry(u64, u32),
         InternalError,
         Unknown,
-        SystemEvent(u32, u64),
+        SystemEvent(u32, Vec<u64>),
         Error(i32),
     }
 
@@ -815,7 +839,7 @@ pub mod tests {
     }
 
     impl Vcpu {
-        pub fn emulate(_fd: &VcpuFd) -> std::result::Result<VcpuExit<'_>, kvm_ioctls::Error> {
+        pub fn emulate(_fd: &mut VcpuFd) -> std::result::Result<VcpuExit<'_>, kvm_ioctls::Error> {
             let res = &*EMULATE_RES.lock().unwrap();
             match res {
                 EmulationCase::IoIn => Ok(VcpuExit::IoIn(0, &mut [])),
@@ -830,7 +854,8 @@ pub mod tests {
                 EmulationCase::InternalError => Ok(VcpuExit::InternalError),
                 EmulationCase::Unknown => Ok(VcpuExit::Unknown),
                 EmulationCase::SystemEvent(event_type, event_flags) => {
-                    Ok(VcpuExit::SystemEvent(*event_type, *event_flags))
+                    let flags = event_flags.clone().into_boxed_slice();
+                    Ok(VcpuExit::SystemEvent(*event_type, Box::leak(flags)))
                 }
                 EmulationCase::Error(e) => Err(kvm_ioctls::Error::new(*e)),
             }
@@ -841,7 +866,7 @@ pub mod tests {
     fn create_vcpu() -> (Vcpu, Receiver<VcpuStateEvent>) {
         let kvm_context = KvmContext::new(None).unwrap();
         let vm = kvm_context.kvm().create_vm().unwrap();
-        let vcpu_fd = Arc::new(vm.create_vcpu(0).unwrap());
+        let vcpu_fd = vm.create_vcpu(0).unwrap();
         let io_manager = IoManagerCached::new(Arc::new(ArcSwap::new(Arc::new(IoManager::new()))));
         let supported_cpuid = kvm_context
             .supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
@@ -850,6 +875,8 @@ pub mod tests {
         let vcpu_state_event = EventFd::new(libc::EFD_NONBLOCK).unwrap();
         let (tx, rx) = channel();
         let time_stamp = TimestampUs::default();
+        let irq_manager: Arc<Box<dyn InterruptManager>> =
+            Arc::new(Box::new(KvmIrqManager::new(Arc::new(vm))));
 
         let vcpu = Vcpu::new_x86_64(
             0,
@@ -861,6 +888,7 @@ pub mod tests {
             tx,
             time_stamp,
             false,
+            irq_manager,
         )
         .unwrap();
 
@@ -877,7 +905,7 @@ pub mod tests {
         let kvm = Kvm::new().unwrap();
         let vm = Arc::new(kvm.create_vm().unwrap());
         let _kvm_context = KvmContext::new(Some(kvm.as_raw_fd())).unwrap();
-        let vcpu_fd = Arc::new(vm.create_vcpu(0).unwrap());
+        let vcpu_fd = vm.create_vcpu(0).unwrap();
         let io_manager = IoManagerCached::new(Arc::new(ArcSwap::new(Arc::new(IoManager::new()))));
         let reset_event_fd = EventFd::new(libc::EFD_NONBLOCK).unwrap();
         let vcpu_state_event = EventFd::new(libc::EFD_NONBLOCK).unwrap();
@@ -901,7 +929,7 @@ pub mod tests {
 
     #[test]
     fn test_vcpu_run_emulation() {
-        skip_if_not_root!();
+        skip_if_kvm_unaccessable!();
 
         let (mut vcpu, _) = create_vcpu();
 
@@ -949,17 +977,19 @@ pub mod tests {
         assert!(matches!(res, Err(VcpuError::VcpuUnhandledKvmExit)));
 
         // KVM_SYSTEM_EVENT_RESET
-        *(EMULATE_RES.lock().unwrap()) = EmulationCase::SystemEvent(KVM_SYSTEM_EVENT_RESET, 0);
+        *(EMULATE_RES.lock().unwrap()) =
+            EmulationCase::SystemEvent(KVM_SYSTEM_EVENT_RESET, vec![0]);
         let res = vcpu.run_emulation();
         assert!(matches!(res, Ok(VcpuEmulation::Stopped)));
 
         // KVM_SYSTEM_EVENT_SHUTDOWN
-        *(EMULATE_RES.lock().unwrap()) = EmulationCase::SystemEvent(KVM_SYSTEM_EVENT_SHUTDOWN, 0);
+        *(EMULATE_RES.lock().unwrap()) =
+            EmulationCase::SystemEvent(KVM_SYSTEM_EVENT_SHUTDOWN, vec![0]);
         let res = vcpu.run_emulation();
         assert!(matches!(res, Ok(VcpuEmulation::Stopped)));
 
         // Other system event
-        *(EMULATE_RES.lock().unwrap()) = EmulationCase::SystemEvent(0, 0);
+        *(EMULATE_RES.lock().unwrap()) = EmulationCase::SystemEvent(0, vec![0]);
         let res = vcpu.run_emulation();
         assert!(matches!(res, Err(VcpuError::VcpuUnhandledKvmExit)));
 
@@ -987,7 +1017,7 @@ pub mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_vcpu_check_io_port_info() {
-        skip_if_not_root!();
+        skip_if_kvm_unaccessable!();
 
         let (vcpu, _receiver) = create_vcpu();
 

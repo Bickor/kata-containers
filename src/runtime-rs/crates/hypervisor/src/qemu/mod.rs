@@ -7,6 +7,7 @@ mod cmdline_generator;
 mod inner;
 mod qmp;
 
+use crate::device::pci_path::PciPath;
 use crate::device::DeviceType;
 use crate::hypervisor_persist::HypervisorState;
 use crate::{Hypervisor, MemoryConfig};
@@ -18,12 +19,15 @@ use persist::sandbox_persist::Persist;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tokio::sync::{mpsc, Mutex};
 
 #[derive(Debug)]
 pub struct Qemu {
     inner: Arc<RwLock<QemuInner>>,
+    exit_waiter: Mutex<(mpsc::Receiver<()>, i32)>,
 }
 
 impl Default for Qemu {
@@ -34,12 +38,15 @@ impl Default for Qemu {
 
 impl Qemu {
     pub fn new() -> Self {
+        let (exit_notify, exit_waiter) = mpsc::channel(1);
+
         Self {
-            inner: Arc::new(RwLock::new(QemuInner::new())),
+            inner: Arc::new(RwLock::new(QemuInner::new(exit_notify))),
+            exit_waiter: Mutex::new((exit_waiter, 0)),
         }
     }
 
-    pub async fn set_hypervisor_config(&mut self, config: HypervisorConfig) {
+    pub async fn set_hypervisor_config(&self, config: HypervisorConfig) {
         let mut inner = self.inner.write().await;
         inner.set_hypervisor_config(config)
     }
@@ -47,9 +54,15 @@ impl Qemu {
 
 #[async_trait]
 impl Hypervisor for Qemu {
-    async fn prepare_vm(&self, id: &str, netns: Option<String>) -> Result<()> {
+    async fn prepare_vm(
+        &self,
+        id: &str,
+        netns: Option<String>,
+        _annotations: &HashMap<String, String>,
+        selinux_label: Option<String>,
+    ) -> Result<()> {
         let mut inner = self.inner.write().await;
-        inner.prepare_vm(id, netns).await
+        inner.prepare_vm(id, netns, selinux_label).await
     }
 
     async fn start_vm(&self, timeout: i32) -> Result<()> {
@@ -63,22 +76,33 @@ impl Hypervisor for Qemu {
     }
 
     async fn wait_vm(&self) -> Result<i32> {
+        info!(sl!(), "Wait QEMU VM");
+
+        let mut waiter = self.exit_waiter.lock().await;
+
+        //wait until the qemu process exited.
+        waiter.0.recv().await;
+
         let inner = self.inner.read().await;
-        inner.wait_vm().await
+        if let Ok(exit_code) = inner.wait_vm().await {
+            waiter.1 = exit_code;
+        }
+
+        Ok(waiter.1)
     }
 
     async fn pause_vm(&self) -> Result<()> {
-        let inner = self.inner.read().await;
+        let mut inner = self.inner.write().await;
         inner.pause_vm()
     }
 
     async fn resume_vm(&self) -> Result<()> {
-        let inner = self.inner.read().await;
+        let mut inner = self.inner.write().await;
         inner.resume_vm()
     }
 
     async fn save_vm(&self) -> Result<()> {
-        let inner = self.inner.read().await;
+        let mut inner = self.inner.write().await;
         inner.save_vm().await
     }
 
@@ -113,7 +137,7 @@ impl Hypervisor for Qemu {
     }
 
     async fn get_thread_ids(&self) -> Result<VcpuThreadIds> {
-        let inner = self.inner.read().await;
+        let mut inner = self.inner.write().await;
         inner.get_thread_ids().await
     }
 
@@ -189,6 +213,13 @@ impl Hypervisor for Qemu {
     async fn get_passfd_listener_addr(&self) -> Result<(String, u32)> {
         Err(anyhow::anyhow!("Not yet supported"))
     }
+
+    async fn resolve_vfio_device_pci_path(&self, hostdev_id: &str) -> Result<PciPath> {
+        self.inner
+            .write()
+            .await
+            .resolve_vfio_device_pci_path(hostdev_id)
+    }
 }
 
 #[async_trait]
@@ -204,12 +235,15 @@ impl Persist for Qemu {
 
     /// Restore a component from a specified state.
     async fn restore(
-        hypervisor_args: Self::ConstructorArgs,
+        _hypervisor_args: Self::ConstructorArgs,
         hypervisor_state: Self::State,
     ) -> Result<Self> {
-        let inner = QemuInner::restore(hypervisor_args, hypervisor_state).await?;
+        let (exit_notify, exit_waiter) = mpsc::channel(1);
+
+        let inner = QemuInner::restore(exit_notify, hypervisor_state).await?;
         Ok(Self {
             inner: Arc::new(RwLock::new(inner)),
+            exit_waiter: Mutex::new((exit_waiter, 0)),
         })
     }
 }

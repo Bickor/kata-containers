@@ -10,6 +10,7 @@ set -o nounset
 set -o pipefail
 
 kata_deploy_dir="$(dirname "$(readlink -f "$0")")"
+# shellcheck source=/dev/null
 source "${kata_deploy_dir}/../../gha-run-k8s-common.sh"
 
 function run_tests() {
@@ -20,13 +21,17 @@ function run_tests() {
 	popd
 }
 
+function report_tests() {
+	report_bats_tests "${kata_deploy_dir}"
+}
+
 function cleanup_runtimeclasses() {
 	# Cleanup any runtime class that was left behind in the cluster, in
 	# case of a test failure, apart from the default one that comes from
 	# AKS
-	for rc in `kubectl get runtimeclass -o name | grep -v "kata-mshv-vm-isolation" | sed 's|runtimeclass.node.k8s.io/||'`
+	for rc in $(kubectl get runtimeclass -o name | grep -v "kata-mshv-vm-isolation" | sed 's|runtimeclass.node.k8s.io/||')
 	do
-		kubectl delete runtimeclass $rc;
+		kubectl delete runtimeclass "${rc}";
 	done
 }
 
@@ -36,8 +41,8 @@ function cleanup() {
 
 	cleanup_runtimeclasses || true
 
-	if [ "${platform}" = "aks" ]; then
-		delete_cluster ${test_type}
+	if [[ "${platform}" = "aks" ]]; then
+		delete_cluster "${test_type}"
 	fi
 }
 
@@ -45,7 +50,8 @@ function main() {
     export KATA_HOST_OS="${KATA_HOST_OS:-}"
 
     platform="aks"
-    if [ "${KATA_HYPERVISOR}" = "qemu-tdx" ]; then
+    # shellcheck disable=SC2154
+    if [[ "${KATA_HYPERVISOR}" = "qemu-tdx" ]]; then
 	    platform="tdx"
     fi
     export platform
@@ -53,14 +59,13 @@ function main() {
     action="${1:-}"
 
     case "${action}" in
-        install-azure-cli) install_azure_cli ;;
-        login-azure) login_azure ;;
         create-cluster) create_cluster "kata-deploy" ;;
         deploy-k8s) deploy_k8s ;;
         install-bats) install_bats ;;
         install-kubectl) install_kubectl ;;
         get-cluster-credentials) get_cluster_credentials "kata-deploy" ;;
         run-tests) run_tests ;;
+        report-tests) report_tests ;;
         delete-cluster) cleanup "aks" "kata-deploy" ;;
         *) >&2 echo "Invalid argument"; exit 2 ;;
     esac

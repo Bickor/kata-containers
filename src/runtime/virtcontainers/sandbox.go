@@ -20,6 +20,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	v1 "github.com/containerd/cgroups/stats/v1"
 	v2 "github.com/containerd/cgroups/v2/stats"
@@ -29,11 +30,12 @@ import (
 	"github.com/vishvananda/netlink"
 
 	cri "github.com/containerd/containerd/pkg/cri/annotations"
-	crio "github.com/containers/podman/v4/pkg/annotations"
+	crio "github.com/cri-o/cri-o/pkg/annotations"
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/api"
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/config"
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/drivers"
 	deviceManager "github.com/kata-containers/kata-containers/src/runtime/pkg/device/manager"
+	volume "github.com/kata-containers/kata-containers/src/runtime/pkg/direct-volume"
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/katautils/katatrace"
 	resCtrl "github.com/kata-containers/kata-containers/src/runtime/pkg/resourcecontrol"
 	exp "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/experimental"
@@ -108,6 +110,7 @@ type SandboxStatus struct {
 	ContainersStatus []ContainerStatus
 	State            types.SandboxState
 	HypervisorConfig HypervisorConfig
+	EmptyDirMode     string
 }
 
 // SandboxStats describes a sandbox's stats
@@ -180,12 +183,24 @@ type SandboxConfig struct {
 	// DisableGuestSeccomp disable seccomp within the guest
 	DisableGuestSeccomp bool
 
+	// EmptyDirMode specifies how Kubernetes emptyDir volumes are handled.
+	// Valid values are "shared-fs" (default) or "block-encrypted".
+	EmptyDirMode string
+
 	// EnableVCPUsPinning controls whether each vCPU thread should be scheduled to a fixed CPU
 	EnableVCPUsPinning bool
 
 	// Create container timeout which, if provided, indicates the create container timeout
 	// needed for the workload(s)
 	CreateContainerTimeout uint64
+
+	// ForceGuestPull enforces guest pull independent of snapshotter annotations.
+	ForceGuestPull bool
+
+	// KubeletRootDir is the kubelet root directory (e.g. /var/lib/kubelet or
+	// /var/lib/k0s/kubelet for k0s). If empty, the runtime uses the default
+	// /var/lib/kubelet for matching ConfigMap/Secret volume paths.
+	KubeletRootDir string
 }
 
 // valid checks that the sandbox configuration is valid.
@@ -218,8 +233,9 @@ type Sandbox struct {
 	store      persistapi.PersistDriver
 	fsShare    FilesystemSharer
 
-	swapDevices []*config.BlockDrive
-	volumes     []types.Volume
+	swapDevices    []*config.BlockDrive
+	volumes        []types.Volume
+	ephemeralDisks []EphemeralDisk
 
 	monitor         *monitor
 	config          *SandboxConfig
@@ -248,6 +264,11 @@ type Sandbox struct {
 	seccompSupported  bool
 	disableVMShutdown bool
 	isVCPUsPinningOn  bool
+
+	// hotplugNetworkConfigApplied prevents network config API being called
+	// multiple times for hot-plugged network device when Sandbox has multiple
+	// containers.
+	hotplugNetworkConfigApplied bool
 }
 
 // ID returns the sandbox identifier string.
@@ -310,6 +331,81 @@ func (s *Sandbox) GetHypervisorPid() (int, error) {
 	return pids[0], nil
 }
 
+// RescanNetwork re-scans the network namespace for endpoints if none have
+// been discovered yet. This is idempotent: if endpoints already exist it
+// returns immediately. It enables Docker 26+ support where networking is
+// configured after task creation but before Start.
+//
+// Docker 26+ configures networking (veth pair, IP addresses) between
+// Create and Start. The interfaces may not be present immediately, so
+// this method polls until they appear or a timeout is reached.
+//
+// When new endpoints are found, the guest agent is informed about the
+// interfaces and routes so that networking becomes functional inside the VM.
+func (s *Sandbox) RescanNetwork(ctx context.Context) error {
+	if s.config.NetworkConfig.DisableNewNetwork {
+		return nil
+	}
+	if len(s.network.Endpoints()) > 0 {
+		return nil
+	}
+
+	const maxWait = 5 * time.Second
+	const pollInterval = 50 * time.Millisecond
+	deadline := time.NewTimer(maxWait)
+	defer deadline.Stop()
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+
+	s.Logger().Debug("waiting for network interfaces in namespace")
+
+	for {
+		if _, err := s.network.AddEndpoints(ctx, s, nil, true); err != nil {
+			return err
+		}
+		if len(s.network.Endpoints()) > 0 {
+			return s.configureGuestNetwork(ctx)
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-deadline.C:
+			s.Logger().Warn("no network interfaces found after timeout — networking may be configured by prestart hooks")
+			return nil
+		case <-ticker.C:
+		}
+	}
+}
+
+// configureGuestNetwork informs the guest agent about discovered network
+// endpoints so that interfaces and routes become functional inside the VM.
+func (s *Sandbox) configureGuestNetwork(ctx context.Context) error {
+	endpoints := s.network.Endpoints()
+	s.Logger().WithField("endpoints", len(endpoints)).Info("configuring hotplugged network in guest")
+
+	// Note: ARP neighbors (3rd return value) are not propagated here
+	// because the agent interface only exposes per-entry updates. The
+	// full setupNetworks path in kataAgent handles them; this path is
+	// only reached for late-discovered endpoints where neighbor entries
+	// are populated dynamically by the kernel.
+	interfaces, routes, _, err := generateVCNetworkStructures(ctx, endpoints)
+	if err != nil {
+		return fmt.Errorf("generating network structures: %w", err)
+	}
+	for _, ifc := range interfaces {
+		if _, err := s.agent.updateInterface(ctx, ifc); err != nil {
+			return fmt.Errorf("updating interface %s in guest: %w", ifc.Name, err)
+		}
+	}
+	if len(routes) > 0 {
+		if _, err := s.agent.updateRoutes(ctx, routes); err != nil {
+			return fmt.Errorf("updating routes in guest: %w", err)
+		}
+	}
+	return nil
+}
+
 // GetAllContainers returns all containers.
 func (s *Sandbox) GetAllContainers() []VCContainer {
 	ifa := make([]VCContainer, len(s.containers))
@@ -368,6 +464,7 @@ func (s *Sandbox) Status() SandboxStatus {
 		HypervisorConfig: s.config.HypervisorConfig,
 		ContainersStatus: contStatusList,
 		Annotations:      s.config.Annotations,
+		EmptyDirMode:     s.config.EmptyDirMode,
 	}
 }
 
@@ -443,18 +540,38 @@ func (s *Sandbox) IOStream(containerID, processID string) (io.WriteCloser, io.Re
 	return c.ioStream(processID)
 }
 
+// IsGuestPullEnforced returns true if guest pull is forced through the sandbox configuration.
+func (s *Sandbox) IsGuestPullForced() bool {
+	if s.config == nil {
+		return false
+	}
+	return s.config.ForceGuestPull
+}
+
 func createAssets(ctx context.Context, sandboxConfig *SandboxConfig) error {
 	span, _ := katatrace.Trace(ctx, nil, "createAssets", sandboxTracingTags, map[string]string{"sandbox_id": sandboxConfig.ID})
 	defer span.End()
 
 	for _, name := range types.AssetTypes() {
-		a, err := types.NewAsset(sandboxConfig.Annotations, name)
+		annotation, _, err := name.Annotations()
 		if err != nil {
 			return err
 		}
+		// For remote hypervisor donot check for Absolute Path incase of ImagePath, as it denotes the name of the image.
+		if sandboxConfig.HypervisorType == RemoteHypervisor && annotation == annotations.ImagePath {
+			value := sandboxConfig.Annotations[annotation]
+			if value != "" {
+				sandboxConfig.HypervisorConfig.ImagePath = value
+			}
+		} else {
+			a, err := types.NewAsset(sandboxConfig.Annotations, name)
+			if err != nil {
+				return err
+			}
 
-		if err := sandboxConfig.HypervisorConfig.AddCustomAsset(a); err != nil {
-			return err
+			if err := sandboxConfig.HypervisorConfig.AddCustomAsset(a); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -706,79 +823,7 @@ func (s *Sandbox) coldOrHotPlugVFIO(sandboxConfig *SandboxConfig) (bool, error) 
 	// for correct number of PCIe root ports.
 	var vhostUserBlkDevices []config.DeviceInfo
 
-	//io.katacontainers.pkg.oci.container_type:pod_sandbox
-
 	for cnt, container := range sandboxConfig.Containers {
-		// Do not alter the original spec, we do not want to inject
-		// CDI devices into the sandbox container, were using the CDI
-		// devices as additional information to determine the number of
-		// PCIe root ports to reserve for the hypervisor.
-		// A single_container type will have the CDI devices injected
-		// only do this if we're a pod_sandbox type.
-		if container.Annotations["io.katacontainers.pkg.oci.container_type"] == "pod_sandbox" && container.CustomSpec != nil {
-			cdiSpec := container.CustomSpec
-			// We can provide additional directories where to search for
-			// CDI specs if needed. immutable OS's only have specific
-			// directories where applications can write too. For instance /opt/cdi
-			//
-			// _, err = withCDI(ociSpec.Annotations, []string{"/opt/cdi"}, ociSpec)
-			//
-			_, err := config.WithCDI(cdiSpec.Annotations, []string{}, cdiSpec)
-			if err != nil {
-				return coldPlugVFIO, fmt.Errorf("adding CDI devices failed")
-			}
-
-			for _, dev := range cdiSpec.Linux.Devices {
-				isVFIODevice := deviceManager.IsVFIODevice(dev.Path)
-				if hotPlugVFIO && isVFIODevice {
-					vfioDev := config.DeviceInfo{
-						ColdPlug:      true,
-						ContainerPath: dev.Path,
-						Port:          sandboxConfig.HypervisorConfig.HotPlugVFIO,
-						DevType:       dev.Type,
-						Major:         dev.Major,
-						Minor:         dev.Minor,
-					}
-					if dev.FileMode != nil {
-						vfioDev.FileMode = *dev.FileMode
-					}
-					if dev.UID != nil {
-						vfioDev.UID = *dev.UID
-					}
-					if dev.GID != nil {
-						vfioDev.GID = *dev.GID
-					}
-
-					vfioDevices = append(vfioDevices, vfioDev)
-					continue
-				}
-				if coldPlugVFIO && isVFIODevice {
-					vfioDev := config.DeviceInfo{
-						ColdPlug:      true,
-						ContainerPath: dev.Path,
-						Port:          sandboxConfig.HypervisorConfig.ColdPlugVFIO,
-						DevType:       dev.Type,
-						Major:         dev.Major,
-						Minor:         dev.Minor,
-					}
-					if dev.FileMode != nil {
-						vfioDev.FileMode = *dev.FileMode
-					}
-					if dev.UID != nil {
-						vfioDev.UID = *dev.UID
-					}
-					if dev.GID != nil {
-						vfioDev.GID = *dev.GID
-					}
-
-					vfioDevices = append(vfioDevices, vfioDev)
-					continue
-				}
-			}
-		}
-		// As stated before the single_container will have the  CDI
-		// devices injected by the runtime. For the pod_container use-case
-		// see container.go how cold and hot-plug are handled.
 		for dev, device := range container.DeviceInfos {
 			if deviceManager.IsVhostUserBlk(device) {
 				vhostUserBlkDevices = append(vhostUserBlkDevices, device)
@@ -839,21 +884,38 @@ func (s *Sandbox) createResourceController() error {
 			resources.Devices = spec.Linux.Resources.Devices
 
 			intptr := func(i int64) *int64 { return &i }
-			// Determine if device /dev/null and /dev/urandom exist, and add if they don't
+			// Compare existing entries by value (nil-safe). Comparing the
+			// *int64 fields directly against intptr(...) only compares
+			// addresses, which never matches because intptr() returns a fresh
+			// pointer on every call.
 			nullDeviceExist := false
 			urandomDeviceExist := false
 			ptmxDeviceExist := false
-			for _, device := range resources.Devices {
-				if device.Type == "c" && device.Major == intptr(1) && device.Minor == intptr(3) {
-					nullDeviceExist = true
+			loopControlDeviceExist := false
+			loopBlockDeviceExist := false
+			for _, d := range resources.Devices {
+				if d.Major == nil {
+					continue
 				}
-
-				if device.Type == "c" && device.Major == intptr(1) && device.Minor == intptr(9) {
-					urandomDeviceExist = true
-				}
-
-				if device.Type == "c" && device.Major == intptr(5) && device.Minor == intptr(2) {
-					ptmxDeviceExist = true
+				switch d.Type {
+				case "c":
+					if d.Minor == nil {
+						continue
+					}
+					switch {
+					case *d.Major == 1 && *d.Minor == 3:
+						nullDeviceExist = true
+					case *d.Major == 1 && *d.Minor == 9:
+						urandomDeviceExist = true
+					case *d.Major == 5 && *d.Minor == 2:
+						ptmxDeviceExist = true
+					case *d.Major == 10 && *d.Minor == 237:
+						loopControlDeviceExist = true
+					}
+				case "b":
+					if *d.Major == 7 && d.Minor == nil {
+						loopBlockDeviceExist = true
+					}
 				}
 			}
 
@@ -880,6 +942,27 @@ func (s *Sandbox) createResourceController() error {
 					{Type: "c", Major: intptr(5), Minor: intptr(2), Access: rwm, Allow: true},
 				}...)
 
+			}
+
+			// When sandbox_cgroup_only is enabled the shim threads inherit
+			// the sandbox device cgroup, so any rootfs whose mount source is
+			// a regular file backed by a loop device (e.g. the blockfile
+			// snapshotter) needs /dev/loop-control and the /dev/loopN block
+			// nodes allowlisted, otherwise containerd's loop setup fails
+			// with EPERM on open("/dev/loop-control").
+			if s.config.SandboxCgroupOnly {
+				if !loopControlDeviceExist {
+					// "/dev/loop-control"
+					resources.Devices = append(resources.Devices, specs.LinuxDeviceCgroup{
+						Type: "c", Major: intptr(10), Minor: intptr(237), Access: rwm, Allow: true,
+					})
+				}
+				if !loopBlockDeviceExist {
+					// "/dev/loop*" (block major 7, any minor)
+					resources.Devices = append(resources.Devices, specs.LinuxDeviceCgroup{
+						Type: "b", Major: intptr(7), Access: rwm, Allow: true,
+					})
+				}
 			}
 
 			if spec.Linux.Resources.CPU != nil {
@@ -909,7 +992,12 @@ func (s *Sandbox) createResourceController() error {
 	// Depending on the SandboxCgroupOnly value, this cgroup
 	// will either hold all the pod threads (SandboxCgroupOnly is true)
 	// or only the virtual CPU ones (SandboxCgroupOnly is false).
-	s.sandboxController, err = resCtrl.NewSandboxResourceController(cgroupPath, &resources, s.config.SandboxCgroupOnly)
+	s.sandboxController, err = resCtrl.NewSandboxResourceController(
+		cgroupPath,
+		&resources,
+		s.config.SandboxCgroupOnly,
+		s.config.HypervisorType != RemoteHypervisor,
+	)
 	if err != nil {
 		return fmt.Errorf("Could not create the sandbox resource controller %v", err)
 	}
@@ -1032,7 +1120,29 @@ func (s *Sandbox) Delete(ctx context.Context) error {
 		s.Logger().WithError(err).Error("failed to cleanup share files")
 	}
 
+	if err := s.cleanupEphemeralDisks(); err != nil {
+		s.Logger().WithError(err).Error("failed to cleanup ephemeral disks")
+	}
+
 	return s.store.Destroy(s.id)
+}
+
+// cleanupEphemeralDisks removes ephemeral disk images and their mount info.
+func (s *Sandbox) cleanupEphemeralDisks() error {
+	if s.config.EmptyDirMode != EmptyDirModeVirtioBlkEncrypted {
+		return nil
+	}
+
+	for _, disk := range s.ephemeralDisks {
+		if err := os.Remove(disk.DiskPath); err != nil && !os.IsNotExist(err) {
+			s.Logger().WithError(err).Errorf("Failed to remove disk file: %s", disk.DiskPath)
+		}
+		if err := volume.Remove(disk.SourcePath); err != nil && !os.IsNotExist(err) {
+			s.Logger().WithError(err).Errorf("Failed to remove volume: %s", disk.SourcePath)
+		}
+	}
+
+	return nil
 }
 
 func (s *Sandbox) createNetwork(ctx context.Context) error {
@@ -1155,7 +1265,7 @@ func (s *Sandbox) AddInterface(ctx context.Context, inf *pbTypes.Interface) (*pb
 	}()
 
 	// Add network for vm
-	inf.PciPath = endpoints[0].PciPath().String()
+	inf.DevicePath = endpoints[0].PciPath().String()
 	result, err := s.agent.updateInterface(ctx, inf)
 	if err != nil {
 		return nil, err
@@ -1258,12 +1368,15 @@ func (cw *consoleWatcher) start(s *Sandbox) (err error) {
 
 	go func() {
 		for scanner.Scan() {
-			s.Logger().WithFields(logrus.Fields{
-				"console-protocol": cw.proto,
-				"console-url":      cw.consoleURL,
-				"sandbox":          s.id,
-				"vmconsole":        scanner.Text(),
-			}).Debug("reading guest console")
+			text := scanner.Text()
+			if text != "" {
+				s.Logger().WithFields(logrus.Fields{
+					"console-protocol": cw.proto,
+					"console-url":      cw.consoleURL,
+					"sandbox":          s.id,
+					"vmconsole":        text,
+				}).Debug("reading guest console")
+			}
 		}
 
 		if err := scanner.Err(); err != nil {
@@ -1441,6 +1554,8 @@ func (s *Sandbox) startVM(ctx context.Context, prestartHookFunc func(context.Con
 
 	defer func() {
 		if err != nil {
+			// Log error, otherwise nobody might see it - StopVM could kill this process.
+			s.Logger().WithError(err).Error("Cannot start VM")
 			s.hypervisor.StopVM(ctx, false)
 		}
 	}()
@@ -1453,6 +1568,13 @@ func (s *Sandbox) startVM(ctx context.Context, prestartHookFunc func(context.Con
 		err = s.runPrestartHooks(ctx, prestartHookFunc)
 		if err != nil {
 			return err
+		}
+		// If we want the network, scan the netns again to update the network
+		// configuration after the prestart hooks have run.
+		if !s.config.NetworkConfig.DisableNewNetwork {
+			if _, err := s.network.AddEndpoints(ctx, s, nil, false); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -1601,7 +1723,7 @@ func (s *Sandbox) CreateContainer(ctx context.Context, contConfig ContainerConfi
 
 	// Sandbox is responsible to update VM resources needed by Containers
 	// Update resources after having added containers to the sandbox, since
-	// container status is requiered to know if more resources should be added.
+	// container status is required to know if more resources should be added.
 	if err = s.updateResources(ctx); err != nil {
 		return nil, err
 	}
@@ -2235,6 +2357,29 @@ func (s *Sandbox) AddDevice(ctx context.Context, info config.DeviceInfo) (api.De
 	return add, nil
 }
 
+// GetVfioDeviceGuestPciPath return a device's guest PCI path by its host BDF
+func (s *Sandbox) GetVfioDeviceGuestPciPath(hostBDF string) types.PciPath {
+	devices := s.devManager.GetAllDevices()
+	for _, device := range devices {
+		switch device.DeviceType() {
+		case config.DeviceVFIO:
+			vfioDevices, ok := device.GetDeviceInfo().([]*config.VFIODev)
+			if !ok {
+				continue
+			}
+			for _, vfioDev := range vfioDevices {
+				if vfioDev.BDF == hostBDF {
+					return vfioDev.GuestPciPath
+				}
+			}
+		default:
+			continue
+		}
+	}
+
+	return types.PciPath{}
+}
+
 // updateResources will:
 // - calculate the resources required for the virtual machine, and adjust the virtual machine
 // sizing accordingly. For a given sandbox, it will calculate the number of vCPUs required based
@@ -2556,14 +2701,23 @@ func (s *Sandbox) resourceControllerDelete() error {
 		return nil
 	}
 
-	sandboxController, err := resCtrl.LoadResourceController(s.state.SandboxCgroupPath)
+	sandboxController, err := resCtrl.LoadResourceController(s.state.SandboxCgroupPath, s.config.SandboxCgroupOnly)
 	if err != nil {
 		return err
 	}
 
-	resCtrlParent := sandboxController.Parent()
-	if err := sandboxController.MoveTo(resCtrlParent); err != nil {
-		return err
+	// When sandbox_cgroup_only is enabled, all Kata threads live in the
+	// sandbox controller and systemd can move tasks as part of unit deletion.
+	// In that mode, a systemd-formatted cgroup path is not a filesystem path,
+	// so MoveTo would fail with "invalid group path".
+	// Keep MoveTo for the case of using cgroupfs paths and for the
+	// non-sandbox_cgroup_only mode. In that mode, Kata may use an overhead
+	// cgroup in which case an explicit MoveTo is used to drain tasks.
+	if !resCtrl.IsSystemdCgroup(s.state.SandboxCgroupPath) || !s.config.SandboxCgroupOnly {
+		resCtrlParent := sandboxController.Parent()
+		if err := sandboxController.MoveTo(resCtrlParent); err != nil {
+			return err
+		}
 	}
 
 	if err := sandboxController.Delete(); err != nil {
@@ -2571,14 +2725,17 @@ func (s *Sandbox) resourceControllerDelete() error {
 	}
 
 	if s.state.OverheadCgroupPath != "" {
-		overheadController, err := resCtrl.LoadResourceController(s.state.OverheadCgroupPath)
+		overheadController, err := resCtrl.LoadResourceController(s.state.OverheadCgroupPath, s.config.SandboxCgroupOnly)
 		if err != nil {
 			return err
 		}
 
-		resCtrlParent := overheadController.Parent()
-		if err := s.overheadController.MoveTo(resCtrlParent); err != nil {
-			return err
+		// See comment at above MoveTo: Avoid this action as systemd moves tasks on unit deletion.
+		if !resCtrl.IsSystemdCgroup(s.state.OverheadCgroupPath) || !s.config.SandboxCgroupOnly {
+			resCtrlParent := overheadController.Parent()
+			if err := s.overheadController.MoveTo(resCtrlParent); err != nil {
+				return err
+			}
 		}
 
 		if err := overheadController.Delete(); err != nil {
@@ -2804,9 +2961,26 @@ func (s *Sandbox) fetchContainers(ctx context.Context) error {
 
 // checkVCPUsPinning is used to support CPUSet mode of kata container.
 // CPUSet mode is on when Sandbox.HypervisorConfig.EnableVCPUsPinning
-// is set to true. Then it fetches sandbox's number of vCPU threads
-// and number of CPUs in CPUSet. If the two are equal, each vCPU thread
-// is then pinned to one fixed CPU in CPUSet.
+// is set to true.
+//
+// When NUMA topology is configured (GuestNUMANodes is non-empty), vCPU
+// threads are pinned to host CPUs belonging to the same host NUMA node
+// as the vCPU's assigned guest NUMA node, preserving memory locality.
+// vCPUs are distributed proportionally across nodes and each vCPU is
+// pinned round-robin to the host CPUs within its NUMA node; the 1:1
+// count equality check does not apply.
+//
+// This is true for both multi-node sandboxes and right-sized
+// single-node sandboxes: when buildNUMATopology()/maybeRightSizeAutoNUMA
+// collapses the topology to one node, that single node still carries a
+// meaningful HostCPUs subset (the CPUs of the chosen host NUMA node),
+// and pinning to that subset is what makes right-sizing actually deliver
+// host-thread locality, not just guest-topology locality.
+//
+// In the non-NUMA path (GuestNUMANodes is empty, e.g. enable_numa=false),
+// it fetches the sandbox's number of vCPU threads and number of CPUs in
+// CPUSet. If the two are equal, each vCPU thread is pinned 1:1 to the
+// CPUs in CPUSet; otherwise pinning is skipped.
 func (s *Sandbox) checkVCPUsPinning(ctx context.Context) error {
 	if s.config == nil {
 		return fmt.Errorf("no sandbox config found")
@@ -2815,11 +2989,39 @@ func (s *Sandbox) checkVCPUsPinning(ctx context.Context) error {
 		return nil
 	}
 
-	// fetch vCPU thread ids and CPUSet
+	expectedVCPUs := int(s.config.HypervisorConfig.NumVCPUs())
+
 	vCPUThreadsMap, err := s.hypervisor.GetThreadIDs(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get vCPU thread ids from hypervisor: %v", err)
 	}
+
+	// QEMU may not have spawned all vCPU threads yet. Retry with
+	// exponential backoff until we see the expected count.
+	if len(vCPUThreadsMap.vcpus) < expectedVCPUs {
+		const maxAttempts = 10
+		backoff := 50 * time.Millisecond
+		for attempt := 2; attempt <= maxAttempts && len(vCPUThreadsMap.vcpus) < expectedVCPUs; attempt++ {
+			s.Logger().WithFields(logrus.Fields{
+				"have":    len(vCPUThreadsMap.vcpus),
+				"want":    expectedVCPUs,
+				"attempt": attempt,
+			}).Debug("waiting for all vCPU threads to be available")
+			time.Sleep(backoff)
+			backoff *= 2
+			vCPUThreadsMap, err = s.hypervisor.GetThreadIDs(ctx)
+			if err != nil {
+				return fmt.Errorf("failed to get vCPU thread ids from hypervisor: %v", err)
+			}
+		}
+		if len(vCPUThreadsMap.vcpus) < expectedVCPUs {
+			s.Logger().WithFields(logrus.Fields{
+				"have": len(vCPUThreadsMap.vcpus),
+				"want": expectedVCPUs,
+			}).Warn("not all vCPU threads available after retries; pinning available ones")
+		}
+	}
+
 	cpuSetStr, _, err := s.getSandboxCPUSet()
 	if err != nil {
 		return fmt.Errorf("failed to get CPUSet config: %v", err)
@@ -2830,9 +3032,42 @@ func (s *Sandbox) checkVCPUsPinning(ctx context.Context) error {
 	}
 	cpuSetSlice := cpuSet.ToSlice()
 
-	// check if vCPU thread numbers and CPU numbers are equal
+	numaNodes := s.config.HypervisorConfig.GuestNUMANodes
+
+	if len(cpuSetSlice) == 0 {
+		if len(numaNodes) >= 1 {
+			// No cpuset constraint (e.g. ctr without k8s, or a Burstable
+			// pod with cpuManagerPolicy=none). Build an effective cpuset
+			// from the NUMA nodes' HostCPUs so pinning works using the
+			// (possibly right-sized) host NUMA topology. Even a single
+			// NUMA node here meaningfully constrains pinning to that
+			// node's host CPUs.
+			for _, gn := range numaNodes {
+				hostCPUs, err := cpuset.Parse(gn.HostCPUs)
+				if err != nil {
+					continue
+				}
+				cpuSet = cpuSet.Union(hostCPUs)
+			}
+			cpuSetSlice = cpuSet.ToSlice()
+			if len(cpuSetSlice) == 0 {
+				s.Logger().Warn("sandbox CPUSet is empty and cannot derive from NUMA HostCPUs; skipping vCPU pinning")
+				s.isVCPUsPinningOn = false
+				return nil
+			}
+			s.Logger().WithField("effective-cpuset", cpuSet.String()).Debug("derived cpuset from NUMA HostCPUs for pinning")
+		} else {
+			s.Logger().Warn("sandbox CPUSet is empty; skipping vCPU pinning")
+			s.isVCPUsPinningOn = false
+			return nil
+		}
+	}
+
+	if len(numaNodes) >= 1 {
+		return s.checkVCPUsPinningNUMA(ctx, vCPUThreadsMap, numaNodes, cpuSetSlice)
+	}
+
 	numVCPUs, numCPUs := len(vCPUThreadsMap.vcpus), len(cpuSetSlice)
-	// if not equal, we should reset threads scheduling to random pattern
 	if numVCPUs != numCPUs {
 		if s.isVCPUsPinningOn {
 			s.isVCPUsPinningOn = false
@@ -2840,7 +3075,6 @@ func (s *Sandbox) checkVCPUsPinning(ctx context.Context) error {
 		}
 		return nil
 	}
-	// if equal, we can use vCPU thread pinning
 	for i, tid := range vCPUThreadsMap.vcpus {
 		if err := resCtrl.SetThreadAffinity(tid, cpuSetSlice[i:i+1]); err != nil {
 			if err := s.resetVCPUsPinning(ctx, vCPUThreadsMap, cpuSetSlice); err != nil {
@@ -2849,6 +3083,68 @@ func (s *Sandbox) checkVCPUsPinning(ctx context.Context) error {
 			return fmt.Errorf("failed to set vcpu thread %d affinity to cpu %d: %v", tid, cpuSetSlice[i], err)
 		}
 	}
+	s.isVCPUsPinningOn = true
+	return nil
+}
+
+// checkVCPUsPinningNUMA pins vCPU threads to host CPUs that belong to the
+// same NUMA node as the vCPU's guest NUMA node assignment. vCPUs are
+// distributed proportionally to the host CPU count per NUMA node
+// (matching buildNUMATopology). It handles any non-empty numaNodes
+// slice — including the right-sized single-node case, where every vCPU
+// is pinned within the single chosen host NUMA node's CPU set.
+func (s *Sandbox) checkVCPUsPinningNUMA(ctx context.Context, vCPUThreadsMap VcpuThreadIDs, numaNodes []types.GuestNUMANode, cpuSetSlice []int) error {
+	numVCPUs := uint32(len(vCPUThreadsMap.vcpus))
+	numNodes := uint32(len(numaNodes))
+	if numVCPUs < numNodes {
+		return fmt.Errorf("number of vCPUs (%d) must be >= NUMA node count (%d) for NUMA pinning", numVCPUs, numNodes)
+	}
+
+	vcpusPerNode, err := utils.DistributeVCPUsProportionally(numaNodes, numVCPUs)
+	if err != nil {
+		return fmt.Errorf("failed to compute NUMA vCPU distribution for pinning: %v", err)
+	}
+
+	cpuSetAll := cpuset.NewCPUSet(cpuSetSlice...)
+
+	var cpuOffset uint32
+	for i, gn := range numaNodes {
+		hostCPUs, err := cpuset.Parse(gn.HostCPUs)
+		if err != nil {
+			return fmt.Errorf("failed to parse HostCPUs for NUMA node %d: %v", i, err)
+		}
+		allowedCPUs := hostCPUs.Intersection(cpuSetAll).ToSlice()
+		if len(allowedCPUs) == 0 {
+			s.Logger().WithFields(logrus.Fields{
+				"numa-node":    i,
+				"host-cpus":    gn.HostCPUs,
+				"sandbox-cpus": cpuSetSlice,
+			}).Warn("NUMA node HostCPUs do not intersect sandbox CPUSet; pinning vCPUs to full cpuset for this node")
+			allowedCPUs = cpuSetSlice
+		}
+
+		startVCPU := cpuOffset
+		endVCPU := startVCPU + vcpusPerNode[i]
+		cpuOffset = endVCPU
+
+		for vcpuIdx := startVCPU; vcpuIdx < endVCPU; vcpuIdx++ {
+			tid, ok := vCPUThreadsMap.vcpus[int(vcpuIdx)]
+			if !ok {
+				if err := s.resetVCPUsPinning(ctx, vCPUThreadsMap, cpuSetSlice); err != nil {
+					return err
+				}
+				return fmt.Errorf("missing vcpu thread id for vcpu index %d", vcpuIdx)
+			}
+			pinIdx := int(vcpuIdx-startVCPU) % len(allowedCPUs)
+			if err := resCtrl.SetThreadAffinity(tid, allowedCPUs[pinIdx:pinIdx+1]); err != nil {
+				if err := s.resetVCPUsPinning(ctx, vCPUThreadsMap, cpuSetSlice); err != nil {
+					return err
+				}
+				return fmt.Errorf("failed to set vcpu thread %d affinity to cpu %d (NUMA node %d): %v", tid, allowedCPUs[pinIdx], i, err)
+			}
+		}
+	}
+
 	s.isVCPUsPinningOn = true
 	return nil
 }

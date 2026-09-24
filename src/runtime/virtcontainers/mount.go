@@ -54,33 +54,32 @@ func isSystemMount(m string) bool {
 	return false
 }
 
-func isHostDevice(m string) bool {
+// isHostDevice returns whether the given path is a non-regular file
+// under /dev (or /dev itself) on the host. If os.Stat fails on the
+// file, it returns false plus the error from os.Stat.
+func isHostDevice(m string) (bool, error) {
 	m = filepath.Clean(m)
 	if m == "/dev" {
-		return true
+		return true, nil
 	}
 
 	if strings.HasPrefix(m, "/dev/") {
-		// Check if regular file
 		s, err := os.Stat(m)
-
-		// This should not happen. In case file does not exist let the
-		// error be handled by the agent, simply return false here.
 		if err != nil {
-			return false
+			return false, err
 		}
 
 		if s.Mode().IsRegular() {
-			return false
+			return false, nil
 		}
 
 		// This is not a regular file in /dev. It is either a
 		// device file, directory or any other special file which is
 		// specific to the host system.
-		return true
+		return true, nil
 	}
 
-	return false
+	return false, nil
 }
 
 func major(dev uint64) int {
@@ -131,7 +130,7 @@ func getDeviceForPath(path string) (device, error) {
 		return device{}, err
 	}
 
-	if isHostDevice(path) {
+	if isDevice, _ := isHostDevice(path); isDevice {
 		// stat.Rdev describes the device that this file (inode) represents.
 		devMajor = major(uint64(stat.Rdev))
 		devMinor = minor(uint64(stat.Rdev))
@@ -273,6 +272,14 @@ type Mount struct {
 	// FSGroupChangePolicy specifies the policy that will be used when applying
 	// group id ownership change for a volume.
 	FSGroupChangePolicy volume.FSGroupChangePolicy
+
+	// EncryptionKey is the encryption key used for the volume.
+	// Currently, valid values are "" for no encryption or "ephemeral"
+	// to instruct the agent to generate a one-time key.
+	EncryptionKey string
+
+	// Shared indicates whether the mount is shared across containers.
+	Shared bool
 }
 
 func isSymlink(path string) bool {

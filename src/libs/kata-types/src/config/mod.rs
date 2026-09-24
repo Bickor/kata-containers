@@ -4,16 +4,15 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::{self, Result};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::u32;
 
 use lazy_static::lazy_static;
 
-use crate::{eother, sl};
+use crate::sl;
 
 /// Default configuration values.
 pub mod default;
@@ -25,12 +24,16 @@ pub mod hypervisor;
 pub use self::agent::Agent;
 use self::default::DEFAULT_AGENT_DBG_CONSOLE_PORT;
 pub use self::hypervisor::{
-    BootInfo, CloudHypervisorConfig, DragonballConfig, FirecrackerConfig, Hypervisor, QemuConfig,
-    HYPERVISOR_NAME_DRAGONBALL, HYPERVISOR_NAME_FIRECRACKER, HYPERVISOR_NAME_QEMU,
+    BootInfo, CloudHypervisorConfig, DragonballConfig, Factory, FirecrackerConfig, Hypervisor,
+    QemuConfig, RemoteConfig, HYPERVISOR_NAME_DRAGONBALL, HYPERVISOR_NAME_FIRECRACKER,
+    HYPERVISOR_NAME_QEMU,
 };
 
 mod runtime;
-pub use self::runtime::{Runtime, RuntimeVendor, RUNTIME_NAME_VIRTCONTAINER};
+pub use self::runtime::{
+    Runtime, RuntimeVendor, EMPTYDIR_MODE_BLOCK_ENCRYPTED, EMPTYDIR_MODE_SHARED_FS,
+    RUNTIME_NAME_VIRTCONTAINER,
+};
 
 pub use self::agent::AGENT_NAME_KATA;
 
@@ -54,8 +57,12 @@ pub const DEBUG_CONSOLE_VPORT_OPTION: &str = "agent.debug_console_vport";
 pub const LOG_VPORT_OPTION: &str = "agent.log_vport";
 /// Option of setting the container's pipe size
 pub const CONTAINER_PIPE_SIZE_OPTION: &str = "agent.container_pipe_size";
+/// Option of setting the guest component launch process timeout
+pub const LAUNCH_PROCESS_TIMEOUT_OPTION: &str = "agent.launch_process_timeout";
 /// Option of setting the fd passthrough io listener port
 pub const PASSFD_LISTENER_PORT: &str = "agent.passfd_listener_port";
+/// Option enabling translation of VISIBLE_CDI_DEVICES into CDI GPU requests
+pub const VISIBLE_CDI_DEVICES_OPTION: &str = "agent.visible_cdi_devices";
 
 /// Trait to manipulate global Kata configuration information.
 pub trait ConfigPlugin: Send + Sync {
@@ -115,6 +122,14 @@ pub struct TomlConfig {
     pub runtime: Runtime,
 }
 
+macro_rules! mem_agent_kv_insert {
+    ($ma_cfg:expr, $key:expr, $map:expr) => {
+        if let Some(n) = $ma_cfg {
+            $map.insert($key.to_string(), n.to_string());
+        }
+    };
+}
+
 impl TomlConfig {
     /// Load Kata configuration information from configuration files.
     ///
@@ -123,9 +138,7 @@ impl TomlConfig {
     pub fn load_from_file<P: AsRef<Path>>(config_file: P) -> Result<(TomlConfig, PathBuf)> {
         let mut result = Self::load_raw_from_file(config_file);
         if let Ok((ref mut config, _)) = result {
-            Hypervisor::adjust_config(config)?;
-            Runtime::adjust_config(config)?;
-            Agent::adjust_config(config)?;
+            config.adjust_config()?;
             info!(sl!(), "get kata config: {:?}", config);
         }
 
@@ -167,11 +180,27 @@ impl TomlConfig {
     /// drop-in config file fragments in config.d/.
     pub fn load(content: &str) -> Result<TomlConfig> {
         let mut config: TomlConfig = toml::from_str(content)?;
-        Hypervisor::adjust_config(&mut config)?;
-        Runtime::adjust_config(&mut config)?;
-        Agent::adjust_config(&mut config)?;
+        config.adjust_config()?;
         info!(sl!(), "get kata config: {:?}", config);
         Ok(config)
+    }
+
+    /// Get the `Factory` configuration from the active hypervisor.
+    pub fn get_factory(&self) -> Factory {
+        let hypervisor_name = self.runtime.hypervisor_name.as_str();
+        self.hypervisor
+            .get(hypervisor_name)
+            .map(|hv| hv.factory.clone())
+            .unwrap_or_default()
+    }
+
+    /// Adjust Kata configuration information.
+    pub fn adjust_config(&mut self) -> Result<()> {
+        Hypervisor::adjust_config(self)?;
+        Runtime::adjust_config(self)?;
+        Agent::adjust_config(self)?;
+
+        Ok(())
     }
 
     /// Validate Kata configuration information.
@@ -184,8 +213,8 @@ impl TomlConfig {
     }
 
     /// Get agent-specfic kernel parameters for further Hypervisor config revision
-    pub fn get_agent_kernel_params(&self) -> Result<HashMap<String, String>> {
-        let mut kv = HashMap::new();
+    pub fn get_agent_kernel_params(&self) -> Result<BTreeMap<String, String>> {
+        let mut kv = BTreeMap::new();
         if let Some(cfg) = self.agent.get(&self.runtime.agent_name) {
             if cfg.debug {
                 kv.insert(LOG_LEVEL_OPTION.to_string(), LOG_LEVEL_DEBUG.to_string());
@@ -197,11 +226,106 @@ impl TomlConfig {
                 let container_pipe_size = cfg.container_pipe_size.to_string();
                 kv.insert(CONTAINER_PIPE_SIZE_OPTION.to_string(), container_pipe_size);
             }
+            if cfg.launch_process_timeout > 0 {
+                let launch_process_timeout = cfg.launch_process_timeout.to_string();
+                kv.insert(
+                    LAUNCH_PROCESS_TIMEOUT_OPTION.to_string(),
+                    launch_process_timeout,
+                );
+            }
+            if cfg.cdh_api_timeout_ms > 0 {
+                // Convert milliseconds to seconds for agent kernel parameter
+                let cdh_api_timeout_secs = cfg.cdh_api_timeout_ms / 1000;
+                kv.insert(
+                    "agent.cdh_api_timeout".to_string(),
+                    cdh_api_timeout_secs.to_string(),
+                );
+            }
             if cfg.debug_console_enabled {
                 kv.insert(DEBUG_CONSOLE_FLAG.to_string(), "".to_string());
                 kv.insert(
                     DEBUG_CONSOLE_VPORT_OPTION.to_string(),
                     DEFAULT_AGENT_DBG_CONSOLE_PORT.to_string(),
+                );
+            }
+            if cfg.visible_cdi_devices {
+                kv.insert(VISIBLE_CDI_DEVICES_OPTION.to_string(), "true".to_string());
+            }
+            if cfg.mem_agent.enable {
+                kv.insert("psi".to_string(), "1".to_string());
+                kv.insert("agent.mem_agent_enable".to_string(), "1".to_string());
+
+                mem_agent_kv_insert!(
+                    cfg.mem_agent.memcg_disable,
+                    "agent.mem_agent_memcg_disable",
+                    kv
+                );
+                mem_agent_kv_insert!(cfg.mem_agent.memcg_swap, "agent.mem_agent_memcg_swap", kv);
+                mem_agent_kv_insert!(
+                    cfg.mem_agent.memcg_swappiness_max,
+                    "agent.mem_agent_memcg_swappiness_max",
+                    kv
+                );
+                mem_agent_kv_insert!(
+                    cfg.mem_agent.memcg_period_secs,
+                    "agent.mem_agent_memcg_period_secs",
+                    kv
+                );
+                mem_agent_kv_insert!(
+                    cfg.mem_agent.memcg_period_psi_percent_limit,
+                    "agent.mem_agent_memcg_period_psi_percent_limit",
+                    kv
+                );
+                mem_agent_kv_insert!(
+                    cfg.mem_agent.memcg_eviction_psi_percent_limit,
+                    "agent.mem_agent_memcg_eviction_psi_percent_limit",
+                    kv
+                );
+                mem_agent_kv_insert!(
+                    cfg.mem_agent.memcg_eviction_run_aging_count_min,
+                    "agent.mem_agent_memcg_eviction_run_aging_count_min",
+                    kv
+                );
+
+                mem_agent_kv_insert!(
+                    cfg.mem_agent.compact_disable,
+                    "agent.mem_agent_compact_disable",
+                    kv
+                );
+                mem_agent_kv_insert!(
+                    cfg.mem_agent.compact_period_secs,
+                    "agent.mem_agent_compact_period_secs",
+                    kv
+                );
+                mem_agent_kv_insert!(
+                    cfg.mem_agent.compact_period_psi_percent_limit,
+                    "agent.mem_agent_compact_period_psi_percent_limit",
+                    kv
+                );
+                mem_agent_kv_insert!(
+                    cfg.mem_agent.compact_psi_percent_limit,
+                    "agent.mem_agent_compact_psi_percent_limit",
+                    kv
+                );
+                mem_agent_kv_insert!(
+                    cfg.mem_agent.compact_sec_max,
+                    "agent.mem_agent_compact_sec_max",
+                    kv
+                );
+                mem_agent_kv_insert!(
+                    cfg.mem_agent.compact_order,
+                    "agent.mem_agent_compact_order",
+                    kv
+                );
+                mem_agent_kv_insert!(
+                    cfg.mem_agent.compact_threshold,
+                    "agent.mem_agent_compact_threshold",
+                    kv
+                );
+                mem_agent_kv_insert!(
+                    cfg.mem_agent.compact_force_times,
+                    "agent.mem_agent_compact_force_times",
+                    kv
                 );
             }
         }
@@ -232,10 +356,9 @@ impl TomlConfig {
 ///
 /// Each member in `patterns` is a path pattern as described by glob(3)
 pub fn validate_path_pattern<P: AsRef<Path>>(patterns: &[String], path: P) -> Result<()> {
-    let path = path
-        .as_ref()
-        .to_str()
-        .ok_or_else(|| eother!("Invalid path {}", path.as_ref().to_string_lossy()))?;
+    let path = path.as_ref().to_str().ok_or_else(|| {
+        std::io::Error::other(format!("Invalid path {}", path.as_ref().to_string_lossy()))
+    })?;
     for p in patterns.iter() {
         if let Ok(glob) = glob::Pattern::new(p) {
             if glob.matches(path) {
@@ -244,7 +367,9 @@ pub fn validate_path_pattern<P: AsRef<Path>>(patterns: &[String], path: P) -> Re
         }
     }
 
-    Err(eother!("Path {} is not permitted", path))
+    Err(std::io::Error::other(format!(
+        "Path {path} is not permitted"
+    )))
 }
 
 /// Kata configuration information.
@@ -379,6 +504,8 @@ mod tests {
             enable_tracing: true,
             container_pipe_size: 20,
             debug_console_enabled: true,
+            launch_process_timeout: 60,
+            visible_cdi_devices: true,
             ..Default::default()
         };
         let agent_name = "test_agent";
@@ -391,5 +518,7 @@ mod tests {
         assert_eq!(kv.get("agent.container_pipe_size").unwrap(), "20");
         kv.get("agent.debug_console").unwrap();
         assert_eq!(kv.get("agent.debug_console_vport").unwrap(), "1026"); // 1026 is the default port
+        assert_eq!(kv.get("agent.launch_process_timeout").unwrap(), "60");
+        assert_eq!(kv.get("agent.visible_cdi_devices").unwrap(), "true");
     }
 }

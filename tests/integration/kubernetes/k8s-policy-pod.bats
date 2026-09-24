@@ -6,22 +6,26 @@
 #
 
 load "${BATS_TEST_DIRNAME}/../../common.bash"
+load "${BATS_TEST_DIRNAME}/lib.sh"
 load "${BATS_TEST_DIRNAME}/tests_common.sh"
 
 issue="https://github.com/kata-containers/kata-containers/issues/10297"
 
 setup() {
 	auto_generate_policy_enabled || skip "Auto-generated policy tests are disabled."
-
+    setup_common || die "setup_common failed"
 	configmap_name="policy-configmap"
 	pod_name="policy-pod"
 	priority_class_name="test-high-priority"
 
-	get_pod_config_dir
 	policy_settings_dir="$(create_tmp_policy_settings_dir "${pod_config_dir}")"
-	
-	exec_command=(printenv data-3)
-	add_exec_to_policy_settings "${policy_settings_dir}" "${exec_command[@]}"
+
+	print_env_var_data3=(printenv data-3)
+	add_exec_to_policy_settings "${policy_settings_dir}" "${print_env_var_data3[@]}"
+
+	print_env_var_label=(printenv VARIABLE_FROM_LABEL)
+	add_exec_to_policy_settings "${policy_settings_dir}" "${print_env_var_label[@]}"
+
 	add_requests_to_policy_settings "${policy_settings_dir}" "ReadStreamRequest"
 
 	correct_configmap_yaml="${pod_config_dir}/k8s-policy-configmap.yaml"
@@ -43,11 +47,11 @@ setup() {
 		prometheus_image_supported || replace_prometheus_image
 
 		# Save pre-generated yaml files
-		cp "${correct_configmap_yaml}" "${pre_generate_configmap_yaml}" 
+		cp "${correct_configmap_yaml}" "${pre_generate_configmap_yaml}"
 		cp "${correct_pod_yaml}" "${pre_generate_pod_yaml}"
 
 		# Add policy to the correct pod yaml file
-		auto_generate_policy "${policy_settings_dir}" "${correct_pod_yaml}" "${correct_configmap_yaml}"
+		auto_generate_policy_no_added_flags "${policy_settings_dir}" "${correct_pod_yaml}" "${correct_configmap_yaml}"
 	fi
 
     # Start each test case with a copy of the correct yaml files.
@@ -57,6 +61,9 @@ setup() {
 	# Also give each testcase a copy of the pre-generated yaml files.
 	cp "${pre_generate_configmap_yaml}" "${testcase_pre_generate_configmap_yaml}"
 	cp "${pre_generate_pod_yaml}" "${testcase_pre_generate_pod_yaml}"
+
+	set_node "${testcase_pre_generate_pod_yaml}" "${node}"
+	set_node "${correct_pod_yaml}" "${node}"
 }
 
 prometheus_image_supported() {
@@ -75,32 +82,40 @@ replace_prometheus_image() {
 		"${correct_pod_yaml}"
 }
 
-# Common function for several test cases from this bats script.
 wait_for_pod_ready() {
+	cmd="kubectl wait --for=condition=Ready --timeout=0s pod ${pod_name}"
+	abort_cmd="kubectl describe pod ${pod_name} | grep \"CreateContainerRequest is blocked by policy\""
+	info "Waiting ${wait_time}s with sleep ${sleep_time}s for: ${cmd}. Abort if: ${abort_cmd}."
+	waitForCmdWithAbortCmd "${wait_time}" "${sleep_time}" "${cmd}" "${abort_cmd}"
+}
+
+create_and_wait_for_pod_ready() {
 	kubectl create -f "${correct_configmap_yaml}"
 	kubectl create -f "${correct_pod_yaml}"
-	kubectl wait --for=condition=Ready "--timeout=${timeout}" pod "${pod_name}"
-}
-
-@test "Successful pod with auto-generated policy" {
 	wait_for_pod_ready
 }
 
-@test "Able to read env variables sourced from configmap using envFrom" {
-	wait_for_pod_ready
-	expected_env_var=$(kubectl exec "${pod_name}" -- "${exec_command[@]}")
-	[ "$expected_env_var" = "value-3" ] || fail "expected_env_var is not equal to value-3"
+@test "Successful pod and able to read env variables sourced from configmap using envFrom" {
+	local value
+
+	create_and_wait_for_pod_ready
+
+	value=$(kubectl exec "${pod_name}" -- "${print_env_var_data3[@]}")
+	[[ "$value" == "value-3" ]] || fail "value=${value} is not equal to value-3"
+
+	value=$(kubectl exec "${pod_name}" -- "${print_env_var_label[@]}")
+	[[ "$value" == "label-value1" ]] || fail "value=${value} is not equal to label-value1"
 }
 
 @test "Successful pod with auto-generated policy and runtimeClassName filter" {
 	runtime_class_name=$(yq ".spec.runtimeClassName" < "${testcase_pre_generate_pod_yaml}")
 
 	auto_generate_policy "${pod_config_dir}" "${testcase_pre_generate_pod_yaml}" "${testcase_pre_generate_configmap_yaml}" \
-		"--runtime-class-names=other-runtime-class-name --runtime-class-names=${runtime_class_name}" 
+		"--runtime-class-names=other-runtime-class-name --runtime-class-names=${runtime_class_name}"
 
 	kubectl create -f "${testcase_pre_generate_configmap_yaml}"
 	kubectl create -f "${testcase_pre_generate_pod_yaml}"
-	kubectl wait --for=condition=Ready "--timeout=${timeout}" pod "${pod_name}"
+	wait_for_pod_ready
 }
 
 @test "Successful pod with auto-generated policy and custom layers cache path" {
@@ -114,7 +129,7 @@ wait_for_pod_ready() {
 
 	kubectl create -f "${testcase_pre_generate_configmap_yaml}"
 	kubectl create -f "${testcase_pre_generate_pod_yaml}"
-	kubectl wait --for=condition=Ready "--timeout=${timeout}" pod "${pod_name}"
+	wait_for_pod_ready
 }
 
 # Common function for several test cases from this bats script.
@@ -154,13 +169,13 @@ test_pod_policy_error() {
 
 @test "Policy failure: unexpected hostPath volume mount" {
 	# Changing the pod spec after generating its policy will cause CreateContainer to be denied.
-  yq -i \
-    '.spec.containers[0].volumeMounts += [{"name": "mountpoint-dir", "mountPath": "/var/lib/kubelet/pods"}]' \
-    "${incorrect_pod_yaml}"
+	yq -i \
+		'.spec.containers[0].volumeMounts += [{"name": "mountpoint-dir", "mountPath": "/hostpath-volume"}]' \
+		"${incorrect_pod_yaml}"
 
-  yq -i \
-    '.spec.volumes += [{"hostPath": {"path": "/var/lib/kubelet/pods", "type": "DirectoryOrCreate"}, "name": "mountpoint-dir"}]' \
-    "${incorrect_pod_yaml}"
+	yq -i \
+		'.spec.volumes += [{"hostPath": {"path": "/tmp/k8s-policy-pod-test", "type": "DirectoryOrCreate"}, "name": "mountpoint-dir"}]' \
+		"${incorrect_pod_yaml}"
 
 	test_pod_policy_error
 }
@@ -191,11 +206,10 @@ test_pod_policy_error() {
 	kubectl create -f "${correct_configmap_yaml}"
 	kubectl create -f "${incorrect_pod_yaml}"
 
-	command="kubectl describe pod ${pod_name} | grep FailedPostStartHook"
-	info "Waiting ${wait_time} seconds for: ${command}"
-
-	# Don't print the "Message:" line because it contains a truncated policy log.
-	waitForProcess "${wait_time}" "$sleep_time" "${command}" | grep -v "Message:"
+	cmd="kubectl describe pod ${pod_name} | grep FailedPostStartHook"
+	abort_cmd="kubectl describe pod ${pod_name} | grep \"CreateContainerRequest is blocked by policy\""
+	info "Waiting ${wait_time}s with sleep ${sleep_time}s for: ${cmd}. Abort if: ${abort_cmd}."
+	waitForCmdWithAbortCmd "${wait_time}" "${sleep_time}" "${cmd}" "${abort_cmd}"
 }
 
 @test "RuntimeClassName filter: no policy" {
@@ -211,11 +225,11 @@ test_pod_policy_error() {
 		"--runtime-class-names=other-${runtime_class_name}"
 
 	# Check that the pod yaml does not contain a policy annotation.
-	run ! grep -q "io.katacontainers.config.agent.policy" "${testcase_pre_generate_pod_yaml}"
+	run ! grep -q "io.katacontainers.config.hypervisor.cc_init_data" "${testcase_pre_generate_pod_yaml}"
 }
 
 @test "ExecProcessRequest tests" {
-	wait_for_pod_ready
+	create_and_wait_for_pod_ready
 
 	# Execute commands allowed by the policy.
 	pod_exec_allowed_command "${pod_name}" "echo" "livenessProbe" "test"
@@ -241,7 +255,7 @@ test_pod_policy_error() {
 
 	kubectl create -f "${correct_configmap_yaml}"
 	kubectl create -f "${incorrect_pod_yaml}"
-	kubectl wait --for=condition=Ready "--timeout=${timeout}" pod "${pod_name}"
+	wait_for_pod_ready
 }
 
 @test "Policy failure: unexpected UID = 0" {
@@ -282,4 +296,6 @@ teardown() {
 	rm -f "${incorrect_configmap_yaml}"
 	rm -f "${testcase_pre_generate_pod_yaml}"
 	rm -f "${testcase_pre_generate_configmap_yaml}"
+
+	teardown_common "${node}" "${node_start_time:-}"
 }

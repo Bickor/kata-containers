@@ -9,7 +9,8 @@ use std::{fs::File, os::unix::io::AsRawFd};
 use anyhow::{Context, Result};
 use nix::sched::{setns, CloneFlags};
 use nix::unistd::{getpid, gettid};
-use rand::Rng;
+use rand::rng as thread_rng;
+use rand::RngExt;
 
 use kata_types::sl;
 
@@ -25,7 +26,7 @@ impl NetnsGuard {
                 .with_context(|| format!("open current netns path {}", &current_netns_path))?;
             let new_netns = File::open(new_netns_path)
                 .with_context(|| format!("open new netns path {}", &new_netns_path))?;
-            setns(new_netns.as_raw_fd(), CloneFlags::CLONE_NEWNET)
+            setns(&new_netns, CloneFlags::CLONE_NEWNET)
                 .with_context(|| "set netns to new netns")?;
             info!(
                 sl!(),
@@ -46,17 +47,16 @@ impl NetnsGuard {
 impl Drop for NetnsGuard {
     fn drop(&mut self) {
         if let Some(old_netns) = self.old_netns.as_ref() {
-            let old_netns_fd = old_netns.as_raw_fd();
-            setns(old_netns_fd, CloneFlags::CLONE_NEWNET).unwrap();
-            info!(sl!(), "set netns to old {:?}", old_netns_fd);
+            setns(old_netns, CloneFlags::CLONE_NEWNET).unwrap();
+            info!(sl!(), "set netns to old {:?}", old_netns.as_raw_fd());
         }
     }
 }
 
 // generate the network namespace name
 pub fn generate_netns_name() -> String {
-    let mut rng = rand::thread_rng();
-    let random_bytes: [u8; 16] = rng.gen();
+    let mut rng = thread_rng();
+    let random_bytes: [u8; 16] = rng.random();
     format!(
         "cnitest-{}-{}-{}-{}-{}",
         hex::encode(&random_bytes[..4]),

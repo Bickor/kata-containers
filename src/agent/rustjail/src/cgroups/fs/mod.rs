@@ -33,6 +33,7 @@ use protocols::agent::{
     BlkioStats, BlkioStatsEntry, CgroupStats, CpuStats, CpuUsage, HugetlbStats, MemoryData,
     MemoryStats, PidsStats, ThrottlingData,
 };
+use serde::{Deserialize, Serialize};
 use std::any::Any;
 use std::collections::HashMap;
 use std::fs;
@@ -559,11 +560,7 @@ fn build_blk_io_device_throttle_resource(
 }
 
 fn linux_device_cgroup_to_device_resource(d: &LinuxDeviceCgroup) -> Option<DeviceResource> {
-    let dev_type = match DeviceType::from_char(d.typ().unwrap_or_default().as_str().chars().next())
-    {
-        Some(t) => t,
-        None => return None,
-    };
+    let dev_type = DeviceType::from_char(d.typ().unwrap_or_default().as_str().chars().next())?;
 
     let mut permissions: Vec<DevicePermissions> = vec![];
     for p in d
@@ -724,9 +721,20 @@ fn get_cpuacct_stats(cg: &cgroups::Cgroup) -> MessageField<CpuUsage> {
     let cpu_controller: &CpuController = get_controller_or_return_singular_none!(cg);
     let stat = cpu_controller.cpu().stat;
     let h = lines_to_map(&stat);
-    let usage_in_usermode = *h.get("user_usec").unwrap_or(&0);
-    let usage_in_kernelmode = *h.get("system_usec").unwrap_or(&0);
-    let total_usage = *h.get("usage_usec").unwrap_or(&0);
+    // All fields in CpuUsage are expressed in nanoseconds (ns).
+    //
+    // For cgroup v1 (cpuacct controller):
+    // kata-agent reads the cpuacct.stat file, which reports the number of ticks
+    // consumed by the processes in the cgroup. It then converts these ticks to nanoseconds.
+    // Ref: https://www.kernel.org/doc/Documentation/cgroup-v1/cpuacct.txt
+    //
+    // For cgroup v2 (cpu controller):
+    // kata-agent reads the cpu.stat file, which reports the time consumed by the
+    // processes in the cgroup in microseconds (us). It then converts microseconds to nanoseconds.
+    // Ref: https://www.kernel.org/doc/Documentation/cgroup-v2.txt, section 5-1-1. CPU Interface Files
+    let usage_in_usermode = *h.get("user_usec").unwrap_or(&0) * 1000;
+    let usage_in_kernelmode = *h.get("system_usec").unwrap_or(&0) * 1000;
+    let total_usage = *h.get("usage_usec").unwrap_or(&0) * 1000;
     let percpu_usage = vec![];
 
     MessageField::some(CpuUsage {
@@ -1089,7 +1097,7 @@ impl Manager {
                             devices_group_info
                         );
                         Self::setup_allowed_all_mode(pod_cg).with_context(|| {
-                            format!("Setup allowed all devices mode for {}", pod_cpath)
+                            format!("Setup allowed all devices mode for {pod_cpath}")
                         })?;
                         devices_group_info.allowed_all = true;
                     }
@@ -1101,11 +1109,11 @@ impl Manager {
 
                     if !is_allowded_all {
                         Self::setup_devcg_whitelist(pod_cg).with_context(|| {
-                            format!("Setup device cgroup whitelist for {}", pod_cpath)
+                            format!("Setup device cgroup whitelist for {pod_cpath}")
                         })?;
                     } else {
                         Self::setup_allowed_all_mode(pod_cg)
-                            .with_context(|| format!("Setup allowed all mode for {}", pod_cpath))?;
+                            .with_context(|| format!("Setup allowed all mode for {pod_cpath}"))?;
                         devices_group_info.allowed_all = true;
                     }
 
@@ -1124,7 +1132,7 @@ impl Manager {
         if let Some(devices_group_info) = devices_group_info.as_ref() {
             if !devices_group_info.allowed_all {
                 Self::setup_devcg_whitelist(&cg)
-                    .with_context(|| format!("Setup device cgroup whitelist for {}", cpath))?;
+                    .with_context(|| format!("Setup device cgroup whitelist for {cpath}"))?;
             }
         }
 
@@ -1157,6 +1165,23 @@ impl Manager {
             cgroup: cg,
             devcg_allowed_all: false,
         })
+    }
+
+    pub fn subcgroup(&self) -> &str {
+        // Check if we're in a Docker-in-Docker setup by verifying:
+        // 1. We're using cgroups v2 (which restricts direct process control)
+        // 2. An "init" subdirectory exists (used by DinD for process delegation)
+        let is_dind = cgroups::hierarchies::is_cgroup2_unified_mode()
+            && cgroups::hierarchies::auto()
+                .root()
+                .join(&self.cpath)
+                .join("init")
+                .exists();
+        if is_dind {
+            "/init/"
+        } else {
+            "/"
+        }
     }
 
     fn get_paths_and_mounts(
@@ -1295,10 +1320,7 @@ fn default_allowed_devices() -> Vec<DeviceResource> {
 
 /// Convert LinuxDevice to DeviceResource.
 fn linux_device_to_device_resource(d: &LinuxDevice) -> Option<DeviceResource> {
-    let dev_type = match DeviceType::from_char(d.typ().as_str().chars().next()) {
-        Some(t) => t,
-        None => return None,
-    };
+    let dev_type = DeviceType::from_char(d.typ().as_str().chars().next())?;
 
     let permissions = vec![
         DevicePermissions::Read,
@@ -1493,7 +1515,7 @@ mod tests {
         let one_time_cpath =
             |child: &str| -> String { format!("/{}/{}", one_time_pod_name, child) };
 
-        let test_cases = vec![
+        let test_cases = [
             TestCase {
                 cpath: vec![one_time_cpath("child1")],
                 devices: vec![vec![allow_all.clone()]],
@@ -1564,14 +1586,14 @@ mod tests {
                 drop(devcg_info);
 
                 let pod_devices_list = Command::new("cat")
-                    .arg(&format!(
+                    .arg(format!(
                         "/sys/fs/cgroup/devices/{}/devices.list",
                         one_time_pod_name
                     ))
                     .output()
                     .unwrap();
                 let container_devices_list = Command::new("cat")
-                    .arg(&format!(
+                    .arg(format!(
                         "/sys/fs/cgroup/devices{}/devices.list",
                         tc.cpath[cid]
                     ))
@@ -1611,7 +1633,7 @@ mod tests {
             DEFAULT_DEVICES.len() + DEFAULT_ALLOWED_DEVICES.len()
         );
 
-        let allowed_permissions = vec![
+        let allowed_permissions = [
             DevicePermissions::Read,
             DevicePermissions::Write,
             DevicePermissions::MkNod,
@@ -1625,7 +1647,7 @@ mod tests {
         assert!(default_devices_0
             .access
             .iter()
-            .all(|&p| allowed_permissions.iter().any(|&ap| ap == p)));
+            .all(|&p| allowed_permissions.contains(&p)));
 
         let default_allowed_devices_0 = &allowed_devices[DEFAULT_DEVICES.len()];
         assert!(default_allowed_devices_0.allow);

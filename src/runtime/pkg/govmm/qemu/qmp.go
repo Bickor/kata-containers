@@ -14,7 +14,6 @@ import (
 	"io"
 	"net"
 	"os"
-	"strconv"
 	"syscall"
 	"time"
 
@@ -44,6 +43,10 @@ type QMPLog interface {
 	// Errorf writes error output to the log.  A newline will be
 	// added to the output if one is not provided.
 	Errorf(string, ...interface{})
+
+	// Debugf writes debug output to the log.  A newline will be
+	// added to the output if one is not provided.
+	Debugf(string, ...interface{})
 }
 
 type qmpNullLogger struct{}
@@ -59,6 +62,9 @@ func (l qmpNullLogger) Warningf(format string, v ...interface{}) {
 }
 
 func (l qmpNullLogger) Errorf(format string, v ...interface{}) {
+}
+
+func (l qmpNullLogger) Debugf(format string, v ...interface{}) {
 }
 
 // QMPConfig is a configuration structure that can be used to specify a
@@ -654,6 +660,7 @@ func (q *QMP) executeCommandWithResponse(ctx context.Context, name string, args 
 
 func (q *QMP) executeCommand(ctx context.Context, name string, args map[string]interface{},
 	filter *qmpEventFilter) error {
+	q.cfg.Logger.Debugf("Executing QMP command: %s: %v", name, args)
 
 	_, err := q.executeCommandWithResponse(ctx, name, args, nil, filter)
 	return err
@@ -852,8 +859,10 @@ func (q *QMP) ExecuteBlockdevAddWithDriverCache(ctx context.Context, driver stri
 // shared denotes if the drive can be shared allowing it to be passed more than once.
 // disableModern indicates if virtio version 1.0 should be replaced by the
 // former version 0.9, as there is a KVM bug that occurs when using virtio
-// 1.0 in nested environments.
-func (q *QMP) ExecuteDeviceAdd(ctx context.Context, blockdevID, devID, driver, bus, romfile string, shared, disableModern bool) error {
+// 1.0 in nested environments. logicalBlockSize and physicalBlockSize specify
+// the logical and physical block sizes for the device; if either is 0, the
+// hypervisor default is used for that size.
+func (q *QMP) ExecuteDeviceAdd(ctx context.Context, blockdevID, devID, driver, bus, romfile string, shared, disableModern bool, logicalBlockSize, physicalBlockSize uint32) error {
 	args := map[string]interface{}{
 		"id":     devID,
 		"driver": driver,
@@ -869,7 +878,7 @@ func (q *QMP) ExecuteDeviceAdd(ctx context.Context, blockdevID, devID, driver, b
 	}
 
 	if shared {
-		args["share-rw"] = "on"
+		args["share-rw"] = true
 	}
 	if transport.isVirtioPCI(nil) {
 		args["romfile"] = romfile
@@ -877,6 +886,14 @@ func (q *QMP) ExecuteDeviceAdd(ctx context.Context, blockdevID, devID, driver, b
 		if disableModern {
 			args["disable-modern"] = disableModern
 		}
+	}
+
+	if logicalBlockSize > 0 {
+		args["logical_block_size"] = logicalBlockSize
+	}
+
+	if physicalBlockSize > 0 {
+		args["physical_block_size"] = physicalBlockSize
 	}
 
 	return q.executeCommand(ctx, "device_add", args, nil)
@@ -923,7 +940,7 @@ func (q *QMP) ExecuteSCSIDeviceAdd(ctx context.Context, blockdevID, devID, drive
 		args["lun"] = lun
 	}
 	if shared {
-		args["share-rw"] = "on"
+		args["share-rw"] = true
 	}
 
 	return q.executeCommand(ctx, "device_add", args, nil)
@@ -1050,7 +1067,7 @@ func (q *QMP) ExecuteNetPCIDeviceAdd(ctx context.Context, netdevID, devID, macAd
 		// Clearlinux automatically sets up the queues properly
 		// The agent implementation should do this to ensure that it is
 		// always set
-		args["mq"] = "on"
+		args["mq"] = true
 		args["vectors"] = 2*queues + 2
 	}
 
@@ -1071,7 +1088,7 @@ func (q *QMP) ExecuteNetCCWDeviceAdd(ctx context.Context, netdevID, devID, macAd
 	}
 
 	if queues > 0 {
-		args["mq"] = "on"
+		args["mq"] = true
 	}
 
 	return q.executeCommand(ctx, "device_add", args, nil)
@@ -1101,8 +1118,9 @@ func (q *QMP) ExecuteDeviceDel(ctx context.Context, devID string) error {
 // a block device. shared denotes if the drive can be shared allowing it to be passed more than once.
 // disableModern indicates if virtio version 1.0 should be replaced by the
 // former version 0.9, as there is a KVM bug that occurs when using virtio
-// 1.0 in nested environments.
-func (q *QMP) ExecutePCIDeviceAdd(ctx context.Context, blockdevID, devID, driver, addr, bus, romfile string, queues int, shared, disableModern bool) error {
+// 1.0 in nested environments. logicalBlockSize and physicalBlockSize specify the logical and
+// physical sector sizes reported to the guest; set to 0 to use the hypervisor default.
+func (q *QMP) ExecutePCIDeviceAdd(ctx context.Context, blockdevID, devID, driver, addr, bus, romfile string, queues int, shared, disableModern bool, iothreadID string, logicalBlockSize, physicalBlockSize uint32) error {
 	args := map[string]interface{}{
 		"id":     devID,
 		"driver": driver,
@@ -1113,10 +1131,10 @@ func (q *QMP) ExecutePCIDeviceAdd(ctx context.Context, blockdevID, devID, driver
 		args["bus"] = bus
 	}
 	if shared {
-		args["share-rw"] = "on"
+		args["share-rw"] = true
 	}
 	if queues > 0 {
-		args["num-queues"] = strconv.Itoa(queues)
+		args["num-queues"] = queues
 	}
 
 	var transport VirtioTransport
@@ -1127,6 +1145,18 @@ func (q *QMP) ExecutePCIDeviceAdd(ctx context.Context, blockdevID, devID, driver
 		if disableModern {
 			args["disable-modern"] = disableModern
 		}
+	}
+
+	if iothreadID != "" {
+		args["iothread"] = iothreadID
+	}
+
+	if logicalBlockSize > 0 {
+		args["logical_block_size"] = logicalBlockSize
+	}
+
+	if physicalBlockSize > 0 {
+		args["physical_block_size"] = physicalBlockSize
 	}
 
 	return q.executeCommand(ctx, "device_add", args, nil)
@@ -1157,7 +1187,8 @@ func (q *QMP) ExecutePCIVhostUserDevAdd(ctx context.Context, driver, devID, char
 // devID is the id of the device to add. Must be valid QMP identifier.
 // bdf is the PCI bus-device-function of the pci device.
 // bus is optional. When hot plugging a PCIe device, the bus can be the ID of the pcie-root-port.
-func (q *QMP) ExecuteVFIODeviceAdd(ctx context.Context, devID, bdf, bus, romfile string) error {
+// iommufdID is the ID of the iommufd object to be created for this device. If empty, no iommufd object will be created.
+func (q *QMP) ExecuteVFIODeviceAdd(ctx context.Context, devID, bdf, bus, romfile string, iommufdID string) error {
 	var driver string
 	var transport VirtioTransport
 
@@ -1175,6 +1206,17 @@ func (q *QMP) ExecuteVFIODeviceAdd(ctx context.Context, devID, bdf, bus, romfile
 	}
 	if bus != "" {
 		args["bus"] = bus
+	}
+	if iommufdID != "" {
+		iommufdIDFull := "iommufd" + iommufdID
+		objectAddArgs := map[string]interface{}{
+			"qom-type": "iommufd",
+			"id":       iommufdIDFull,
+		}
+		if err := q.executeCommand(ctx, "object-add", objectAddArgs, nil); err != nil {
+			return err
+		}
+		args["iommufd"] = iommufdIDFull
 	}
 	return q.executeCommand(ctx, "device_add", args, nil)
 }
@@ -1257,25 +1299,23 @@ func (q *QMP) isDieIDSupported(driver string) bool {
 // node/board the CPU belongs to, coreID is the core number within socket the CPU belongs to, threadID is the
 // thread number within core the CPU belongs to. Note that socketID and threadID are not a requirement for
 // architecures like ppc64le.
-func (q *QMP) ExecuteCPUDeviceAdd(ctx context.Context, driver, cpuID, socketID, dieID, coreID, threadID, romfile string) error {
+func (q *QMP) ExecuteCPUDeviceAdd(ctx context.Context, driver, cpuID string, socketID, dieID, coreID, threadID int, romfile string) error {
 	args := map[string]interface{}{
 		"driver":  driver,
 		"id":      cpuID,
 		"core-id": coreID,
 	}
 
-	if socketID != "" && isSocketIDSupported(driver) {
+	if socketID >= 0 && isSocketIDSupported(driver) {
 		args["socket-id"] = socketID
 	}
 
-	if threadID != "" && isThreadIDSupported(driver) {
+	if threadID >= 0 && isThreadIDSupported(driver) {
 		args["thread-id"] = threadID
 	}
 
-	if q.isDieIDSupported(driver) {
-		if dieID != "" {
-			args["die-id"] = dieID
-		}
+	if dieID >= 0 && q.isDieIDSupported(driver) {
+		args["die-id"] = dieID
 	}
 
 	return q.executeCommand(ctx, "device_add", args, nil)
@@ -1425,11 +1465,18 @@ func (q *QMP) ExecMemdevAdd(ctx context.Context, qomtype, id, mempath string, si
 		"memdev": id,
 	}
 
-	if bus != "" {
-		args["bus"] = bus
-	}
-	if addr != "" {
-		args["addr"] = addr
+	var transport VirtioTransport
+	if transport.isVirtioCCW(nil) {
+		if addr != "" {
+			args["devno"] = addr
+		}
+	} else {
+		if bus != "" {
+			args["bus"] = bus
+		}
+		if addr != "" {
+			args["addr"] = addr
+		}
 	}
 
 	err = q.executeCommand(ctx, "device_add", args, nil)

@@ -6,7 +6,7 @@
 # s390x settings
 
 MACHINETYPE := s390-ccw-virtio
-KERNELPARAMS :=
+KERNELPARAMS := cgroup_no_v1=all systemd.unified_cgroup_hierarchy=1
 MACHINEACCELERATORS :=
 CPUFEATURES :=
 
@@ -18,3 +18,6 @@ ifneq (,$(NEEDS_CC_SETTING))
 	CC := gcc
 	export CC
 endif
+
+# Enable virtio-mem for s390x
+DEFENABLEVIRTIOMEM = true

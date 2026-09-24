@@ -122,7 +122,7 @@ where
     }
 
     /// Returns an immutable iterator over the config items
-    pub fn iter(&self) -> ::std::slice::Iter<T> {
+    pub fn iter(&self) -> ::std::slice::Iter<'_, T> {
         self.configs.iter()
     }
 
@@ -165,7 +165,7 @@ impl<T> DeviceConfigInfo<T>
 where
     T: ConfigItem + Clone,
 {
-    /// Create a new instance of ['DeviceInfoGroup'].
+    /// Create a new instance of ['DeviceConfigInfo'].
     pub fn new(config: T) -> Self {
         DeviceConfigInfo {
             config,
@@ -173,7 +173,7 @@ where
         }
     }
 
-    /// Create a new instance of ['DeviceInfoGroup'] with optional device.
+    /// Create a new instance of ['DeviceConfigInfo'] with optional device.
     pub fn new_with_device(config: T, device: Option<Arc<dyn DeviceIo>>) -> Self {
         DeviceConfigInfo { config, device }
     }
@@ -269,12 +269,12 @@ where
     }
 
     /// Iterator for configuration information objects.
-    pub fn iter(&self) -> std::slice::Iter<DeviceConfigInfo<T>> {
+    pub fn iter(&self) -> std::slice::Iter<'_, DeviceConfigInfo<T>> {
         self.info_list.iter()
     }
 
     /// Mutable iterator for configuration information objects.
-    pub fn iter_mut(&mut self) -> std::slice::IterMut<DeviceConfigInfo<T>> {
+    pub fn iter_mut(&mut self) -> std::slice::IterMut<'_, DeviceConfigInfo<T>> {
         self.info_list.iter_mut()
     }
 

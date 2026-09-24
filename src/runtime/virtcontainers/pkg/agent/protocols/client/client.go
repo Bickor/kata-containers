@@ -24,7 +24,6 @@ import (
 	otelLabel "go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 	grpcStatus "google.golang.org/grpc/status"
 
 	"github.com/containerd/ttrpc"
@@ -41,6 +40,9 @@ const (
 var defaultDialTimeout = 30 * time.Second
 
 var hybridVSockPort uint32
+var hybridVSockErrors uint32 = 0
+
+const hybridVSockErrorsSkip uint32 = 128
 
 var agentClientFields = logrus.Fields{
 	"name":   "agent-client",
@@ -129,7 +131,7 @@ func TraceUnaryClientInterceptor() ttrpc.UnaryClientInterceptor {
 			span.SetAttributes(otelLabel.Key("RPC_ERROR").Bool(true))
 		}
 		// err can be nil, that will return an OK response code
-		if status, _ := status.FromError(err); status != nil {
+		if status, _ := grpcStatus.FromError(err); status != nil {
 			span.SetAttributes(otelLabel.Key("RPC_CODE").Int((int)(status.Code())))
 			span.SetAttributes(otelLabel.Key("RPC_MESSAGE").String(status.Message()))
 		}
@@ -397,7 +399,7 @@ func HybridVSockDialer(sock string, timeout time.Duration) (net.Conn, error) {
 		// Once the connection is opened, the following command MUST BE sent,
 		// the hypervisor needs to know the port number where the agent is listening in order to
 		// create the connection
-		if _, err = conn.Write([]byte(fmt.Sprintf("CONNECT %d\n", port))); err != nil {
+		if _, err = fmt.Fprintf(conn, "CONNECT %d\n", port); err != nil {
 			conn.Close()
 			return nil, err
 		}
@@ -425,9 +427,16 @@ func HybridVSockDialer(sock string, timeout time.Duration) (net.Conn, error) {
 		case err = <-errChan:
 			if err != nil {
 				conn.Close()
-				agentClientLog.WithField("Error", err).Debug("HybridVsock trivial handshake failed")
-				return nil, err
 
+				// With full debug logging enabled there might be around 1,500 redials in a tight loop, so
+				// skip logging some of these failures to avoid flooding the log.
+				errorsCount := hybridVSockErrors
+				if errorsCount%hybridVSockErrorsSkip == 0 {
+					agentClientLog.WithField("Error", err).WithField("count", errorsCount).Debug("HybridVsock trivial handshake failed")
+				}
+				hybridVSockErrors = errorsCount + 1
+
+				return nil, err
 			}
 			return conn, nil
 		case <-time.After(handshakeTimeout):
@@ -447,7 +456,7 @@ func HybridVSockDialer(sock string, timeout time.Duration) (net.Conn, error) {
 func RemoteSockDialer(sock string, timeout time.Duration) (net.Conn, error) {
 
 	s := strings.Split(sock, ":")
-	if !(len(s) == 2 && s[0] == RemoteSockScheme) {
+	if len(s) != 2 || s[0] != RemoteSockScheme {
 		return nil, fmt.Errorf("failed to parse remote sock: %q", sock)
 	}
 	socketPath := s[1]

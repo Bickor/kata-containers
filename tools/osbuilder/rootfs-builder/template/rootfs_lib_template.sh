@@ -1,3 +1,4 @@
+#!/usr/bin/env bash
 #
 # Copyright (c) 2018-2020 Intel Corporation
 #
@@ -31,6 +32,7 @@
 
 build_rootfs() {
 	# Mandatory
+	# shellcheck disable=SC2034
 	local ROOTFS_DIR=$1
 
 	#Name of the Kata-Agent binary

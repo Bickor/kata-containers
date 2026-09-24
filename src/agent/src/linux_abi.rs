@@ -3,33 +3,63 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
+use crate::pci;
+use anyhow::{Context, Result};
 use cfg_if::cfg_if;
-
-/// Linux ABI related constants.
+use std::str::FromStr;
+// Linux ABI related constants.
 
 #[cfg(target_arch = "aarch64")]
 use std::fs;
 
 pub const SYSFS_DIR: &str = "/sys";
 #[cfg(any(
-    target_arch = "powerpc64",
+    all(target_arch = "powerpc64", target_endian = "little"),
+    target_arch = "riscv64",
     target_arch = "s390x",
     target_arch = "x86_64",
     target_arch = "x86"
 ))]
-pub fn create_pci_root_bus_path() -> String {
-    String::from("/devices/pci0000:00")
+// With NUMA, we need to make sure we use the correct root complex which is
+// defined by the pxb-pcie driver.
+pub fn create_pci_root_bus_path(root_complex: &str) -> String {
+    format!("/devices/pci0000:{root_complex}")
+}
+
+// Parses a device tree path into a (root_complex, PCI path) pair.
+//
+// Supports two formats:
+//   - Full NUMA path: "root_complex/bus/device" (e.g. "10/00/02") where the
+//     first segment is the root complex and the rest form the PCI path.
+//   - Legacy path: "bus/device" (e.g. "00/02") which defaults to root complex "00".
+pub fn pcipath_from_dev_tree_path(dev_tree_path: &str) -> Result<(&str, pci::Path)> {
+    let segments: Vec<&str> = dev_tree_path.split('/').collect();
+    if segments.len() >= 3 {
+        let root_complex = segments[0];
+        let pci_part = &dev_tree_path[root_complex.len() + 1..];
+        let pci_path = pci::Path::from_str(pci_part).with_context(|| {
+            format!(
+                "Failed to parse PCI path from NUMA path '{}'",
+                dev_tree_path
+            )
+        })?;
+        Ok((root_complex, pci_path))
+    } else {
+        let pci_path = pci::Path::from_str(dev_tree_path)
+            .with_context(|| format!("Failed to parse PCI path from '{}'", dev_tree_path))?;
+        Ok(("00", pci_path))
+    }
 }
 
 #[cfg(target_arch = "aarch64")]
-pub fn create_pci_root_bus_path() -> String {
-    let ret = String::from("/devices/platform/4010000000.pcie/pci0000:00");
+pub fn create_pci_root_bus_path(root_complex: &str) -> String {
+    let ret = format!("/devices/platform/4010000000.pcie/pci0000:{root_complex}");
 
-    let acpi_root_bus_path = String::from("/devices/pci0000:00");
+    let acpi_root_bus_path = format!("/devices/pci0000:{root_complex}");
     let mut acpi_sysfs_dir = String::from(SYSFS_DIR);
     let mut sysfs_dir = String::from(SYSFS_DIR);
     let mut start_root_bus_path = String::from("/devices/platform/");
-    let end_root_bus_path = String::from("/pci0000:00");
+    let end_root_bus_path = format!("/pci0000:{root_complex}");
 
     // check if there is pci bus path for acpi
     acpi_sysfs_dir.push_str(&acpi_root_bus_path);

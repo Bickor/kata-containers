@@ -11,19 +11,22 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use hypervisor::{
     device::{
-        device_manager::{do_handle_device, get_block_driver, DeviceManager},
+        device_manager::{do_handle_device, get_block_device_info, DeviceManager},
         DeviceConfig, DeviceType,
     },
-    BlockConfig,
+    BlockConfig, BlockDeviceAio,
 };
 use kata_types::config::hypervisor::{
     VIRTIO_BLK_CCW, VIRTIO_BLK_MMIO, VIRTIO_BLK_PCI, VIRTIO_PMEM, VIRTIO_SCSI,
 };
+use kata_types::fs::VM_ROOTFS_FILESYSTEM_XFS;
 use kata_types::mount::Mount;
 use nix::sys::stat::{self, SFlag};
 use oci_spec::runtime as oci;
 use std::fs;
 use tokio::sync::RwLock;
+
+const BLOCKFILE_ROOTFS_FLAG: &str = "loop";
 
 pub(crate) struct BlockRootfs {
     guest_path: String,
@@ -47,12 +50,18 @@ impl BlockRootfs {
         fs::create_dir_all(&host_path)
             .map_err(|e| anyhow!("failed to create rootfs dir {}: {:?}", host_path, e))?;
 
-        let block_driver = get_block_driver(d).await;
-
+        let blkdev_info = get_block_device_info(d).await;
+        let block_driver = blkdev_info.block_device_driver.clone();
         let block_device_config = &mut BlockConfig {
             major: stat::major(dev_id) as i64,
             minor: stat::minor(dev_id) as i64,
             driver_option: block_driver.clone(),
+            path_on_host: rootfs.source.clone(),
+            blkdev_aio: BlockDeviceAio::new(&blkdev_info.block_device_aio),
+            num_queues: blkdev_info.num_queues,
+            queue_size: blkdev_info.queue_size,
+            logical_sector_size: blkdev_info.block_device_logical_sector_size,
+            physical_sector_size: blkdev_info.block_device_physical_sector_size,
             ..Default::default()
         };
 
@@ -67,6 +76,16 @@ impl BlockRootfs {
             options: rootfs.options.clone(),
             ..Default::default()
         };
+
+        // XFS rootfs: add 'nouuid' to avoid UUID conflicts when the same
+        // disk image is mounted across multiple VMs/containers.
+        // This allows mounting XFS volumes that share the same UUID.
+        if rootfs.fs_type == VM_ROOTFS_FILESYSTEM_XFS {
+            // Add nouuid to existing options if not already present
+            if !storage.options.iter().any(|opt| opt == "nouuid") {
+                storage.options.push("nouuid".to_string());
+            }
+        }
 
         let mut device_id: String = "".to_owned();
         if let DeviceType::Block(device) = device_info {
@@ -85,7 +104,13 @@ impl BlockRootfs {
                 VIRTIO_BLK_MMIO => {
                     storage.source = device.config.virt_path;
                 }
-                VIRTIO_SCSI | VIRTIO_BLK_CCW | VIRTIO_PMEM => {
+                VIRTIO_BLK_CCW => {
+                    storage.source = device
+                        .config
+                        .ccw_addr
+                        .ok_or_else(|| anyhow!("CCW address missing for ccw block device"))?;
+                }
+                VIRTIO_SCSI | VIRTIO_PMEM => {
                     return Err(anyhow!(
                         "Complete support for block driver {} has not been implemented yet",
                         block_driver
@@ -116,8 +141,8 @@ impl Rootfs for BlockRootfs {
         Ok(vec![self.mount.clone()])
     }
 
-    async fn get_storage(&self) -> Option<Storage> {
-        self.storage.clone()
+    async fn get_storage(&self) -> Option<Vec<Storage>> {
+        self.storage.clone().map(|s| vec![s])
     }
 
     async fn get_device_id(&self) -> Result<Option<String>> {
@@ -133,15 +158,40 @@ impl Rootfs for BlockRootfs {
     }
 }
 
-pub(crate) fn is_block_rootfs(file: &str) -> Option<u64> {
-    if file.is_empty() {
+pub(crate) fn is_block_rootfs(m: &Mount) -> Option<(u64, Mount)> {
+    if m.source.is_empty() {
         return None;
     }
-    match stat::stat(file) {
+
+    match stat::stat(m.source.as_str()) {
         Ok(fstat) => {
             if SFlag::from_bits_truncate(fstat.st_mode) == SFlag::S_IFBLK {
                 let dev_id = fstat.st_rdev;
-                return Some(dev_id);
+                let mut volume = m.clone();
+
+                //clear the volume resource thus the block device will use the dev_id
+                //to find the device's host path;
+                volume.source = String::new();
+                return Some((dev_id, volume));
+            }
+
+            if SFlag::from_bits_truncate(fstat.st_mode) == SFlag::S_IFREG
+                && m.options.contains(&BLOCKFILE_ROOTFS_FLAG.to_string())
+            {
+                //use the block file's inode as the device id, which can make sure it's unique.
+                let dev_id = fstat.st_ino;
+                let options = m
+                    .options
+                    .clone()
+                    .into_iter()
+                    .filter(|o| !o.eq(BLOCKFILE_ROOTFS_FLAG))
+                    .collect();
+
+                //discard the blockfile rootfs's mount option "loop"
+                let mut volume = m.clone();
+                volume.options = options;
+
+                return Some((dev_id, volume));
             }
         }
         Err(_) => return None,

@@ -9,9 +9,12 @@ package drivers
 import (
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/api"
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/config"
@@ -43,6 +46,7 @@ var (
 	PCISysFsSlotsMaxBusSpeed PCISysFsProperty = "max_bus_speed" // /sys/bus/pci/slots/xxx/max_bus_speed
 	PCISysFsDevicesVendor    PCISysFsProperty = "vendor"        // /sys/bus/pci/devices/xxx/vendor
 	PCISysFsDevicesDevice    PCISysFsProperty = "device"        // /sys/bus/pci/devices/xxx/device
+	PCISysFsDevicesNUMANode  PCISysFsProperty = "numa_node"     // /sys/bus/pci/devices/xxx/numa_node
 )
 
 func deviceLogger() *logrus.Entry {
@@ -69,7 +73,7 @@ func IsPCIeDevice(bdf string) bool {
 }
 
 // read from /sys/bus/pci/devices/xxx/property
-func getPCIDeviceProperty(bdf string, property PCISysFsProperty) string {
+func GetPCIDeviceProperty(bdf string, property PCISysFsProperty) string {
 	if len(strings.Split(bdf, ":")) == 2 {
 		bdf = PCIDomain + ":" + bdf
 	}
@@ -80,6 +84,20 @@ func getPCIDeviceProperty(bdf string, property PCISysFsProperty) string {
 		return ""
 	}
 	return rlt
+}
+
+// GetPCIDeviceNUMANode returns the host NUMA node for a PCI device.
+// Returns -1 if the device has no NUMA affinity or the value cannot be read.
+func GetPCIDeviceNUMANode(bdf string) int {
+	raw := GetPCIDeviceProperty(bdf, PCISysFsDevicesNUMANode)
+	if raw == "" {
+		return -1
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return -1
+	}
+	return n
 }
 
 func readPCIProperty(propertyPath string) (string, error) {
@@ -157,6 +175,95 @@ func checkIgnorePCIClass(pciClass string, deviceBDF string, bitmask uint64) (boo
 	return false, nil
 }
 
+func GetMajorMinorFromDevPath(devPath string) (uint32, uint32, error) {
+	fi, err := os.Stat(devPath)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	dev := fi.Sys().(*syscall.Stat_t)
+	return uint32(dev.Rdev >> 8), uint32(dev.Rdev & 0xff), nil
+}
+
+func extractIndex(devicePath string) (string, error) {
+
+	base := filepath.Base(devicePath)
+
+	const prefix = "vfio"
+	if !strings.HasPrefix(base, prefix) {
+		return "0", fmt.Errorf("unexpected device name format: %s", base)
+	}
+	return strings.TrimPrefix(base, prefix), nil
+}
+
+func GetBDFFromVFIODev(major uint32, minor uint32) (string, error) {
+	devPath := fmt.Sprintf("/sys/dev/char/%d:%d", major, minor)
+	realPath, err := filepath.EvalSymlinks(devPath)
+	if err != nil {
+		return "", fmt.Errorf("Failed to resolve symlink for %s: %v", devPath, err)
+	}
+
+	bdfRegex := regexp.MustCompile(`([0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-9a-fA-F])`)
+	matches := bdfRegex.FindAllString(realPath, -1)
+	if len(matches) == 0 {
+		return "", fmt.Errorf("No BDF found in resolved path: %s", realPath)
+	}
+	return matches[len(matches)-1], nil
+}
+
+// GetDeviceFromVFIODev return the host device associated with the VFIO device
+// There is only one device per VFIO device in the case of IOMMUFD
+func GetDeviceFromVFIODev(device config.DeviceInfo) ([]*config.VFIODev, error) {
+	// The way we get the host BDF is by reading the symlink of the char
+	// device major:minor entries in /sys/chart/major:minor
+	// $ ls -l /dev/vfio/devices/vfio0
+	// crw------- 1 root root 237, 0 Jan 15 16:53 /dev/vfio/devices/vfio0
+	major, minor, err := GetMajorMinorFromDevPath(device.HostPath)
+	if err != nil {
+		return nil, fmt.Errorf("Failed to get major:minor from %s: %v", device.HostPath, err)
+	}
+	// $ ls -l /sys/dev/char/237:0
+	// /sys/dev/char/237:0 -> ../../devices/pci0000:64/0000:64:00.0/0000:65:00.0/vfio-dev/vfio0
+	deviceBDF, err := GetBDFFromVFIODev(major, minor)
+	if err != nil {
+		return nil, err
+	}
+
+	deviceSysfsDev := path.Join(config.SysBusPciDevicesPath, deviceBDF)
+	vfioDeviceType, err := GetVFIODeviceType(deviceSysfsDev)
+	if err != nil {
+		return nil, err
+	}
+
+	vendorID := GetPCIDeviceProperty(deviceBDF, PCISysFsDevicesVendor)
+	deviceID := GetPCIDeviceProperty(deviceBDF, PCISysFsDevicesDevice)
+	pciClass := GetPCIDeviceProperty(deviceBDF, PCISysFsDevicesClass)
+
+	i, err := extractIndex(device.HostPath)
+	if err != nil {
+		return nil, err
+	}
+	id := utils.MakeNameID("vfio", device.ID+i, maxDevIDSize)
+
+	vfio := config.VFIODev{
+		ID:       id,
+		Type:     vfioDeviceType,
+		BDF:      deviceBDF,
+		SysfsDev: deviceSysfsDev,
+		DevfsDev: device.HostPath,
+		IsPCIe:   IsPCIeDevice(deviceBDF),
+		Class:    pciClass,
+		VendorID: vendorID,
+		DeviceID: deviceID,
+		NUMANode: GetPCIDeviceNUMANode(deviceBDF),
+		Port:     device.Port,
+		HostPath: device.HostPath,
+	}
+	vfioDevs := []*config.VFIODev{&vfio}
+
+	return vfioDevs, nil
+}
+
 // GetAllVFIODevicesFromIOMMUGroup returns all the VFIO devices in the IOMMU group
 // We can reuse this function at various levels, sandbox, container.
 func GetAllVFIODevicesFromIOMMUGroup(device config.DeviceInfo) ([]*config.VFIODev, error) {
@@ -185,7 +292,7 @@ func GetAllVFIODevicesFromIOMMUGroup(device config.DeviceInfo) ([]*config.VFIODe
 		switch vfioDeviceType {
 		case config.VFIOPCIDeviceNormalType, config.VFIOPCIDeviceMediatedType:
 			// This is vfio-pci and vfio-mdev specific
-			pciClass := getPCIDeviceProperty(deviceBDF, PCISysFsDevicesClass)
+			pciClass := GetPCIDeviceProperty(deviceBDF, PCISysFsDevicesClass)
 			// We need to ignore Host or PCI Bridges that are in the same IOMMU group as the
 			// passed-through devices. One CANNOT pass-through a PCI bridge or Host bridge.
 			// Class 0x0604 is PCI bridge, 0x0600 is Host bridge
@@ -197,10 +304,9 @@ func GetAllVFIODevicesFromIOMMUGroup(device config.DeviceInfo) ([]*config.VFIODe
 				continue
 			}
 			// Fetch the PCI Vendor ID and Device ID
-			vendorID := getPCIDeviceProperty(deviceBDF, PCISysFsDevicesVendor)
-			deviceID := getPCIDeviceProperty(deviceBDF, PCISysFsDevicesDevice)
+			vendorID := GetPCIDeviceProperty(deviceBDF, PCISysFsDevicesVendor)
+			deviceID := GetPCIDeviceProperty(deviceBDF, PCISysFsDevicesDevice)
 
-			// Do not directly assign to `vfio` -- need to access field still
 			vfio = config.VFIODev{
 				ID:       id,
 				Type:     vfioDeviceType,
@@ -210,6 +316,7 @@ func GetAllVFIODevicesFromIOMMUGroup(device config.DeviceInfo) ([]*config.VFIODe
 				Class:    pciClass,
 				VendorID: vendorID,
 				DeviceID: deviceID,
+				NUMANode: GetPCIDeviceNUMANode(deviceBDF),
 				Port:     device.Port,
 				HostPath: device.HostPath,
 			}
@@ -224,6 +331,7 @@ func GetAllVFIODevicesFromIOMMUGroup(device config.DeviceInfo) ([]*config.VFIODe
 				SysfsDev:  deviceSysfsDev,
 				Type:      config.VFIOAPDeviceMediatedType,
 				APDevices: devices,
+				NUMANode:  -1,
 				Port:      device.Port,
 			}
 		default:

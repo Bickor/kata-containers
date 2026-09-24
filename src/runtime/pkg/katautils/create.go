@@ -19,6 +19,7 @@ import (
 	vc "github.com/kata-containers/kata-containers/src/runtime/virtcontainers"
 	vf "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/factory"
 	vcAnnotations "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/annotations"
+	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/utils"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 )
 
@@ -81,12 +82,8 @@ func HandleFactory(ctx context.Context, vci vc.VC, runtimeConfig *oci.RuntimeCon
 	kataUtilsLogger.WithField("factory", factoryConfig).Info("load vm factory")
 
 	f, err := vf.NewFactory(ctx, factoryConfig, true)
-	if err != nil && !factoryConfig.VMCache {
-		kataUtilsLogger.WithError(err).Warn("load vm factory failed, about to create new one")
-		f, err = vf.NewFactory(ctx, factoryConfig, false)
-	}
 	if err != nil {
-		kataUtilsLogger.WithError(err).Warn("create vm factory failed")
+		kataUtilsLogger.WithError(err).Warn("load vm factory failed, will use direct boot")
 		return
 	}
 
@@ -98,12 +95,12 @@ func HandleFactory(ctx context.Context, vci vc.VC, runtimeConfig *oci.RuntimeCon
 // For the given pod ephemeral volume is created only once
 // backed by tmpfs inside the VM. For successive containers
 // of the same pod the already existing volume is reused.
-func SetEphemeralStorageType(ociSpec specs.Spec, disableGuestEmptyDir bool) specs.Spec {
+func SetEphemeralStorageType(ociSpec specs.Spec, disableGuestEmptyDir bool, emptyDirMode string) specs.Spec {
 	for idx, mnt := range ociSpec.Mounts {
 		if vc.IsEphemeralStorage(mnt.Source) {
 			ociSpec.Mounts[idx].Type = vc.KataEphemeralDevType
 		}
-		if vc.Isk8sHostEmptyDir(mnt.Source) && !disableGuestEmptyDir {
+		if vc.Isk8sHostEmptyDir(mnt.Source) && !disableGuestEmptyDir && emptyDirMode != vc.EmptyDirModeVirtioBlkEncrypted {
 			ociSpec.Mounts[idx].Type = vc.KataLocalDevType
 		}
 	}
@@ -130,7 +127,7 @@ func CreateSandbox(ctx context.Context, vci vc.VC, ociSpec specs.Spec, runtimeCo
 	}
 
 	if !rootFs.Mounted && len(sandboxConfig.Containers) == 1 {
-		if rootFs.Source != "" && !vc.HasOptionPrefix(rootFs.Options, vc.VirtualVolumePrefix) {
+		if rootFs.Source != "" && !vc.HasOptionPrefix(rootFs.Options, vc.VirtualVolumePrefix) && !vc.IsErofsRootFS(rootFs) {
 			realPath, err := ResolvePath(rootFs.Source)
 			if err != nil {
 				return nil, vc.Process{}, err
@@ -138,6 +135,17 @@ func CreateSandbox(ctx context.Context, vci vc.VC, ociSpec specs.Spec, runtimeCo
 			rootFs.Source = realPath
 		}
 		sandboxConfig.Containers[0].RootFs = rootFs
+	}
+
+	// Docker 26+ may set up networking before task creation instead of using
+	// prestart hooks. The netns path is not in the OCI spec but can be
+	// discovered from Docker's libnetwork hook args which contain the sandbox
+	// ID that maps to /var/run/docker/netns/<sandbox_id>.
+	if sandboxConfig.NetworkConfig.NetworkID == "" && !sandboxConfig.NetworkConfig.DisableNewNetwork {
+		if dockerNetns := utils.DockerNetnsPath(&ociSpec); dockerNetns != "" {
+			sandboxConfig.NetworkConfig.NetworkID = dockerNetns
+			kataUtilsLogger.WithField("netns", dockerNetns).Info("discovered Docker network namespace from hook args")
+		}
 	}
 
 	// Important to create the network namespace before the sandbox is
@@ -166,6 +174,10 @@ func CreateSandbox(ctx context.Context, vci vc.VC, ociSpec specs.Spec, runtimeCo
 	// The value of this annotation is sent to the sandbox using SetPolicy.
 	delete(ociSpec.Annotations, vcAnnotations.Policy)
 	delete(sandboxConfig.Annotations, vcAnnotations.Policy)
+
+	// The value of this annotation is sent to the sandbox using init data.
+	delete(ociSpec.Annotations, vcAnnotations.Initdata)
+	delete(sandboxConfig.Annotations, vcAnnotations.Initdata)
 
 	sandbox, err := vci.CreateSandbox(ctx, sandboxConfig, func(ctx context.Context) error {
 		// Run pre-start OCI hooks, in the runtime namespace.
@@ -236,7 +248,11 @@ func CreateContainer(ctx context.Context, sandbox vc.VCSandbox, ociSpec specs.Sp
 	// The value of this annotation is sent to the sandbox using SetPolicy.
 	delete(ociSpec.Annotations, vcAnnotations.Policy)
 
-	ociSpec = SetEphemeralStorageType(ociSpec, disableGuestEmptyDir)
+	// The value of this annotation is sent to the sandbox using init data.
+	delete(ociSpec.Annotations, vcAnnotations.Initdata)
+
+	emptyDirMode := sandbox.Status().EmptyDirMode
+	ociSpec = SetEphemeralStorageType(ociSpec, disableGuestEmptyDir, emptyDirMode)
 
 	contConfig, err := oci.ContainerConfig(ociSpec, bundlePath, containerID, disableOutput)
 	if err != nil {
@@ -244,7 +260,7 @@ func CreateContainer(ctx context.Context, sandbox vc.VCSandbox, ociSpec specs.Sp
 	}
 
 	if !rootFs.Mounted {
-		if rootFs.Source != "" && rootFs.Type != vc.NydusRootFSType {
+		if rootFs.Source != "" && !vc.IsNydusRootFSType(rootFs.Type) && !vc.IsErofsRootFS(rootFs) {
 			realPath, err := ResolvePath(rootFs.Source)
 			if err != nil {
 				return vc.Process{}, err

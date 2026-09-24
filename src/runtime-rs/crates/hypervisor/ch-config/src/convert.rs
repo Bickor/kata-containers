@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::NamedHypervisorConfig;
+use crate::ProtectionDevConfig;
 use crate::VmConfig;
 use crate::{
     guest_protection_is_tdx, ConsoleConfig, ConsoleOutputMode, CpuFeatures, CpuTopology,
@@ -18,7 +19,7 @@ use kata_types::config::hypervisor::{
 };
 use kata_types::config::BootInfo;
 use std::convert::TryFrom;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::errors::*;
 
@@ -35,6 +36,17 @@ pub const DEFAULT_NUM_PCI_SEGMENTS: u16 = 1;
 
 pub const DEFAULT_DISK_QUEUES: usize = 1;
 pub const DEFAULT_DISK_QUEUE_SIZE: u16 = 128;
+
+const MSHV_DEVICE_PATH: &str = "/dev/mshv";
+
+fn cpu_nested_config() -> Option<bool> {
+    if Path::new(MSHV_DEVICE_PATH).exists() {
+        // Nested vCPUs are not supported on MSHV yet.
+        Some(false)
+    } else {
+        None
+    }
+}
 
 // TDX requires all rootfs's be mounted using a block device. This test
 // ensures that the user has a correct set of values for the following Kata
@@ -109,6 +121,8 @@ impl TryFrom<NamedHypervisorConfig> for VmConfig {
 
         let fs = n.shared_fs_devices;
         let net = n.network_devices;
+        let host_devices = n.host_devices;
+        let protection_dev = n.protection_device;
 
         let cpus = CpusConfig::try_from((cfg.cpu_info, guest_protection_to_use.clone()))
             .map_err(VmConfigError::CPUError)?;
@@ -117,13 +131,11 @@ impl TryFrom<NamedHypervisorConfig> for VmConfig {
 
         // Note how CH handles the different image types:
         //
-        // - A standard image is specified in PmemConfig.
         // - An initrd/initramfs is specified in PayloadConfig.
-        // - A confidential guest image is specified by a DiskConfig.
+        // - An image is specified in DiskConfig.
+        //   Note: pmem is not used as it's not properly supported by Cloud Hypervisor.
         //   - If TDX is enabled, the firmware (`td-shim` [1]) must be
         //     specified in PayloadConfig.
-        // - A confidential guest initrd is specified by a PayloadConfig with
-        //   firmware.
         //
         // [1] - https://github.com/confidential-containers/td-shim
         let boot_info = cfg.boot_info;
@@ -139,26 +151,19 @@ impl TryFrom<NamedHypervisorConfig> for VmConfig {
             return Err(VmConfigError::NoBootFile);
         }
 
-        let pmem = if use_initrd || guest_protection_is_tdx(guest_protection_to_use.clone()) {
-            None
-        } else {
-            let pmem = PmemConfig::try_from(&boot_info).map_err(VmConfigError::PmemError)?;
-
-            Some(vec![pmem])
-        };
-
         let payload = Some(
             PayloadConfig::try_from((
                 boot_info.clone(),
                 kernel_params,
                 guest_protection_to_use.clone(),
+                protection_dev,
             ))
             .map_err(VmConfigError::PayloadError)?,
         );
 
         let mut disks: Vec<DiskConfig> = vec![];
 
-        if use_image && guest_protection_is_tdx(guest_protection_to_use.clone()) {
+        if use_image {
             let disk = DiskConfig::try_from(boot_info).map_err(VmConfigError::DiskError)?;
 
             disks.push(disk);
@@ -180,6 +185,15 @@ impl TryFrom<NamedHypervisorConfig> for VmConfig {
 
         let platform = get_platform_cfg(guest_protection_to_use);
 
+        let balloon = if cfg.device_info.reclaim_guest_freed_memory {
+            Some(crate::BalloonConfig {
+                free_page_reporting: true,
+                ..Default::default()
+            })
+        } else {
+            None
+        };
+
         let cfg = VmConfig {
             cpus,
             memory,
@@ -188,11 +202,12 @@ impl TryFrom<NamedHypervisorConfig> for VmConfig {
             payload,
             fs,
             net,
-            pmem,
+            devices: host_devices,
             disks,
             vsock: Some(vsock),
             rng,
             platform,
+            balloon,
 
             ..Default::default()
         };
@@ -275,6 +290,8 @@ impl TryFrom<(MemoryInfo, GuestProtection)> for MemoryConfig {
 
             hotplug_size,
 
+            prefault: mem.enable_mem_prealloc,
+
             ..Default::default()
         };
 
@@ -305,12 +322,12 @@ impl TryFrom<(CpuInfo, GuestProtection)> for CpusConfig {
         let guest_protection_to_use = args.1;
 
         // This can only happen if runtime-rs fails to set default values.
-        if cpu.default_vcpus <= 0 {
+        if cpu.default_vcpus <= 0.0 {
             return Err(CpusConfigError::BootVCPUsTooSmall);
         }
 
-        let default_vcpus =
-            u8::try_from(cpu.default_vcpus).map_err(CpusConfigError::BootVCPUsTooBig)?;
+        let default_vcpus = u8::try_from(cpu.default_vcpus.ceil() as u32)
+            .map_err(CpusConfigError::BootVCPUsTooBig)?;
 
         // This can only happen if runtime-rs fails to set default values.
         if cpu.default_maxvcpus == 0 {
@@ -348,6 +365,7 @@ impl TryFrom<(CpuInfo, GuestProtection)> for CpusConfig {
         let cfg = CpusConfig {
             boot_vcpus,
             max_vcpus,
+            nested: cpu_nested_config(),
             max_phys_bits,
             topology: Some(topology),
             features,
@@ -382,13 +400,28 @@ impl From<String> for CpuFeatures {
 //
 // - The 3rd tuple element determines if TDX is enabled.
 //
-impl TryFrom<(BootInfo, Option<String>, GuestProtection)> for PayloadConfig {
+impl
+    TryFrom<(
+        BootInfo,
+        Option<String>,
+        GuestProtection,
+        Option<ProtectionDevConfig>,
+    )> for PayloadConfig
+{
     type Error = PayloadConfigError;
 
-    fn try_from(args: (BootInfo, Option<String>, GuestProtection)) -> Result<Self, Self::Error> {
+    fn try_from(
+        args: (
+            BootInfo,
+            Option<String>,
+            GuestProtection,
+            Option<ProtectionDevConfig>,
+        ),
+    ) -> Result<Self, Self::Error> {
         let boot_info = args.0;
         let cmdline = args.1;
         let guest_protection_to_use = args.2;
+        let protection_device = args.3;
 
         // The kernel is always specified here,
         // not in the top level VmConfig.kernel.
@@ -416,11 +449,25 @@ impl TryFrom<(BootInfo, Option<String>, GuestProtection)> for PayloadConfig {
             Some(PathBuf::from(boot_info.firmware))
         };
 
+        let mrconfigid = if let Some(ref data) = protection_device {
+            data.mrconfigid.clone()
+        } else {
+            None
+        };
+
+        let host_data = if let Some(ref data) = protection_device {
+            data.host_data.clone()
+        } else {
+            None
+        };
+
         let payload = PayloadConfig {
             kernel: Some(kernel),
             initramfs,
             cmdline,
             firmware,
+            mrconfigid,
+            host_data,
         };
 
         Ok(payload)
@@ -539,7 +586,7 @@ fn get_platform_cfg(guest_protection_to_use: GuestProtection) -> Option<Platform
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kata_sys_util::protection::TDXDetails;
+    use kata_sys_util::protection::SevSnpDetails;
     use kata_types::config::hypervisor::{
         BlockDeviceInfo, Hypervisor as HypervisorConfig, SecurityInfo,
     };
@@ -597,7 +644,7 @@ mod tests {
         };
 
         let cpu_info = CpuInfo {
-            default_vcpus: cpu_default as i32,
+            default_vcpus: cpu_default as f32,
             default_maxvcpus,
 
             ..Default::default()
@@ -612,6 +659,7 @@ mod tests {
         let cpus_config = CpusConfig {
             boot_vcpus: cpu_default,
             max_vcpus,
+            nested: cpu_nested_config(),
             topology: Some(CpuTopology {
                 cores_per_die: max_vcpus,
 
@@ -692,6 +740,8 @@ mod tests {
             initramfs: Some(PathBuf::from(initramfs)),
             firmware: payload_firmware,
             cmdline,
+            mrconfigid: None,
+            host_data: None,
         };
 
         (boot_info, payload_config)
@@ -715,11 +765,6 @@ mod tests {
 
     #[test]
     fn test_get_serial_cfg() {
-        let tdx_details = TDXDetails {
-            major_version: 1,
-            minor_version: 0,
-        };
-
         #[derive(Debug)]
         struct TestData {
             debug: bool,
@@ -748,7 +793,7 @@ mod tests {
             },
             TestData {
                 debug: false,
-                guest_protection: GuestProtection::Tdx(tdx_details.clone()),
+                guest_protection: GuestProtection::Tdx,
                 result: ConsoleConfig {
                     file: None,
                     mode: ConsoleOutputMode::Off,
@@ -757,7 +802,7 @@ mod tests {
             },
             TestData {
                 debug: true,
-                guest_protection: GuestProtection::Tdx(tdx_details.clone()),
+                guest_protection: GuestProtection::Tdx,
                 result: ConsoleConfig {
                     file: None,
                     mode: ConsoleOutputMode::Off,
@@ -803,11 +848,6 @@ mod tests {
 
     #[test]
     fn test_get_console_cfg() {
-        let tdx_details = TDXDetails {
-            major_version: 1,
-            minor_version: 0,
-        };
-
         #[derive(Debug)]
         struct TestData {
             debug: bool,
@@ -836,7 +876,7 @@ mod tests {
             },
             TestData {
                 debug: false,
-                guest_protection: GuestProtection::Tdx(tdx_details.clone()),
+                guest_protection: GuestProtection::Tdx,
                 result: ConsoleConfig {
                     file: None,
                     mode: ConsoleOutputMode::Off,
@@ -845,7 +885,7 @@ mod tests {
             },
             TestData {
                 debug: true,
-                guest_protection: GuestProtection::Tdx(tdx_details.clone()),
+                guest_protection: GuestProtection::Tdx,
                 result: ConsoleConfig {
                     file: None,
                     mode: ConsoleOutputMode::Tty,
@@ -889,11 +929,6 @@ mod tests {
 
     #[test]
     fn test_get_platform_cfg() {
-        let tdx_details = TDXDetails {
-            major_version: 1,
-            minor_version: 0,
-        };
-
         #[derive(Debug)]
         struct TestData {
             guest_protection: GuestProtection,
@@ -906,7 +941,7 @@ mod tests {
                 result: None,
             },
             TestData {
-                guest_protection: GuestProtection::Tdx(tdx_details.clone()),
+                guest_protection: GuestProtection::Tdx,
                 result: Some(PlatformConfig {
                     tdx: true,
                     num_pci_segments: DEFAULT_NUM_PCI_SEGMENTS,
@@ -1143,11 +1178,6 @@ mod tests {
 
     #[test]
     fn test_cpuinfo_to_cpusconfig() {
-        let tdx_details = TDXDetails {
-            major_version: 1,
-            minor_version: 0,
-        };
-
         #[derive(Debug)]
         struct TestData {
             cpu_info: CpuInfo,
@@ -1165,7 +1195,7 @@ mod tests {
             },
             TestData {
                 cpu_info: CpuInfo {
-                    default_vcpus: -1,
+                    default_vcpus: -1.0,
 
                     ..Default::default()
                 },
@@ -1174,7 +1204,7 @@ mod tests {
             },
             TestData {
                 cpu_info: CpuInfo {
-                    default_vcpus: 1,
+                    default_vcpus: 1.0,
                     default_maxvcpus: 0,
 
                     ..Default::default()
@@ -1184,7 +1214,7 @@ mod tests {
             },
             TestData {
                 cpu_info: CpuInfo {
-                    default_vcpus: 9,
+                    default_vcpus: 9.0,
                     default_maxvcpus: 7,
 
                     ..Default::default()
@@ -1194,7 +1224,7 @@ mod tests {
             },
             TestData {
                 cpu_info: CpuInfo {
-                    default_vcpus: 1,
+                    default_vcpus: 1.0,
                     default_maxvcpus: 1,
                     ..Default::default()
                 },
@@ -1202,6 +1232,7 @@ mod tests {
                 result: Ok(CpusConfig {
                     boot_vcpus: 1,
                     max_vcpus: 1,
+                    nested: cpu_nested_config(),
                     topology: Some(CpuTopology {
                         cores_per_die: 1,
 
@@ -1214,7 +1245,7 @@ mod tests {
             },
             TestData {
                 cpu_info: CpuInfo {
-                    default_vcpus: 1,
+                    default_vcpus: 1.0,
                     default_maxvcpus: 3,
                     ..Default::default()
                 },
@@ -1222,6 +1253,7 @@ mod tests {
                 result: Ok(CpusConfig {
                     boot_vcpus: 1,
                     max_vcpus: 3,
+                    nested: cpu_nested_config(),
                     topology: Some(CpuTopology {
                         cores_per_die: 3,
 
@@ -1234,14 +1266,15 @@ mod tests {
             },
             TestData {
                 cpu_info: CpuInfo {
-                    default_vcpus: 1,
+                    default_vcpus: 1.0,
                     default_maxvcpus: 13,
                     ..Default::default()
                 },
-                guest_protection: GuestProtection::Tdx(tdx_details.clone()),
+                guest_protection: GuestProtection::Tdx,
                 result: Ok(CpusConfig {
                     boot_vcpus: 1,
                     max_vcpus: 1,
+                    nested: cpu_nested_config(),
                     topology: Some(CpuTopology {
                         cores_per_die: 1,
 
@@ -1284,16 +1317,12 @@ mod tests {
 
     #[test]
     fn test_bootinfo_to_payloadconfig() {
-        let tdx_details = TDXDetails {
-            major_version: 1,
-            minor_version: 0,
-        };
-
         #[derive(Debug)]
         struct TestData {
             boot_info: BootInfo,
             cmdline: Option<String>,
             guest_protection: GuestProtection,
+            protection_device: Option<ProtectionDevConfig>,
             result: Result<PayloadConfig, PayloadConfigError>,
         }
 
@@ -1330,6 +1359,7 @@ mod tests {
                 boot_info: BootInfo::default(),
                 cmdline: None,
                 guest_protection: GuestProtection::NoProtection,
+                protection_device: None,
                 result: Err(PayloadConfigError::NoKernel),
             },
             TestData {
@@ -1342,6 +1372,7 @@ mod tests {
                 },
                 cmdline: None,
                 guest_protection: GuestProtection::NoProtection,
+                protection_device: None,
                 result: Ok(PayloadConfig {
                     kernel: Some(PathBuf::from(kernel)),
                     cmdline: None,
@@ -1361,11 +1392,14 @@ mod tests {
                 },
                 cmdline: None,
                 guest_protection: GuestProtection::NoProtection,
+                protection_device: None,
                 result: Ok(PayloadConfig {
                     kernel: Some(PathBuf::from(kernel)),
                     cmdline: None,
                     initramfs: Some(PathBuf::from(initramfs)),
                     firmware: Some(PathBuf::from(firmware)),
+                    mrconfigid: None,
+                    host_data: None,
                 }),
             },
             TestData {
@@ -1378,6 +1412,7 @@ mod tests {
                 },
                 cmdline: Some(cmdline.to_string()),
                 guest_protection: GuestProtection::NoProtection,
+                protection_device: None,
                 result: Ok(PayloadConfig {
                     kernel: Some(PathBuf::from(kernel)),
                     initramfs: Some(PathBuf::from(initramfs)),
@@ -1394,19 +1429,22 @@ mod tests {
                     ..Default::default()
                 },
                 cmdline: None,
-                guest_protection: GuestProtection::Tdx(tdx_details.clone()),
+                guest_protection: GuestProtection::Tdx,
+                protection_device: None,
                 result: Err(PayloadConfigError::TDXFirmwareMissing),
             },
             TestData {
                 boot_info: boot_info_with_initrd,
                 cmdline: Some(cmdline.to_string()),
-                guest_protection: GuestProtection::Tdx(tdx_details.clone()),
+                guest_protection: GuestProtection::Tdx,
+                protection_device: None,
                 result: Ok(payload_config_with_initrd),
             },
             TestData {
                 boot_info: boot_info_without_initrd,
                 cmdline: Some(cmdline.to_string()),
-                guest_protection: GuestProtection::Tdx(tdx_details.clone()),
+                guest_protection: GuestProtection::Tdx,
+                protection_device: None,
                 result: Ok(payload_config_without_initrd),
             },
         ];
@@ -1418,6 +1456,7 @@ mod tests {
                 d.boot_info.clone(),
                 d.cmdline.clone(),
                 d.guest_protection.clone(),
+                d.protection_device.clone(),
             ));
 
             let msg = format!("{}: actual result: {:?}", msg, result);
@@ -1445,11 +1484,6 @@ mod tests {
 
     #[test]
     fn test_memoryinfo_to_memoryconfig() {
-        let tdx_details = TDXDetails {
-            major_version: 1,
-            minor_version: 0,
-        };
-
         #[derive(Debug)]
         struct TestData {
             mem_info: MemoryInfo,
@@ -1484,7 +1518,7 @@ mod tests {
 
                     ..Default::default()
                 },
-                guest_protection: GuestProtection::Tdx(tdx_details.clone()),
+                guest_protection: GuestProtection::Tdx,
                 result: Ok(MemoryConfig {
                     size: (17 * MIB),
                     shared: true,
@@ -1499,7 +1533,7 @@ mod tests {
 
                     ..Default::default()
                 },
-                guest_protection: GuestProtection::Tdx(tdx_details.clone()),
+                guest_protection: GuestProtection::Tdx,
                 result: Ok(MemoryConfig {
                     size: usable_max_mem_bytes,
                     shared: true,
@@ -1514,7 +1548,7 @@ mod tests {
 
                     ..Default::default()
                 },
-                guest_protection: GuestProtection::Tdx(tdx_details.clone()),
+                guest_protection: GuestProtection::Tdx,
                 result: Err(MemoryConfigError::DefaultMemSizeTooBig),
             },
             TestData {
@@ -1542,7 +1576,7 @@ mod tests {
             },
             TestData {
                 mem_info: mem_info_confidential_guest,
-                guest_protection: GuestProtection::Tdx(tdx_details.clone()),
+                guest_protection: GuestProtection::Tdx,
                 result: Ok(mem_cfg_confidential_guest),
             },
         ];
@@ -1632,18 +1666,12 @@ mod tests {
 
     #[test]
     fn test_named_hypervisor_config_to_vmconfig() {
-        let tdx_details = TDXDetails {
-            major_version: 1,
-            minor_version: 0,
-        };
-
         #[derive(Debug)]
         struct TestData {
             cfg: NamedHypervisorConfig,
             result: Result<VmConfig, VmConfigError>,
         }
 
-        let u8_max = std::u8::MAX;
         let sysinfo = nix::sys::sysinfo::sysinfo().unwrap();
 
         let actual_max_mem_bytes = sysinfo.ram_total();
@@ -1669,8 +1697,8 @@ mod tests {
         let valid_vsock =
             VsockConfig::try_from((vsock_socket_path.to_string(), DEFAULT_VSOCK_CID)).unwrap();
 
-        let (cpu_info, cpus_config) = make_cpu_objects(7, u8_max, false);
-        let (cpu_info_tdx, cpus_config_tdx) = make_cpu_objects(7, u8_max, true);
+        let (cpu_info, cpus_config) = make_cpu_objects(7, u8::MAX, false);
+        let (cpu_info_tdx, cpus_config_tdx) = make_cpu_objects(7, u8::MAX, true);
 
         let (memory_info_std, mem_config_std) =
             make_memory_objects(79, usable_max_mem_bytes, false);
@@ -1678,7 +1706,6 @@ mod tests {
         let (memory_info_confidential_guest, mem_config_confidential_guest) =
             make_memory_objects(79, usable_max_mem_bytes, true);
 
-        let (_, pmem_config_with_image) = make_bootinfo_pmemconfig_objects(image);
         let (machine_info, rng_config) = make_machineinfo_rngconfig_objects(entropy_source);
 
         let payload_firmware = None;
@@ -1686,6 +1713,7 @@ mod tests {
         let (boot_info_with_initrd, payload_config_with_initrd) =
             make_bootinfo_payloadconfig_objects(kernel, initramfs, payload_firmware, None);
 
+        let (_, disk_config_with_image) = make_bootinfo_diskconfig_objects(image);
         let (_, disk_config_confidential_guest_image) = make_bootinfo_diskconfig_objects(image);
 
         let boot_info_tdx_image = BootInfo {
@@ -1784,7 +1812,7 @@ mod tests {
             vsock: Some(valid_vsock.clone()),
 
             // rootfs image specific
-            pmem: Some(vec![pmem_config_with_image]),
+            disks: Some(vec![disk_config_with_image]),
 
             payload: Some(PayloadConfig {
                 kernel: Some(PathBuf::from(kernel)),
@@ -1808,7 +1836,7 @@ mod tests {
             ..Default::default()
         };
 
-        let platform_config_tdx = get_platform_cfg(GuestProtection::Tdx(tdx_details.clone()));
+        let platform_config_tdx = get_platform_cfg(GuestProtection::Tdx);
 
         let vmconfig_tdx_image = VmConfig {
             cpus: cpus_config_tdx.clone(),
@@ -1845,7 +1873,7 @@ mod tests {
 
             cfg: HypervisorConfig {
                 cpu_info: CpuInfo {
-                    default_vcpus: 0,
+                    default_vcpus: 0.0,
 
                     ..cpu_info.clone()
                 },
@@ -1917,7 +1945,7 @@ mod tests {
             vsock_socket_path: vsock_socket_path.into(),
 
             cfg: hypervisor_cfg_tdx_image,
-            guest_protection_to_use: GuestProtection::Tdx(tdx_details.clone()),
+            guest_protection_to_use: GuestProtection::Tdx,
 
             ..Default::default()
         };
@@ -1927,7 +1955,7 @@ mod tests {
             vsock_socket_path: vsock_socket_path.into(),
 
             cfg: hypervisor_cfg_tdx_initrd,
-            guest_protection_to_use: GuestProtection::Tdx(tdx_details.clone()),
+            guest_protection_to_use: GuestProtection::Tdx,
 
             ..Default::default()
         };
@@ -1961,7 +1989,7 @@ mod tests {
                     vsock_socket_path: "vsock_socket_path".into(),
                     cfg: HypervisorConfig {
                         cpu_info: CpuInfo {
-                            default_vcpus: 1,
+                            default_vcpus: 1.0,
                             default_maxvcpus: 1,
 
                             ..Default::default()
@@ -1985,7 +2013,7 @@ mod tests {
                             ..Default::default()
                         },
                         cpu_info: CpuInfo {
-                            default_vcpus: 1,
+                            default_vcpus: 1.0,
                             default_maxvcpus: 1,
 
                             ..Default::default()
@@ -2166,9 +2194,9 @@ mod tests {
 
     #[test]
     fn test_check_tdx_rootfs_settings() {
-        let tdx_details = TDXDetails {
-            major_version: 1,
-            minor_version: 0,
+        let sev_snp_details = SevSnpDetails {
+            cbitpos: 42,
+            phys_addr_reduction: 42,
         };
 
         #[derive(Debug)]
@@ -2193,14 +2221,14 @@ mod tests {
                 use_image: true,
                 container_rootfs_driver: "container",
                 vm_rootfs_driver: "vm",
-                guest_protection_to_use: GuestProtection::Sev,
+                guest_protection_to_use: GuestProtection::Sev(sev_snp_details.clone()),
                 result: Ok(()),
             },
             TestData {
                 use_image: true,
                 container_rootfs_driver: "container",
                 vm_rootfs_driver: "vm",
-                guest_protection_to_use: GuestProtection::Snp,
+                guest_protection_to_use: GuestProtection::Snp(sev_snp_details.clone()),
                 result: Ok(()),
             },
             TestData {
@@ -2222,7 +2250,7 @@ mod tests {
                 use_image: true,
                 container_rootfs_driver: "container",
                 vm_rootfs_driver: "vm",
-                guest_protection_to_use: GuestProtection::Tdx(tdx_details.clone()),
+                guest_protection_to_use: GuestProtection::Tdx,
                 result: Err(VmConfigError::TDXContainerRootfsNotVirtioBlk),
             },
             // Partially correct
@@ -2230,28 +2258,28 @@ mod tests {
                 use_image: true,
                 container_rootfs_driver: VIRTIO_BLK_PCI,
                 vm_rootfs_driver: "vm",
-                guest_protection_to_use: GuestProtection::Tdx(tdx_details.clone()),
+                guest_protection_to_use: GuestProtection::Tdx,
                 result: Err(VmConfigError::TDXVMRootfsNotVirtioBlk),
             },
             TestData {
                 use_image: true,
                 container_rootfs_driver: VIRTIO_BLK_MMIO,
                 vm_rootfs_driver: "vm",
-                guest_protection_to_use: GuestProtection::Tdx(tdx_details.clone()),
+                guest_protection_to_use: GuestProtection::Tdx,
                 result: Err(VmConfigError::TDXVMRootfsNotVirtioBlk),
             },
             TestData {
                 use_image: true,
                 container_rootfs_driver: "container",
                 vm_rootfs_driver: VIRTIO_BLK_PCI,
-                guest_protection_to_use: GuestProtection::Tdx(tdx_details.clone()),
+                guest_protection_to_use: GuestProtection::Tdx,
                 result: Err(VmConfigError::TDXContainerRootfsNotVirtioBlk),
             },
             TestData {
                 use_image: true,
                 container_rootfs_driver: "container",
                 vm_rootfs_driver: VIRTIO_BLK_MMIO,
-                guest_protection_to_use: GuestProtection::Tdx(tdx_details.clone()),
+                guest_protection_to_use: GuestProtection::Tdx,
                 result: Err(VmConfigError::TDXContainerRootfsNotVirtioBlk),
             },
             // Same types
@@ -2259,14 +2287,14 @@ mod tests {
                 use_image: true,
                 container_rootfs_driver: VIRTIO_BLK_MMIO,
                 vm_rootfs_driver: VIRTIO_BLK_MMIO,
-                guest_protection_to_use: GuestProtection::Tdx(tdx_details.clone()),
+                guest_protection_to_use: GuestProtection::Tdx,
                 result: Ok(()),
             },
             TestData {
                 use_image: true,
                 container_rootfs_driver: VIRTIO_BLK_PCI,
                 vm_rootfs_driver: VIRTIO_BLK_PCI,
-                guest_protection_to_use: GuestProtection::Tdx(tdx_details.clone()),
+                guest_protection_to_use: GuestProtection::Tdx,
                 result: Ok(()),
             },
             // Alternate types
@@ -2274,14 +2302,14 @@ mod tests {
                 use_image: true,
                 container_rootfs_driver: VIRTIO_BLK_MMIO,
                 vm_rootfs_driver: VIRTIO_BLK_PCI,
-                guest_protection_to_use: GuestProtection::Tdx(tdx_details.clone()),
+                guest_protection_to_use: GuestProtection::Tdx,
                 result: Ok(()),
             },
             TestData {
                 use_image: true,
                 container_rootfs_driver: VIRTIO_BLK_PCI,
                 vm_rootfs_driver: VIRTIO_BLK_MMIO,
-                guest_protection_to_use: GuestProtection::Tdx(tdx_details.clone()),
+                guest_protection_to_use: GuestProtection::Tdx,
                 result: Ok(()),
             },
             // Using an initrd (not currently supported)
@@ -2289,28 +2317,28 @@ mod tests {
                 use_image: false,
                 container_rootfs_driver: VIRTIO_BLK_PCI,
                 vm_rootfs_driver: VIRTIO_BLK_PCI,
-                guest_protection_to_use: GuestProtection::Tdx(tdx_details.clone()),
+                guest_protection_to_use: GuestProtection::Tdx,
                 result: Err(VmConfigError::TDXDisallowsInitrd),
             },
             TestData {
                 use_image: false,
                 container_rootfs_driver: "container",
                 vm_rootfs_driver: "vm",
-                guest_protection_to_use: GuestProtection::Tdx(tdx_details.clone()),
+                guest_protection_to_use: GuestProtection::Tdx,
                 result: Err(VmConfigError::TDXDisallowsInitrd),
             },
             TestData {
                 use_image: false,
                 container_rootfs_driver: VIRTIO_BLK_PCI,
                 vm_rootfs_driver: "vm",
-                guest_protection_to_use: GuestProtection::Tdx(tdx_details.clone()),
+                guest_protection_to_use: GuestProtection::Tdx,
                 result: Err(VmConfigError::TDXDisallowsInitrd),
             },
             TestData {
                 use_image: false,
                 container_rootfs_driver: VIRTIO_BLK_MMIO,
                 vm_rootfs_driver: "vm",
-                guest_protection_to_use: GuestProtection::Tdx(tdx_details.clone()),
+                guest_protection_to_use: GuestProtection::Tdx,
                 result: Err(VmConfigError::TDXDisallowsInitrd),
             },
         ];

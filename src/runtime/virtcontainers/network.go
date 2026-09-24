@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"runtime"
 
 	"github.com/sirupsen/logrus"
 	"github.com/vishvananda/netlink"
@@ -233,10 +234,8 @@ type Network interface {
 	GetEndpointsNum() (int, error)
 }
 
-func generateVCNetworkStructures(ctx context.Context, network Network) ([]*pbTypes.Interface, []*pbTypes.Route, []*pbTypes.ARPNeighbor, error) {
-	if network.NetworkID() == "" {
-		return nil, nil, nil, nil
-	}
+func generateVCNetworkStructures(ctx context.Context, endpoints []Endpoint) ([]*pbTypes.Interface, []*pbTypes.Route, []*pbTypes.ARPNeighbor, error) {
+
 	span, _ := networkTrace(ctx, "generateVCNetworkStructures", nil)
 	defer span.End()
 
@@ -244,7 +243,7 @@ func generateVCNetworkStructures(ctx context.Context, network Network) ([]*pbTyp
 	var ifaces []*pbTypes.Interface
 	var neighs []*pbTypes.ARPNeighbor
 
-	for _, endpoint := range network.Endpoints() {
+	for _, endpoint := range endpoints {
 		var ipAddresses []*pbTypes.IPAddress
 		for _, addr := range endpoint.Properties().Addrs {
 			// Skip localhost interface
@@ -265,14 +264,24 @@ func generateVCNetworkStructures(ctx context.Context, network Network) ([]*pbTyp
 			ipAddresses = append(ipAddresses, &ipAddress)
 		}
 		noarp := endpoint.Properties().Iface.RawFlags & unix.IFF_NOARP
+		devicePath := endpoint.PciPath().String()
+		if runtime.GOARCH == "s390x" {
+			device := endpoint.CcwDevice()
+			if device == nil {
+				devicePath = ""
+			} else {
+				devicePath = device.String()
+			}
+		}
 		ifc := pbTypes.Interface{
 			IPAddresses: ipAddresses,
 			Device:      endpoint.Name(),
 			Name:        endpoint.Name(),
 			Mtu:         uint64(endpoint.Properties().Iface.MTU),
+			Type:        string(endpoint.Type()),
 			RawFlags:    noarp,
 			HwAddr:      endpoint.HardwareAddr(),
-			PciPath:     endpoint.PciPath().String(),
+			DevicePath:  devicePath,
 		}
 
 		ifaces = append(ifaces, &ifc)
@@ -300,15 +309,21 @@ func generateVCNetworkStructures(ctx context.Context, network Network) ([]*pbTyp
 			r.Device = endpoint.Name()
 			r.Scope = uint32(route.Scope)
 			r.Family = utils.ConvertAddressFamily((int32)(route.Family))
+			r.Flags = uint32(route.Flags)
+			r.Mtu = uint32(route.MTU)
+
 			routes = append(routes, &r)
 		}
 
-		for _, neigh := range endpoint.Properties().Neighbors {
-			var n pbTypes.ARPNeighbor
+		gatewaySet := gatewaySetFromRoutes(endpoint.Properties().Routes)
 
-			if !validGuestNeighbor(neigh) {
+		for _, neigh := range endpoint.Properties().Neighbors {
+
+			if !validGuestNeighbor(neigh, gatewaySet) {
 				continue
 			}
+
+			var n pbTypes.ARPNeighbor
 
 			n.Device = endpoint.Name()
 			n.State = int32(neigh.State)

@@ -42,6 +42,10 @@ func TestMacvtapEndpointTypeSet(t *testing.T) {
 	testEndpointTypeSet(t, "macvtap", MacvtapEndpointType)
 }
 
+func TestVfioEndpointTypeSet(t *testing.T) {
+	testEndpointTypeSet(t, "vfio", VfioEndpointType)
+}
+
 func TestEndpointTypeSetFailure(t *testing.T) {
 	var endpointType EndpointType
 
@@ -115,8 +119,8 @@ func TestSaveLoadIfPair(t *testing.T) {
 	// Since VMFds and VhostFds are't saved, netPair and loadedIfPair are not equal.
 	assert.False(t, reflect.DeepEqual(netPair, loadedIfPair))
 
-	netPair.TapInterface.VMFds = nil
-	netPair.TapInterface.VhostFds = nil
+	netPair.VMFds = nil
+	netPair.VhostFds = nil
 	// They are equal now.
 	assert.True(t, reflect.DeepEqual(netPair, loadedIfPair))
 }

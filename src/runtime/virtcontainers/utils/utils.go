@@ -12,6 +12,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -21,6 +23,9 @@ import (
 	"golang.org/x/sys/unix"
 
 	pbTypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/agent/protocols"
+
+	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/cpuset"
+	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
 )
 
 const cpBinaryName = "cp"
@@ -490,20 +495,334 @@ func RevertBytes(num uint64) uint64 {
 	return 1024*RevertBytes(a) + b
 }
 
+// dockerLibnetworkSetkey is the hook argument that identifies Docker's
+// network configuration hook. The argument following it is the sandbox ID.
+const dockerLibnetworkSetkey = "libnetwork-setkey"
+
+// dockerNetnsPrefixes are the well-known filesystem paths where the Docker
+// daemon bind-mounts container network namespaces.
+var dockerNetnsPrefixes = []string{"/var/run/docker/netns/", "/run/docker/netns/"}
+
+// validSandboxID matches Docker sandbox IDs: exactly 64 lowercase hex characters.
+var validSandboxID = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
 // IsDockerContainer returns if the container is managed by docker
-// This is done by checking the prestart hook for `libnetwork` arguments.
+// This is done by checking the prestart and createRuntime hooks for
+// `libnetwork` arguments. Docker 26+ may use CreateRuntime hooks
+// instead of the deprecated Prestart hooks.
 func IsDockerContainer(spec *specs.Spec) bool {
 	if spec == nil || spec.Hooks == nil {
 		return false
 	}
 
-	for _, hook := range spec.Hooks.Prestart {
-		for _, arg := range hook.Args {
-			if strings.HasPrefix(arg, "libnetwork") {
-				return true
+	// Check both Prestart (Docker < 26) and CreateRuntime (Docker >= 26) hooks.
+	hookSets := [][]specs.Hook{
+		spec.Hooks.Prestart, //nolint:all
+		spec.Hooks.CreateRuntime,
+	}
+
+	for _, hooks := range hookSets {
+		for _, hook := range hooks {
+			for _, arg := range hook.Args {
+				if strings.HasPrefix(arg, "libnetwork") {
+					return true
+				}
 			}
 		}
 	}
 
 	return false
+}
+
+// DockerNetnsPath attempts to discover Docker's pre-created network namespace
+// path from OCI spec hooks. Docker's libnetwork-setkey hook contains the
+// sandbox ID as its second argument, which maps to the netns file under
+// /var/run/docker/netns/<sandbox_id>.
+func DockerNetnsPath(spec *specs.Spec) string {
+	if spec == nil || spec.Hooks == nil {
+		return ""
+	}
+
+	// Search both Prestart and CreateRuntime hooks for libnetwork-setkey.
+	hookSets := [][]specs.Hook{
+		spec.Hooks.Prestart, //nolint:all
+		spec.Hooks.CreateRuntime,
+	}
+
+	for _, hooks := range hookSets {
+		for _, hook := range hooks {
+			for i, arg := range hook.Args {
+				if arg == dockerLibnetworkSetkey && i+1 < len(hook.Args) {
+					sandboxID := hook.Args[i+1]
+					// Docker sandbox IDs are exactly 64 lowercase hex
+					// characters. Reject anything else to prevent path
+					// traversal and unexpected input.
+					if !validSandboxID.MatchString(sandboxID) {
+						continue
+					}
+					// Docker stores netns under well-known paths.
+					// Use Lstat to reject symlinks (which could point
+					// outside the Docker netns directory) and non-regular
+					// files such as directories.
+					for _, prefix := range dockerNetnsPrefixes {
+						nsPath := prefix + sandboxID
+						if fi, err := os.Lstat(nsPath); err == nil && fi.Mode().IsRegular() {
+							return nsPath
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return ""
+}
+
+// GetGuestNUMANodes constructs guest NUMA nodes mapping to host NUMA nodes and host CPUs.
+func GetGuestNUMANodes(numaMapping []string) ([]types.GuestNUMANode, error) {
+	// Add guest NUMA node for each specified subsets of host NUMA nodes.
+	if numNUMA := len(numaMapping); numNUMA > 0 {
+		numaNodes := make([]types.GuestNUMANode, numNUMA)
+		for i, hostNodes := range numaMapping {
+			hostNodeIds, err := cpuset.Parse(hostNodes)
+			if err != nil {
+				return nil, err
+			}
+			numaNodes[i].HostNodes = hostNodes
+			for _, nodeId := range hostNodeIds.ToSlice() {
+				cpus, err := getHostNUMANodeCPUs(nodeId)
+				if err != nil {
+					return nil, err
+				}
+				if numaNodes[i].HostCPUs != "" {
+					numaNodes[i].HostCPUs += ","
+				}
+				numaNodes[i].HostCPUs += cpus
+			}
+		}
+		return numaNodes, nil
+	}
+
+	// Add guest NUMA node for each host NUMA node.
+	nodeIds, err := getHostNUMANodes()
+	if err != nil {
+		return nil, err
+	}
+	if len(nodeIds) == 0 {
+		return nil, nil
+	}
+
+	numaNodes := make([]types.GuestNUMANode, len(nodeIds))
+	for i, nodeId := range nodeIds {
+		cpus, err := getHostNUMANodeCPUs(nodeId)
+		if err != nil {
+			return nil, err
+		}
+		numaNodes[i].HostNodes = fmt.Sprintf("%d", nodeId)
+		numaNodes[i].HostCPUs = cpus
+	}
+
+	return numaNodes, nil
+}
+
+// FilterNUMANodesByCPUSet returns only those guest NUMA nodes whose HostCPUs
+// intersect with the given sandbox cpuset. If sandboxCPUs is empty (size 0),
+// no filtering is applied and the original slice is returned unchanged.
+func FilterNUMANodesByCPUSet(nodes []types.GuestNUMANode, sandboxCPUs cpuset.CPUSet) []types.GuestNUMANode {
+	if sandboxCPUs.Size() == 0 {
+		return nodes
+	}
+	var filtered []types.GuestNUMANode
+	for _, n := range nodes {
+		hostCPUs, err := cpuset.Parse(n.HostCPUs)
+		if err != nil {
+			continue
+		}
+		if hostCPUs.Intersection(sandboxCPUs).Size() > 0 {
+			filtered = append(filtered, n)
+		}
+	}
+	if len(filtered) == 0 {
+		return nodes
+	}
+	return filtered
+}
+
+// NUMADistEntry represents a single NUMA distance measurement between two nodes.
+type NUMADistEntry struct {
+	Src uint32
+	Dst uint32
+	Val uint32
+}
+
+// GetHostNUMADistances reads the host NUMA distance matrix for the nodes
+// referenced by the given GuestNUMANode list and returns off-diagonal
+// pairwise entries (skipping self-distance src==dst).
+// The distance row from sysfs is indexed by host NUMA node ID, so we parse
+// each guest node's HostNodes to find the representative host node ID and
+// use that to index into the distance row.
+func GetHostNUMADistances(nodes []types.GuestNUMANode) []NUMADistEntry {
+	hostNodeIDs := make([]int, len(nodes))
+	for i, n := range nodes {
+		nodeSet, err := cpuset.Parse(n.HostNodes)
+		if err != nil {
+			hostNodeIDs[i] = -1
+			continue
+		}
+		ids := nodeSet.ToSlice()
+		if len(ids) == 0 {
+			hostNodeIDs[i] = -1
+			continue
+		}
+		hostNodeIDs[i] = ids[0]
+	}
+
+	var dists []NUMADistEntry
+	for srcIdx, srcNode := range nodes {
+		if hostNodeIDs[srcIdx] < 0 {
+			continue
+		}
+		distStr := getHostNUMADistance(srcNode.HostNodes)
+		if distStr == "" {
+			continue
+		}
+		fields := strings.Fields(distStr)
+		for dstIdx := range nodes {
+			if srcIdx == dstIdx {
+				continue
+			}
+			hostID := hostNodeIDs[dstIdx]
+			if hostID < 0 || hostID >= len(fields) {
+				continue
+			}
+			val, err := strconv.ParseUint(fields[hostID], 10, 32)
+			if err != nil {
+				continue
+			}
+			dists = append(dists, NUMADistEntry{
+				Src: uint32(srcIdx),
+				Dst: uint32(dstIdx),
+				Val: uint32(val),
+			})
+		}
+	}
+	return dists
+}
+
+// HostNUMANodeCapacity describes the CPU and memory capacity of a single
+// host NUMA node, as seen via sysfs.
+type HostNUMANodeCapacity struct {
+	NodeID int
+	CPUs   int
+	MemMB  uint64
+}
+
+// GetHostNUMANodeCapacity returns the CPU count and memory size (in MiB)
+// of the given host NUMA node.
+func GetHostNUMANodeCapacity(nodeID int) (HostNUMANodeCapacity, error) {
+	cap := HostNUMANodeCapacity{NodeID: nodeID}
+	cpuList, err := getHostNUMANodeCPUs(nodeID)
+	if err != nil {
+		return cap, err
+	}
+	cs, err := cpuset.Parse(cpuList)
+	if err != nil {
+		return cap, fmt.Errorf("parse host node %d cpulist %q: %w", nodeID, cpuList, err)
+	}
+	cap.CPUs = cs.Size()
+	memMB, err := getHostNUMANodeMemoryMB(nodeID)
+	if err != nil {
+		return cap, err
+	}
+	cap.MemMB = memMB
+	return cap, nil
+}
+
+// GetHostNUMANodeCapacities returns the capacities of the given host NUMA
+// node IDs in the same order. Nodes that fail to be read are skipped and
+// the corresponding error is logged via the returned error (the slice may
+// be shorter than the input).
+func GetHostNUMANodeCapacities(nodeIDs []int) ([]HostNUMANodeCapacity, error) {
+	out := make([]HostNUMANodeCapacity, 0, len(nodeIDs))
+	for _, id := range nodeIDs {
+		c, err := GetHostNUMANodeCapacity(id)
+		if err != nil {
+			return out, fmt.Errorf("read host NUMA node %d capacity: %w", id, err)
+		}
+		out = append(out, c)
+	}
+	return out, nil
+}
+
+// DistributeVCPUsProportionally distributes totalVCPUs across NUMA nodes
+// proportionally to the number of host CPUs available on each node.
+// Each node is guaranteed at least 1 vCPU. Remainder vCPUs go to nodes
+// with the most host CPUs.
+func DistributeVCPUsProportionally(numaNodes []types.GuestNUMANode, totalVCPUs uint32) ([]uint32, error) {
+	numNodes := len(numaNodes)
+	if numNodes == 0 {
+		return nil, fmt.Errorf("no NUMA nodes")
+	}
+	if totalVCPUs < uint32(numNodes) {
+		return nil, fmt.Errorf("totalVCPUs (%d) must be >= NUMA node count (%d)", totalVCPUs, numNodes)
+	}
+
+	hostCPUCounts := make([]int, numNodes)
+	totalHostCPUs := 0
+	for i, gn := range numaNodes {
+		parsed, err := cpuset.Parse(gn.HostCPUs)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse HostCPUs for NUMA node %d: %w", i, err)
+		}
+		if parsed.Size() == 0 {
+			return nil, fmt.Errorf("HostCPUs for NUMA node %d must not be empty", i)
+		}
+		hostCPUCounts[i] = parsed.Size()
+		totalHostCPUs += hostCPUCounts[i]
+	}
+	if totalHostCPUs == 0 {
+		return nil, fmt.Errorf("total host CPU count is 0")
+	}
+
+	vcpusPerNode := make([]uint32, numNodes)
+	var assigned uint32
+	for i := range numaNodes {
+		vcpusPerNode[i] = uint32(int(totalVCPUs) * hostCPUCounts[i] / totalHostCPUs)
+		if vcpusPerNode[i] == 0 {
+			vcpusPerNode[i] = 1
+		}
+		assigned += vcpusPerNode[i]
+	}
+
+	// Use a copy for remainder distribution to avoid mutating the original counts.
+	weights := make([]int, numNodes)
+	copy(weights, hostCPUCounts)
+
+	for assigned < totalVCPUs {
+		bestIdx := 0
+		for i := 1; i < numNodes; i++ {
+			if weights[i] > weights[bestIdx] {
+				bestIdx = i
+			}
+		}
+		vcpusPerNode[bestIdx]++
+		assigned++
+		weights[bestIdx]--
+	}
+
+	for assigned > totalVCPUs {
+		bestIdx := 0
+		for i := 1; i < numNodes; i++ {
+			if vcpusPerNode[i] > vcpusPerNode[bestIdx] {
+				bestIdx = i
+			}
+		}
+		if vcpusPerNode[bestIdx] <= 1 {
+			break
+		}
+		vcpusPerNode[bestIdx]--
+		assigned--
+	}
+
+	return vcpusPerNode, nil
 }

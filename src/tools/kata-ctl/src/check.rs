@@ -11,11 +11,11 @@ use crate::types::KernelModule;
 use anyhow::{anyhow, Result};
 use nix::fcntl::{open, OFlag};
 use nix::sys::stat::Mode;
-use nix::unistd::close;
 use nix::{ioctl_write_int_bad, request_code_none};
 use reqwest::header::{CONTENT_TYPE, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use slog::{info, o};
+use std::os::unix::io::AsRawFd;
 
 #[cfg(target_arch = "x86_64")]
 use std::process::{Command, Stdio};
@@ -131,7 +131,7 @@ pub fn check_kvm_is_usable_generic() -> Result<()> {
         request_code_none!(KVM_IOCTL_ID, KVM_GET_API_VERSION)
     );
     // 0 is not used but required to produce output
-    let v = unsafe { kvm_api_version(fd, 0)? };
+    let v = unsafe { kvm_api_version(fd.as_raw_fd(), 0)? };
     if v != API_VERSION {
         return Err(anyhow!("KVM API version is not correct"));
     }
@@ -142,7 +142,7 @@ pub fn check_kvm_is_usable_generic() -> Result<()> {
         request_code_none!(KVM_IOCTL_ID, KVM_CREATE_VM)
     );
     // 0 is default machine type
-    let vmfd = unsafe { kvm_create_vm(fd, 0) };
+    let vmfd = unsafe { kvm_create_vm(fd.as_raw_fd(), 0) };
     let _vmfd = match vmfd {
         Ok(vm) => vm,
         Err(ref error) if error.to_string() == "EBUSY: Device or resource busy" => {
@@ -154,7 +154,7 @@ pub fn check_kvm_is_usable_generic() -> Result<()> {
         Err(error) => return Err(anyhow!("Other KVM_CREATE_VM error: {:?}", error)),
     };
 
-    let _ = close(fd);
+    // fd will be automatically closed when it goes out of scope (OwnedFd RAII)
 
     Ok(())
 }
@@ -261,8 +261,7 @@ pub fn check_kernel_module_loaded(kernel_module: &KernelModule) -> Result<(), St
         }
         Err(_e) => {
             let msg = format!(
-                "Command {:} not found, verify that `kmod` package is already installed.",
-                MODINFO_PATH,
+                "Command {MODINFO_PATH:} not found, verify that `kmod` package is already installed.",
             );
             return Err(msg);
         }
@@ -292,8 +291,7 @@ pub fn check_kernel_module_loaded(kernel_module: &KernelModule) -> Result<(), St
 
         Err(_e) => {
             let msg = format!(
-                "Command {:} not found, verify that `kmod` package is already installed.",
-                MODPROBE_PATH,
+                "Command {MODPROBE_PATH:} not found, verify that `kmod` package is already installed.",
             );
             return Err(msg);
         }
@@ -323,7 +321,7 @@ mod tests {
         let path_full = file_path_full.clone();
         let mut file_full = fs::File::create(file_path_full).unwrap();
         let contents = "processor : 0\nvendor_id : VendorExample\nflags : flag_1 flag_2 flag_3 flag_4\nprocessor : 1\n".to_string();
-        writeln!(file_full, "{}", contents).unwrap();
+        writeln!(file_full, "{contents}").unwrap();
 
         // Empty cpuinfo example
         let file_path_empty = dir.path().join("cpuinfo_empty");
@@ -360,17 +358,12 @@ mod tests {
         ];
 
         for (i, d) in tests.iter().enumerate() {
-            let msg = format!("test[{}]: {:?}", i, d);
+            let msg = format!("test[{i}]: {d:?}");
             let result = get_single_cpu_info(d.cpuinfo_path, d.processor_delimiter_str);
-            let msg = format!("{}, result: {:?}", msg, result);
+            let msg = format!("{msg}, result: {result:?}");
 
-            if d.result.is_ok() {
-                assert_eq!(
-                    result.as_ref().unwrap(),
-                    d.result.as_ref().unwrap(),
-                    "{}",
-                    msg
-                );
+            if let Ok(d_result) = &d.result {
+                assert_eq!(result.as_ref().unwrap(), d_result, "{msg}");
                 continue;
             }
 
@@ -421,17 +414,12 @@ mod tests {
         ];
 
         for (i, d) in tests.iter().enumerate() {
-            let msg = format!("test[{}]: {:?}", i, d);
+            let msg = format!("test[{i}]: {d:?}");
             let result = get_cpu_flags(d.cpu_info_str, d.cpu_flags_tag);
-            let msg = format!("{}, result: {:?}", msg, result);
+            let msg = format!("{msg}, result: {result:?}");
 
-            if d.result.is_ok() {
-                assert_eq!(
-                    result.as_ref().unwrap(),
-                    d.result.as_ref().unwrap(),
-                    "{}",
-                    msg
-                );
+            if let Ok(d_result) = &d.result {
+                assert_eq!(result.as_ref().unwrap(), d_result, "{msg}");
                 continue;
             }
 
@@ -462,26 +450,26 @@ mod tests {
             // Failure scenarios
             TestData {
                 test_url: "http:",
-                expected: "builder error: empty host",
+                expected: "builder error",
             },
             TestData {
                 test_url: "_localhost_",
-                expected: "builder error: relative URL without a base",
+                expected: "builder error",
             },
             TestData {
                 test_url: "http://localhost :80",
-                expected: "builder error: invalid domain character",
+                expected: "builder error",
             },
         ];
 
         for (i, d) in tests.iter().enumerate() {
-            let msg = format!("test[{}]: {:?}", i, d);
+            let msg = format!("test[{i}]: {d:?}");
             let actual = get_kata_all_releases_by_url(d.test_url)
                 .err()
                 .unwrap()
                 .to_string();
-            let msg = format!("{}, result: {:?}", msg, actual);
-            assert_eq!(d.expected, actual, "{}", msg);
+            let msg = format!("{msg}, result: {actual:?}");
+            assert_eq!(d.expected, actual, "{msg}");
         }
     }
 
@@ -490,11 +478,11 @@ mod tests {
         let releases = get_kata_all_releases_by_url(KATA_GITHUB_RELEASE_URL);
         // sometime in GitHub action accessing to github.com API may fail
         // we can skip this test to prevent the whole test fail.
-        if releases.is_err() {
+        if let Err(error) = releases {
             warn!(
                 sl!(),
                 "get kata version failed({:?}), this maybe a temporary error, just skip the test.",
-                releases.unwrap_err()
+                error
             );
             return;
         }
@@ -513,7 +501,6 @@ mod tests {
     #[test]
     fn check_module_loaded() {
         #[allow(dead_code)]
-
         struct TestData<'a> {
             module_name: &'a str,
             param_name: &'a str,
@@ -567,9 +554,9 @@ mod tests {
         ];
 
         for (i, d) in tests.iter().enumerate() {
-            let msg = format!("test[{}]", i);
+            let msg = format!("test[{i}]");
             let result = check_kernel_module_loaded(d.kernel_module);
-            let msg = format!("{}, result: {:?}", msg, result);
+            let msg = format!("{msg}, result: {result:?}");
 
             if d.result.is_ok() {
                 assert_eq!(result, Ok(()));

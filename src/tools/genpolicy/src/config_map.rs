@@ -13,10 +13,8 @@ use crate::utils::Config;
 use crate::yaml;
 
 use async_trait::async_trait;
-use log::debug;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::fs::File;
 
 /// See Reference / Kubernetes API / Config and Storage Resources / ConfigMap.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -28,8 +26,10 @@ pub struct ConfigMap {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<BTreeMap<String, String>>,
 
+    // When parsing a YAML file, binaryData is encoded as base64.
+    // Therefore, this is a BTreeMap<String, String> instead of BTreeMap<String, Vec<u8>>.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub binaryData: Option<BTreeMap<String, Vec<u8>>>,
+    pub binaryData: Option<BTreeMap<String, String>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     immutable: Option<bool>,
@@ -39,14 +39,6 @@ pub struct ConfigMap {
 }
 
 impl ConfigMap {
-    pub fn new(file: &str) -> anyhow::Result<Self> {
-        debug!("Reading ConfigMap...");
-        let config_map: ConfigMap = serde_yaml::from_reader(File::open(file)?)?;
-        debug!("\nRead ConfigMap => {:#?}", config_map);
-
-        Ok(config_map)
-    }
-
     pub fn get_value(&self, value_from: &pod::EnvVarSource) -> Option<String> {
         if let Some(key_ref) = &value_from.configMapKeyRef {
             if let Some(name) = &key_ref.name {
@@ -112,7 +104,7 @@ impl yaml::K8sResource for ConfigMap {
         self.doc_mapping = doc_mapping.clone();
     }
 
-    fn generate_policy(&self, _agent_policy: &policy::AgentPolicy) -> String {
+    fn generate_initdata_anno(&self, _agent_policy: &policy::AgentPolicy) -> String {
         "".to_string()
     }
 

@@ -46,6 +46,13 @@ For a quick evaluation, you can check out [this how to](../how-to/how-to-set-pro
 
 ### Kata monitor
 
+Starting with Kata Containers 3.32.0, the `kata-monitor` binary is also published as a standalone, multi-arch container image alongside every release:
+
+- Released image: `quay.io/kata-containers/kata-monitor:<release-version>` (mirrored to `ghcr.io/kata-containers/kata-monitor`). The `latest` tag always points at the most recent release.
+- Testing image (tracking `main`): `quay.io/kata-containers/kata-monitor-ci:latest` (mirrored to `ghcr.io/kata-containers/kata-monitor-ci`).
+
+See the [how-to on running `kata-monitor` in a Kubernetes cluster](../how-to/how-to-set-prometheus-in-k8s.md) for a complete deployment example.
+
 The `kata-monitor` management agent should be started on each node where the Kata containers runtime is installed. `kata-monitor` will:
 
 > **Note**: a *node* running Kata containers will be either a single host system or a worker node belonging to a K8s cluster capable of running Kata pods.
@@ -119,17 +126,17 @@ The metrics service also doesn't hold any metrics in memory.
 *Metrics size*: response size of one Prometheus scrape request.
 
 It's easy to estimate the size of one metrics fetch request issued by Prometheus.
-The formula to calculate the expected size when no gzip compression is in place is:  
+The formula to calculate the expected size when no gzip compression is in place is:
 9 + (144 - 9) * `number of kata sandboxes`
 
-Prometheus supports `gzip compression`. When enabled, the response size of each request will be smaller:  
+Prometheus supports `gzip compression`. When enabled, the response size of each request will be smaller:
 2 + (10 - 2) * `number of kata sandboxes`
 
-**Example**  
-We have 10 sandboxes running on a node. The expected size of one metrics fetch request issued by Prometheus against the kata-monitor agent running on that node will be:  
+**Example**
+We have 10 sandboxes running on a node. The expected size of one metrics fetch request issued by Prometheus against the kata-monitor agent running on that node will be:
 9 + (144 - 9) * 10 = **1.35M**
 
-If `gzip compression` is enabled:  
+If `gzip compression` is enabled:
 2 + (10 - 2) * 10 = **82K**
 
 #### Metrics delay ####

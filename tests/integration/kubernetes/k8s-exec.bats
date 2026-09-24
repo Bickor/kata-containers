@@ -5,15 +5,15 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 
+load "${BATS_TEST_DIRNAME}/lib.sh"
 load "${BATS_TEST_DIRNAME}/../../common.bash"
 load "${BATS_TEST_DIRNAME}/tests_common.sh"
 
 setup() {
-	get_pod_config_dir
 	pod_name="busybox"
 	first_container_name="first-test-container"
 	second_container_name="second-test-container"
-
+	setup_common || die "setup_common failed"
 	test_yaml_file="${pod_config_dir}/test-busybox-pod.yaml"
 	cp "$pod_config_dir/busybox-pod.yaml" "${test_yaml_file}"
 
@@ -69,11 +69,11 @@ EOF"
 
 	## Cases for target container
 	### First container
-	container_name=$(kubectl exec $pod_name -c $first_container_name -- $env_command | grep CONTAINER_NAME)
+	container_name=$(kubectl exec $pod_name -c $first_container_name -- $env_command | grep CONTAINER_NAME | tr -d '\r')
 	[ "$container_name" == "CONTAINER_NAME=$first_container_name" ]
 
 	### Second container
-	container_name=$(kubectl exec $pod_name -c $second_container_name -- $env_command | grep CONTAINER_NAME)
+	container_name=$(kubectl exec $pod_name -c $second_container_name -- $env_command | grep CONTAINER_NAME | tr -d '\r')
 	[ "$container_name" == "CONTAINER_NAME=$second_container_name" ]
 
 }
@@ -86,4 +86,5 @@ teardown() {
 
 	rm "${test_yaml_file}"
 	delete_tmp_policy_settings_dir "${policy_settings_dir}"
+	teardown_common "${node}" "${node_start_time:-}"
 }

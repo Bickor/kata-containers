@@ -44,7 +44,6 @@ use std::fmt::Debug;
 use std::fs;
 use std::io::{self, BufRead};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -52,7 +51,8 @@ use std::time::Instant;
 
 use lazy_static::lazy_static;
 use nix::mount::{mount, MntFlags, MsFlags};
-use nix::{unistd, NixPath};
+use nix::unistd;
+use oci_spec::runtime as oci;
 
 use crate::fs::is_symlink;
 use crate::sl;
@@ -176,7 +176,7 @@ pub fn get_linux_mount_info(mount_point: &str) -> Result<LinuxMountInfo> {
 ///
 /// To ensure security, the `create_mount_destination()` function takes an extra parameter `root`,
 /// which is used to ensure that `dst` is within the specified directory. And a safe version of
-/// `PathBuf` is returned to avoid TOCTTOU type of flaws.
+/// `PathBuf` is returned to avoid TOCTOU type of flaws.
 pub fn create_mount_destination<S: AsRef<Path>, D: AsRef<Path>, R: AsRef<Path>>(
     src: S,
     dst: D,
@@ -189,10 +189,20 @@ pub fn create_mount_destination<S: AsRef<Path>, D: AsRef<Path>, R: AsRef<Path>>(
         .parent()
         .ok_or_else(|| Error::InvalidPath(dst.to_path_buf()))?;
     let mut builder = fs::DirBuilder::new();
-    builder
-        .mode(MOUNT_DIR_PERM)
-        .recursive(true)
-        .create(parent)?;
+    builder.mode(MOUNT_DIR_PERM).recursive(true);
+
+    // Try to create parent directory, but handle ENOSYS gracefully
+    // ENOSYS can occur on certain filesystems (e.g., virtio-fs) where mkdir is not fully supported
+    if let Err(e) = builder.create(parent) {
+        // If the error is ENOSYS or AlreadyExists, check if parent exists and continue
+        if e.kind() != std::io::ErrorKind::AlreadyExists && e.raw_os_error() != Some(libc::ENOSYS) {
+            return Err(e.into());
+        }
+        // Verify parent exists
+        if !parent.exists() {
+            return Err(e.into());
+        }
+    }
 
     if fs_type == "bind" {
         // The source and destination for bind mounting must be the same type: file or directory.
@@ -206,11 +216,17 @@ pub fn create_mount_destination<S: AsRef<Path>, D: AsRef<Path>, R: AsRef<Path>>(
         }
     }
 
+    // Try to create destination directory, but handle ENOSYS gracefully
     if let Err(e) = builder.create(dst) {
-        if e.kind() != std::io::ErrorKind::AlreadyExists {
+        if e.kind() != std::io::ErrorKind::AlreadyExists && e.raw_os_error() != Some(libc::ENOSYS) {
             return Err(e.into());
         }
+        // If ENOSYS or AlreadyExists, check if dst exists and is a directory
+        if !dst.exists() || !dst.is_dir() {
+            return Err(Error::InvalidPath(dst.to_path_buf()));
+        }
     }
+
     if !dst.is_dir() {
         Err(Error::InvalidPath(dst.to_path_buf()))
     } else {
@@ -224,7 +240,7 @@ pub fn create_mount_destination<S: AsRef<Path>, D: AsRef<Path>, R: AsRef<Path>>(
 /// Caller needs to ensure safety of the `dst` to avoid possible file path based attacks.
 pub fn bind_remount<P: AsRef<Path>>(dst: P, readonly: bool) -> Result<()> {
     let dst = dst.as_ref();
-    if dst.is_empty() {
+    if dst.as_os_str().is_empty() {
         return Err(Error::NullMountPointPath);
     }
     let dst = dst
@@ -261,10 +277,10 @@ pub fn bind_mount_unchecked<S: AsRef<Path>, D: AsRef<Path>>(
 
     let src = src.as_ref();
     let dst = dst.as_ref();
-    if src.is_empty() {
+    if src.as_os_str().is_empty() {
         return Err(Error::NullMountPointPath);
     }
-    if dst.is_empty() {
+    if dst.as_os_str().is_empty() {
         return Err(Error::NullMountPointPath);
     }
     let abs_src = src
@@ -551,7 +567,7 @@ fn mount_at<P: AsRef<Path>>(
     let child = std::thread::Builder::new()
         .name("async_mount".to_string())
         .spawn(move || {
-            match unistd::fchdir(file.as_raw_fd()) {
+            match unistd::fchdir(&file) {
                 Ok(_) => info!(sl!(), "chdir from {} to {}", cwd.display(), chdir.display()),
                 Err(e) => {
                     error!(
@@ -587,7 +603,7 @@ fn mount_at<P: AsRef<Path>>(
                 }
             }
         })?;
-    child.join().map_err(|e| Error::Join(format!("{:?}", e)))?;
+    child.join().map_err(|e| Error::Join(format!("{e:?}")))?;
 
     if !rx.load(Ordering::Acquire) {
         Err(Error::Mount(
@@ -759,7 +775,7 @@ pub fn umount_timeout<P: AsRef<Path>>(path: P, timeout: u64) -> Result<()> {
 /// # Safety
 /// Caller needs to ensure safety of the `path` to avoid possible file path based attacks.
 pub fn umount_all<P: AsRef<Path>>(mountpoint: P, lazy_umount: bool) -> Result<()> {
-    if mountpoint.as_ref().is_empty() || !mountpoint.as_ref().exists() {
+    if mountpoint.as_ref().as_os_str().is_empty() || !mountpoint.as_ref().exists() {
         return Ok(());
     }
 
@@ -799,8 +815,20 @@ pub fn get_mount_options(options: &Option<Vec<String>>) -> Vec<String> {
     }
 }
 
-pub fn get_mount_type(typ: &Option<String>) -> String {
-    typ.clone().unwrap_or("bind".to_string())
+pub fn get_mount_type(m: &oci::Mount) -> String {
+    m.typ()
+        .clone()
+        .map(|typ| {
+            if typ.as_str() == "none" {
+                if let Some(opts) = m.options() {
+                    if opts.iter().any(|opt| opt == "bind" || opt == "rbind") {
+                        return "bind".to_string();
+                    }
+                }
+            }
+            typ
+        })
+        .unwrap_or("bind".to_string())
 }
 
 #[cfg(test)]
@@ -810,11 +838,11 @@ mod tests {
 
     #[test]
     fn test_get_linux_mount_info() {
-        let info = get_linux_mount_info("/sys/fs/cgroup").unwrap();
+        let info = get_linux_mount_info("/dev/shm").unwrap();
 
         assert_eq!(&info.device, "tmpfs");
         assert_eq!(&info.fs_type, "tmpfs");
-        assert_eq!(&info.path, "/sys/fs/cgroup");
+        assert_eq!(&info.path, "/dev/shm");
 
         assert!(matches!(
             get_linux_mount_info(""),
@@ -1075,7 +1103,7 @@ mod tests {
         assert!(parse_mount_options(&options).is_err());
 
         let idx = options.len() - 1;
-        options[idx] = " ".repeat(4097);
+        options[idx] = " ".repeat(*MAX_MOUNT_PARAM_SIZE + 1);
         assert!(parse_mount_options(&options).is_err());
     }
 

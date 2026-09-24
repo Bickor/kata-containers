@@ -94,10 +94,22 @@ pub struct PodSpec {
     topologySpreadConstraints: Option<Vec<TopologySpreadConstraint>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    securityContext: Option<PodSecurityContext>,
+    pub securityContext: Option<PodSecurityContext>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     priorityClassName: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    preemptionPolicy: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    priority: Option<i32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    schedulerName: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resources: Option<ResourceRequirements>,
 }
 
 /// See Reference / Kubernetes API / Workload Resources / Pod.
@@ -166,22 +178,73 @@ pub struct Container {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminationMessagePath: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminationMessagePolicy: Option<String>,
 }
 
 /// See Reference / Kubernetes API / Workload Resources / Pod.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Affinity {
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub nodeAffinity: Option<NodeAffinity>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub podAntiAffinity: Option<PodAntiAffinity>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub podAffinity: Option<PodAffinity>,
-    // TODO: additional fields.
+}
+
+/// See Reference / Kubernetes API / Workload Resources / Pod.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct NodeAffinity {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    requiredDuringSchedulingIgnoredDuringExecution: Option<NodeSelector>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    preferredDuringSchedulingIgnoredDuringExecution: Option<Vec<PreferredSchedulingTerm>>,
+}
+
+/// See Reference / Kubernetes API / Workload Resources / Pod.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PreferredSchedulingTerm {
+    weight: i32,
+    preference: NodeSelectorTerm,
+}
+
+/// See Reference / Kubernetes API / Workload Resources / Pod.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct NodeSelector {
+    nodeSelectorTerms: Vec<NodeSelectorTerm>,
+}
+
+/// See Reference / Kubernetes API / Workload Resources / Pod.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct NodeSelectorTerm {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    matchExpressions: Option<Vec<NodeSelectorRequirement>>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    matchFields: Option<Vec<NodeSelectorRequirement>>,
+}
+
+/// See Reference / Kubernetes API / Workload Resources / Pod.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct NodeSelectorRequirement {
+    key: String,
+    operator: String,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    values: Option<Vec<String>>,
 }
 
 /// See Reference / Kubernetes API / Workload Resources / Pod.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PodAffinity {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    preferredDuringSchedulingIgnoredDuringExecution: Option<Vec<WeightedPodAffinityTerm>>,
+
     #[serde(skip_serializing_if = "Option::is_none")]
     requiredDuringSchedulingIgnoredDuringExecution: Option<Vec<PodAffinityTerm>>,
 }
@@ -194,7 +257,6 @@ struct PodAntiAffinity {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     requiredDuringSchedulingIgnoredDuringExecution: Option<Vec<PodAffinityTerm>>,
-    // TODO: additional fields.
 }
 
 /// See Reference / Kubernetes API / Workload Resources / Pod.
@@ -211,7 +273,18 @@ struct PodAffinityTerm {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     labelSelector: Option<yaml::LabelSelector>,
-    // TODO: additional fields.
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    matchLabelKeys: Option<Vec<String>>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mismatchLabelKeys: Option<Vec<String>>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    namespaceSelector: Option<yaml::LabelSelector>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    namespaces: Option<Vec<String>>,
 }
 
 /// See Reference / Kubernetes API / Workload Resources / Pod.
@@ -230,6 +303,9 @@ struct Probe {
     periodSeconds: Option<i32>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
+    terminationGracePeriodSeconds: Option<i32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
     failureThreshold: Option<i32>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -240,6 +316,9 @@ struct Probe {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     tcpSocket: Option<TCPSocketAction>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    grpc: Option<GRPCAction>,
     // TODO: additional fields.
 }
 
@@ -250,6 +329,15 @@ struct TCPSocketAction {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     host: Option<String>,
+}
+
+/// See Reference / Kubernetes API / Workload Resources / Pod.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct GRPCAction {
+    port: u16,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service: Option<String>,
 }
 
 /// See Reference / Kubernetes API / Workload Resources / Pod.
@@ -297,6 +385,9 @@ struct SecurityContext {
     runAsUser: Option<i64>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
+    runAsGroup: Option<i64>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
     seccompProfile: Option<SeccompProfile>,
 }
 
@@ -312,10 +403,31 @@ struct SeccompProfile {
 
 /// See Reference / Kubernetes API / Workload Resources / Pod.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct PodSecurityContext {
+pub struct PodSecurityContext {
     #[serde(skip_serializing_if = "Option::is_none")]
-    runAsUser: Option<i64>,
-    // TODO: additional fields.
+    pub runAsUser: Option<i64>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sysctls: Option<Vec<Sysctl>>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runAsGroup: Option<i64>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fsGroup: Option<i64>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supplementalGroups: Option<Vec<u32>>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowPrivilegeEscalation: Option<bool>,
+}
+
+/// See Reference / Kubernetes API / Workload Resources / Pod.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Sysctl {
+    pub name: String,
+    pub value: String,
 }
 
 /// See Reference / Kubernetes API / Workload Resources / Pod.
@@ -578,9 +690,11 @@ struct TopologySpreadConstraint {
 }
 
 impl Container {
-    pub async fn init(&mut self, config: &Config) {
+    pub async fn init(&mut self, config: &Config, is_pause_container: bool) {
         // Load container image properties from the registry.
-        self.registry = registry::get_container(config, &self.image).await.unwrap();
+        self.registry = registry::get_container(config, &self.image, is_pause_container)
+            .await
+            .unwrap();
     }
 
     pub fn get_env_variables(
@@ -589,7 +703,7 @@ impl Container {
         config_maps: &Vec<config_map::ConfigMap>,
         secrets: &Vec<secret::Secret>,
         namespace: &str,
-        annotations: &Option<BTreeMap<String, String>>,
+        resource: &dyn yaml::K8sResource,
         service_account_name: &str,
     ) {
         if let Some(source_env) = &self.env {
@@ -598,7 +712,7 @@ impl Container {
                     config_maps,
                     secrets,
                     namespace,
-                    annotations,
+                    resource,
                     service_account_name,
                 );
                 let src_string = format!("{}={value}", &env_variable.name);
@@ -738,66 +852,111 @@ impl EnvVar {
         config_maps: &Vec<config_map::ConfigMap>,
         secrets: &Vec<secret::Secret>,
         namespace: &str,
-        annotations: &Option<BTreeMap<String, String>>,
+        resource: &dyn yaml::K8sResource,
         service_account_name: &str,
     ) -> String {
+        // When neither `value` nor `valueFrom` were specified, the default value is an empty string:
+        // https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/pod-v1/#environment-variables
         if let Some(value) = &self.value {
-            return value.clone();
+            value.clone()
+        } else {
+            self.get_value_from(
+                config_maps,
+                secrets,
+                namespace,
+                resource,
+                service_account_name,
+            )
+            .unwrap_or_default()
         }
+    }
 
+    fn get_value_from(
+        &self,
+        config_maps: &Vec<config_map::ConfigMap>,
+        secrets: &Vec<secret::Secret>,
+        namespace: &str,
+        resource: &dyn yaml::K8sResource,
+        service_account_name: &str,
+    ) -> Option<String> {
         if let Some(value_from) = &self.valueFrom {
             if let Some(value) = config_map::get_value(value_from, config_maps) {
-                return value.clone();
+                return Some(value);
             }
 
             if let Some(value) = secret::get_value(value_from, secrets) {
-                return value.clone();
+                return Some(value);
             }
 
-            if let Some(field_ref) = &value_from.fieldRef {
-                let path: &str = &field_ref.fieldPath;
-                match path {
-                    "metadata.name" => return "$(sandbox-name)".to_string(),
-                    "metadata.namespace" => return namespace.to_string(),
-                    "metadata.uid" => return "$(pod-uid)".to_string(),
-                    "status.hostIP" => return "$(host-ip)".to_string(),
-                    "status.podIP" => return "$(pod-ip)".to_string(),
-                    "spec.nodeName" => return "$(node-name)".to_string(),
-                    "spec.serviceAccountName" => return service_account_name.to_string(),
-                    _ => {
-                        if let Some(value) = self.get_annotation_value(path, annotations) {
-                            return value;
-                        } else {
-                            panic!(
-                                "Env var: unsupported field reference: {}",
-                                &field_ref.fieldPath
-                            )
-                        }
-                    }
-                }
+            if let Some(value) =
+                self.get_value_from_field_ref(value_from, namespace, resource, service_account_name)
+            {
+                return Some(value);
             }
 
             if value_from.resourceFieldRef.is_some() {
                 // TODO: should resource fields such as "limits.cpu" or "limits.memory"
                 // be handled in a different way?
-                return "$(resource-field)".to_string();
+                return Some("$(resource-field)".to_string());
             }
-        } else {
-            panic!("Environment variable without value or valueFrom!");
+
+            panic!("Couldn't get the value of env var: {}", &self.name);
         }
 
-        panic!("Couldn't get the value of env var: {}", &self.name);
+        None
+    }
+
+    fn get_value_from_field_ref(
+        &self,
+        value_from: &EnvVarSource,
+        namespace: &str,
+        resource: &dyn yaml::K8sResource,
+        service_account_name: &str,
+    ) -> Option<String> {
+        if let Some(field_ref) = &value_from.fieldRef {
+            let path: &str = &field_ref.fieldPath;
+            let v = match path {
+                "metadata.name" => "$(sandbox-name)",
+                "metadata.namespace" => {
+                    if namespace.is_empty() {
+                        "$(sandbox-namespace)"
+                    } else {
+                        namespace
+                    }
+                }
+                "metadata.uid" => "$(pod-uid)",
+                "status.hostIP" => "$(host-ip)",
+                "status.podIP" => "$(pod-ip)",
+                "spec.nodeName" => "$(node-name)",
+                "spec.serviceAccountName" => service_account_name,
+                _ => {
+                    if let Some(value) = self.get_annotation_value(path, resource) {
+                        &value.to_string()
+                    } else if let Some(value) = self.get_label_value(path, resource) {
+                        &value.to_string()
+                    } else {
+                        panic!(
+                            "Env var: unsupported field reference: {}",
+                            &field_ref.fieldPath
+                        )
+                    }
+                }
+            };
+            Some(v.to_string())
+        } else {
+            None
+        }
     }
 
     fn get_annotation_value(
         &self,
         reference: &str,
-        anno: &Option<BTreeMap<String, String>>,
+        resource: &dyn yaml::K8sResource,
     ) -> Option<String> {
         let prefix = "metadata.annotations['";
         let suffix = "']";
         if reference.starts_with(prefix) && reference.ends_with(suffix) {
-            if let Some(annotations) = anno {
+            if let Some(annotations) = resource.get_annotations() {
                 let start = prefix.len();
                 let end = reference.len() - 2;
                 let annotation = reference[start..end].to_string();
@@ -817,6 +976,25 @@ impl EnvVar {
         }
         None
     }
+
+    fn get_label_value(&self, reference: &str, resource: &dyn yaml::K8sResource) -> Option<String> {
+        let prefix = "metadata.labels['";
+        let suffix = "']";
+        if reference.starts_with(prefix) && reference.ends_with(suffix) {
+            if let Some(labels) = resource.get_labels() {
+                let start = prefix.len();
+                let end = reference.len() - 2;
+                let label = reference[start..end].to_string();
+
+                if let Some(value) = labels.get(&label) {
+                    return Some(value.clone());
+                } else {
+                    panic!("Can't find the value of label {}.", &label);
+                }
+            }
+        }
+        None
+    }
 }
 
 #[async_trait]
@@ -827,11 +1005,7 @@ impl yaml::K8sResource for Pod {
     }
 
     fn get_sandbox_name(&self) -> Option<String> {
-        let name = self.metadata.get_name();
-        if !name.is_empty() {
-            return Some(name);
-        }
-        panic!("No pod name.");
+        yaml::name_regex_from_meta(&self.metadata)
     }
 
     fn get_namespace(&self) -> Option<String> {
@@ -850,12 +1024,12 @@ impl yaml::K8sResource for Pod {
             storages,
             container,
             settings,
-            &self.spec.volumes,
+            &self.spec,
         );
     }
 
-    fn generate_policy(&self, agent_policy: &policy::AgentPolicy) -> String {
-        agent_policy.generate_policy(self)
+    fn generate_initdata_anno(&self, agent_policy: &policy::AgentPolicy) -> String {
+        agent_policy.generate_initdata_anno(self)
     }
 
     fn serialize(&mut self, policy: &str) -> String {
@@ -892,12 +1066,30 @@ impl yaml::K8sResource for Pod {
             .or_else(|| Some(String::new()))
     }
 
-    fn get_process_fields(&self, process: &mut policy::KataProcess) {
-        if let Some(context) = &self.spec.securityContext {
-            if let Some(uid) = context.runAsUser {
-                process.User.UID = uid.try_into().unwrap();
-            }
-        }
+    fn get_process_fields(
+        &self,
+        process: &mut policy::KataProcess,
+        must_check_passwd: &mut bool,
+        is_pause_container: bool,
+    ) {
+        yaml::get_process_fields(
+            process,
+            must_check_passwd,
+            is_pause_container,
+            &self.spec.securityContext,
+        );
+    }
+
+    fn get_sysctls(&self) -> Vec<Sysctl> {
+        yaml::get_sysctls(&self.spec.securityContext)
+    }
+
+    fn get_pod_security_context(&self) -> Option<&PodSecurityContext> {
+        self.spec.securityContext.as_ref()
+    }
+
+    fn get_labels(&self) -> &Option<BTreeMap<String, String>> {
+        &self.metadata.labels
     }
 }
 
@@ -948,14 +1140,86 @@ impl Container {
     }
 
     pub fn get_process_fields(&self, process: &mut policy::KataProcess) {
+        debug!(
+            "get_process_fields: container image = {:?}",
+            self.registry.image
+        );
+
         if let Some(context) = &self.securityContext {
+            debug!("get_process_fields: securityContext = {:?}", context);
+
             if let Some(uid) = context.runAsUser {
-                process.User.UID = uid.try_into().unwrap();
+                debug!("get_process_fields: runAsUser uid = {uid}");
+
+                let new_uid = uid.try_into().unwrap();
+                process.User.UID = new_uid;
+                // Changing the UID can break the GID mapping
+                // if a /etc/passwd file is present.
+                // The proper GID is determined, in order of preference:
+                // 1. the securityContext runAsGroup field (applied last in code)
+                // 2. lacking an explicit runAsGroup, /etc/passwd (get_gid_from_passwd_uid)
+                // 3. fall back to pod-level GID if there is one (unwrap_or)
+                //
+                // This behavior comes from the containerd runtime implementation:
+                // WithUser https://github.com/containerd/containerd/blob/main/pkg/oci/spec_opts.go#L592
+                let new_gid = match self.registry.get_gid_from_passwd_uid(new_uid) {
+                    Ok(gid) => gid,
+                    Err(e) => {
+                        debug!(
+                            "get_process_fields: no GID for UID = {new_uid} in container image, error {e}"
+                        );
+                        process.User.GID
+                    }
+                };
+                process.User.GID = new_gid;
+                debug!(
+                    "get_process_fields: set GID = {new_gid}, User = {:?}",
+                    &process.User
+                );
+
+                process.User.AdditionalGids.insert(new_gid);
+                debug!(
+                    "get_process_fields: inserted GID = {new_gid} into AdditionalGids, User = {:?}",
+                    &process.User
+                );
             }
+
+            if let Some(gid) = context.runAsGroup {
+                debug!("get_process_fields: runAsGroup = {:?}", gid);
+
+                let new_gid = gid.try_into().unwrap();
+                process.User.GID = new_gid;
+
+                process.User.AdditionalGids.insert(new_gid);
+                debug!(
+                    "get_process_fields: inserted GID = {new_gid} into AdditionalGids, User = {:?}",
+                    &process.User
+                );
+            }
+
             if let Some(allow) = context.allowPrivilegeEscalation {
                 process.NoNewPrivileges = !allow
             }
         }
+
+        // Handle AdditionalGids here as this is the last time the UID can be updated.
+        for gid in self
+            .registry
+            .get_additional_groups_from_uid(process.User.UID)
+            .unwrap_or_default()
+        {
+            debug!(
+                "get_process_fields: adding additional group = {gid} for UID = {}",
+                process.User.UID
+            );
+            process.User.AdditionalGids.insert(gid);
+        }
+    }
+
+    // Count NVIDIA passthrough GPU requests using an explicit allowlist of resource keys.
+    pub fn get_nvidia_pgpu_count(&self, pgpu_resource_keys: &[String]) -> Option<usize> {
+        let limits = self.resources.as_ref()?.limits.as_ref()?;
+        sum_limits_by_keys(limits, pgpu_resource_keys)
     }
 }
 
@@ -998,11 +1262,95 @@ pub async fn add_pause_container(containers: &mut Vec<Container>, config: &Confi
             privileged: None,
             capabilities: None,
             runAsUser: None,
+            runAsGroup: None,
             seccompProfile: None,
         }),
         ..Default::default()
     };
-    pause_container.init(config).await;
+    let is_pause_container = true;
+    pause_container.init(config, is_pause_container).await;
     containers.insert(0, pause_container);
     debug!("pause container added.");
+}
+
+fn sum_limits_by_keys(limits: &BTreeMap<String, String>, keys: &[String]) -> Option<usize> {
+    if keys.is_empty() {
+        return None;
+    }
+
+    let mut total: usize = 0;
+    let mut matched_any = false;
+
+    for key in keys {
+        if let Some(v) = limits.get(key) {
+            matched_any = true;
+            let n = v.parse::<usize>().ok()?;
+            total = total.saturating_add(n);
+        }
+    }
+
+    // Preserve historical semantics:
+    // - if at least one key matched and all matched values parsed, return Some(total)
+    // - if no key matched, return None
+    matched_any.then_some(total)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_limits(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
+        entries
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn sum_limits_none_when_keys_empty() {
+        let limits = make_limits(&[("nvidia.com/pgpu", "2")]);
+        assert_eq!(sum_limits_by_keys(&limits, &[]), None);
+    }
+
+    #[test]
+    fn sum_limits_none_when_no_match() {
+        let limits = make_limits(&[("nvidia.com/pgpu", "2")]);
+        let keys = vec!["vendor.com/gpu".to_string()];
+        assert_eq!(sum_limits_by_keys(&limits, &keys), None);
+    }
+
+    #[test]
+    fn sum_limits_sums_matching_keys() {
+        let limits = make_limits(&[("nvidia.com/pgpu", "2"), ("nvidia.com/gpu_model", "1")]);
+        let keys = vec![
+            "nvidia.com/pgpu".to_string(),
+            "nvidia.com/gpu_model".to_string(),
+        ];
+        assert_eq!(sum_limits_by_keys(&limits, &keys), Some(3));
+    }
+
+    #[test]
+    fn sum_limits_none_on_parse_failure() {
+        let limits = make_limits(&[("nvidia.com/pgpu", "two")]);
+        let keys = vec!["nvidia.com/pgpu".to_string()];
+        assert_eq!(sum_limits_by_keys(&limits, &keys), None);
+    }
+
+    #[test]
+    fn get_nvidia_pgpu_count_uses_allowlist_keys() {
+        let limits = make_limits(&[("nvidia.com/pgpu", "1"), ("nvidia.com/GH100", "2")]);
+        let keys = vec![
+            "nvidia.com/pgpu".to_string(),
+            "nvidia.com/GH100".to_string(),
+        ];
+        let c = Container {
+            resources: Some(ResourceRequirements {
+                requests: None,
+                limits: Some(limits),
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(c.get_nvidia_pgpu_count(&keys), Some(3));
+    }
 }

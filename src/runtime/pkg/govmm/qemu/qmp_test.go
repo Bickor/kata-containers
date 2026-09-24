@@ -50,6 +50,10 @@ func (l qmpTestLogger) Errorf(format string, v ...interface{}) {
 	l.Infof(format, v...)
 }
 
+func (l qmpTestLogger) Debugf(format string, v ...interface{}) {
+	l.Infof(format, v...)
+}
+
 // nolint: govet
 type qmpTestCommand struct {
 	name string
@@ -204,6 +208,31 @@ func (b *qmpTestCommandBuffer) Write(p []byte) (int, error) {
 			b.cmds[currentCmd].name, gotCmdName)
 		result = "error"
 	}
+
+	// When expected args are provided, verify that each expected key/value
+	// is present in the actual QMP arguments. Existing tests pass nil args
+	// and are unaffected by this check.
+	if expectedArgs := b.cmds[currentCmd].args; expectedArgs != nil {
+		gotArgs, _ := cmdJSON["arguments"].(map[string]interface{})
+		for k, v := range expectedArgs {
+			got, ok := gotArgs[k]
+			if !ok {
+				b.t.Errorf("Command %s: missing expected argument %q", gotCmdName, k)
+				continue
+			}
+			// JSON numbers decode as float64
+			expectedFloat, expectedIsFloat := toFloat64(v)
+			gotFloat, gotIsFloat := toFloat64(got)
+			if expectedIsFloat && gotIsFloat {
+				if expectedFloat != gotFloat {
+					b.t.Errorf("Command %s: argument %q = %v, want %v", gotCmdName, k, got, v)
+				}
+			} else if fmt.Sprintf("%v", got) != fmt.Sprintf("%v", v) {
+				b.t.Errorf("Command %s: argument %q = %v, want %v", gotCmdName, k, got, v)
+			}
+		}
+	}
+
 	resultMap := make(map[string]interface{})
 	resultMap[result] = b.results[currentCmd].data
 	encodedRes, err := json.Marshal(&resultMap)
@@ -213,6 +242,26 @@ func (b *qmpTestCommandBuffer) Write(p []byte) (int, error) {
 	encodedRes = append(encodedRes, '\n')
 	b.newDataCh <- encodedRes
 	return len(p), nil
+}
+
+// toFloat64 attempts to convert a numeric value to float64 for comparison.
+// JSON unmarshalling decodes all numbers as float64, while Go code may pass
+// int, uint32, etc. This helper normalises both sides for comparison.
+func toFloat64(v interface{}) (float64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return n, true
+	case int:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	case uint32:
+		return float64(n), true
+	case uint64:
+		return float64(n), true
+	default:
+		return 0, false
+	}
 }
 
 func checkVersion(t *testing.T, connectedCh <-chan *QMPVersion) *QMPVersion {
@@ -601,7 +650,7 @@ func TestQMPDeviceAdd(t *testing.T) {
 	blockdevID := fmt.Sprintf("drive_%s", volumeUUID)
 	devID := fmt.Sprintf("device_%s", volumeUUID)
 	err := q.ExecuteDeviceAdd(context.Background(), blockdevID, devID,
-		"virtio-blk-pci", "", "", true, false)
+		"virtio-blk-pci", "", "", true, false, 0, 0)
 	if err != nil {
 		t.Fatalf("Unexpected error %v", err)
 	}
@@ -1066,7 +1115,31 @@ func TestQMPPCIDeviceAdd(t *testing.T) {
 	blockdevID := fmt.Sprintf("drive_%s", volumeUUID)
 	devID := fmt.Sprintf("device_%s", volumeUUID)
 	err := q.ExecutePCIDeviceAdd(context.Background(), blockdevID, devID,
-		"virtio-blk-pci", "0x1", "", "", 1, true, false)
+		"virtio-blk-pci", "0x1", "", "", 1, true, false, "", 0, 0)
+	if err != nil {
+		t.Fatalf("Unexpected error %v", err)
+	}
+	q.Shutdown()
+	<-disconnectedCh
+}
+
+// Checks that PCI block devices with explicit logical and physical block sizes are
+// correctly added using device_add, and that the sizes appear in the QMP arguments.
+func TestQMPPCIDeviceAddWithBlockSize(t *testing.T) {
+	connectedCh := make(chan *QMPVersion)
+	disconnectedCh := make(chan struct{})
+	buf := newQMPTestCommandBuffer(t)
+	buf.AddCommand("device_add", map[string]interface{}{
+		"logical_block_size":  uint32(512),
+		"physical_block_size": uint32(4096),
+	}, "return", nil)
+	cfg := QMPConfig{Logger: qmpTestLogger{}}
+	q := startQMPLoop(buf, cfg, connectedCh, disconnectedCh)
+	q.version = checkVersion(t, connectedCh)
+	blockdevID := fmt.Sprintf("drive_%s", volumeUUID)
+	devID := fmt.Sprintf("device_%s", volumeUUID)
+	err := q.ExecutePCIDeviceAdd(context.Background(), blockdevID, devID,
+		"virtio-blk-pci", "0x1", "", "", 1, true, false, "", 512, 4096)
 	if err != nil {
 		t.Fatalf("Unexpected error %v", err)
 	}
@@ -1136,14 +1209,59 @@ func TestQMPAPVFIOMediatedDeviceAdd(t *testing.T) {
 	<-disconnectedCh
 }
 
+func TestExecuteVFIODeviceAdd(t *testing.T) {
+	bdf := "04:00.0"
+	romfile := ""
+
+	for _, tc := range []struct {
+		name      string
+		iommufdID string
+	}{
+		{
+			name:      "with IOMMUFD",
+			iommufdID: "0",
+		},
+		{
+			name:      "without IOMMUFD",
+			iommufdID: "",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			connectedCh := make(chan *QMPVersion)
+			disconnectedCh := make(chan struct{})
+
+			buf := newQMPTestCommandBuffer(t)
+
+			// Note: At the time of writing, the QMPTestCommandBuffer does not
+			// support verifying parameters passed to object-add and device_add.
+			// So we just verify that the commands are sent in the correct order.
+			if tc.iommufdID != "" {
+				buf.AddCommand("object-add", nil, "return", nil)
+			}
+			buf.AddCommand("device_add", nil, "return", nil)
+
+			cfg := QMPConfig{Logger: qmpTestLogger{}}
+			q := startQMPLoop(buf, cfg, connectedCh, disconnectedCh)
+			checkVersion(t, connectedCh)
+
+			err := q.ExecuteVFIODeviceAdd(context.Background(), "devID", bdf, "rp1", romfile, tc.iommufdID)
+			if err != nil {
+				t.Fatalf("Unexpected error %v", err)
+			}
+			q.Shutdown()
+			<-disconnectedCh
+		})
+	}
+}
+
 // Checks that CPU are correctly added using device_add
 func TestQMPCPUDeviceAdd(t *testing.T) {
 	drivers := []string{"host-x86_64-cpu", "host-s390x-cpu", "host-powerpc64-cpu"}
 	cpuID := "cpu-0"
-	socketID := "0"
-	dieID := "0"
-	coreID := "1"
-	threadID := "0"
+	socketID := 0
+	dieID := 0
+	coreID := 1
+	threadID := 0
 	for _, d := range drivers {
 		connectedCh := make(chan *QMPVersion)
 		disconnectedCh := make(chan struct{})

@@ -5,11 +5,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::inner::CloudHypervisorInner;
+use crate::ch::utils::get_rootless_symlink_sandbox_jailer_root;
 use crate::device::pci_path::PciPath;
 use crate::device::DeviceType;
+use crate::utils::create_dir_all_with_inherit_owner;
+use crate::utils::open_named_tuntap;
 use crate::HybridVsockDevice;
 use crate::NetworkConfig;
 use crate::NetworkDevice;
+use crate::ProtectionDeviceConfig;
 use crate::ShareFsConfig;
 use crate::ShareFsDevice;
 use crate::VfioDevice;
@@ -19,20 +23,27 @@ use anyhow::{anyhow, Context, Result};
 use ch_config::ch_api::cloud_hypervisor_vm_device_add;
 use ch_config::ch_api::{
     cloud_hypervisor_vm_blockdev_add, cloud_hypervisor_vm_device_remove,
-    cloud_hypervisor_vm_fs_add, cloud_hypervisor_vm_netdev_add, cloud_hypervisor_vm_vsock_add,
-    PciDeviceInfo, VmRemoveDeviceData,
+    cloud_hypervisor_vm_fs_add, cloud_hypervisor_vm_netdev_add_with_fds,
+    cloud_hypervisor_vm_vsock_add, PciDeviceInfo, VmRemoveDeviceData,
 };
-use ch_config::convert::{DEFAULT_DISK_QUEUES, DEFAULT_DISK_QUEUE_SIZE, DEFAULT_NUM_PCI_SEGMENTS};
+use ch_config::convert::DEFAULT_NUM_PCI_SEGMENTS;
 use ch_config::DiskConfig;
-use ch_config::{net_util::MacAddr, DeviceConfig, FsConfig, NetConfig, VsockConfig};
+use ch_config::ImageType;
+use ch_config::{
+    net_util::MacAddr, DeviceConfig, FsConfig, NetConfig, ProtectionDevConfig, VsockConfig,
+};
+use kata_sys_util::netns::NetnsGuard;
+use kata_types::config::hypervisor::RateLimiterConfig;
+use kata_types::rootless::is_rootless;
+
 use safe_path::scoped_join;
 use std::convert::TryFrom;
+use std::os::fd::AsRawFd;
+use std::os::fd::IntoRawFd;
+use std::os::unix::fs::symlink;
 use std::path::PathBuf;
 
 const VIRTIO_FS: &str = "virtio-fs";
-
-pub const DEFAULT_FS_QUEUES: usize = 1;
-const DEFAULT_FS_QUEUE_SIZE: u16 = 1024;
 
 impl CloudHypervisorInner {
     pub(crate) async fn add_device(&mut self, device: DeviceType) -> Result<DeviceType> {
@@ -61,6 +72,8 @@ impl CloudHypervisorInner {
             match device {
                 DeviceType::ShareFs(_) => self.pending_devices.insert(0, device.clone()),
                 DeviceType::Network(_) => self.pending_devices.insert(0, device.clone()),
+                DeviceType::Vfio(_) => self.pending_devices.insert(0, device.clone()),
+                DeviceType::Protection(_) => self.pending_devices.insert(0, device.clone()),
                 _ => {
                     debug!(
                         sl!(),
@@ -106,7 +119,10 @@ impl CloudHypervisorInner {
 
     pub(crate) async fn remove_device(&mut self, device: DeviceType) -> Result<()> {
         match device {
-            DeviceType::Vfio(vfiodev) => self.remove_vfio_device(&vfiodev).await,
+            DeviceType::Vfio(vfiodev) => self.inner_remove_device(vfiodev.device_id.as_str()).await,
+            DeviceType::Block(blockdev) => {
+                self.inner_remove_device(blockdev.device_id.as_str()).await
+            }
             _ => Ok(()),
         }
     }
@@ -124,23 +140,8 @@ impl CloudHypervisorInner {
             ));
         }
 
-        let socket = self
-            .api_socket
-            .as_ref()
-            .ok_or("missing socket")
-            .map_err(|e| anyhow!(e))?;
-
-        let num_queues: usize = if device.config.queue_num > 0 {
-            device.config.queue_num as usize
-        } else {
-            DEFAULT_FS_QUEUES
-        };
-
-        let queue_size: u16 = if device.config.queue_num > 0 {
-            u16::try_from(device.config.queue_size)?
-        } else {
-            DEFAULT_FS_QUEUE_SIZE
-        };
+        let num_queues = device.config.queue_num as usize;
+        let queue_size = u16::try_from(device.config.queue_size)?;
 
         let socket_path = if device.config.sock_path.starts_with('/') {
             PathBuf::from(device.config.sock_path)
@@ -158,11 +159,7 @@ impl CloudHypervisorInner {
             ..Default::default()
         };
 
-        let response = cloud_hypervisor_vm_fs_add(
-            socket.try_clone().context("failed to clone socket")?,
-            fs_config,
-        )
-        .await?;
+        let response = cloud_hypervisor_vm_fs_add(&self.api_socket, fs_config).await?;
 
         if let Some(detail) = response {
             debug!(sl!(), "fs add response: {:?}", detail);
@@ -187,23 +184,13 @@ impl CloudHypervisorInner {
 
         let sysfsdev = primary_device.sysfs_path.clone();
 
-        let socket = self
-            .api_socket
-            .as_ref()
-            .ok_or("missing socket")
-            .map_err(|e| anyhow!(e))?;
-
         let device_config = DeviceConfig {
             path: PathBuf::from(sysfsdev),
             iommu: false,
             ..Default::default()
         };
 
-        let response = cloud_hypervisor_vm_device_add(
-            socket.try_clone().context("failed to clone socket")?,
-            device_config,
-        )
-        .await?;
+        let response = cloud_hypervisor_vm_device_add(&self.api_socket, device_config).await?;
 
         if let Some(detail) = response {
             debug!(sl!(), "VFIO add response: {:?}", detail);
@@ -224,8 +211,8 @@ impl CloudHypervisorInner {
         Ok(DeviceType::Vfio(vfio_device))
     }
 
-    async fn remove_vfio_device(&mut self, device: &VfioDevice) -> Result<()> {
-        let clh_device_id = self.device_ids.get(&device.device_id);
+    async fn inner_remove_device(&mut self, device_id: &str) -> Result<()> {
+        let clh_device_id = self.device_ids.get(device_id);
 
         if clh_device_id.is_none() {
             return Err(anyhow!(
@@ -233,25 +220,15 @@ impl CloudHypervisorInner {
             ));
         }
 
-        let socket = self
-            .api_socket
-            .as_ref()
-            .ok_or("missing socket")
-            .map_err(|e| anyhow!(e))?;
-
         let clh_device_id = clh_device_id.unwrap();
         let rm_data = VmRemoveDeviceData {
             id: clh_device_id.clone(),
         };
 
-        let response = cloud_hypervisor_vm_device_remove(
-            socket.try_clone().context("failed to clone socket")?,
-            rm_data,
-        )
-        .await?;
+        let response = cloud_hypervisor_vm_device_remove(&self.api_socket, rm_data).await?;
 
         if let Some(detail) = response {
-            debug!(sl!(), "vfio remove response: {:?}", detail);
+            debug!(sl!(), "device remove response: {:?}", detail);
         }
 
         Ok(())
@@ -282,11 +259,6 @@ impl CloudHypervisorInner {
 
     async fn handle_hvsock_device(&mut self, device: HybridVsockDevice) -> Result<DeviceType> {
         let hvsock_config = device.config.clone();
-        let socket = self
-            .api_socket
-            .as_ref()
-            .ok_or("missing socket")
-            .map_err(|e| anyhow!(e))?;
 
         let vsock_config = VsockConfig {
             cid: hvsock_config.guest_cid.into(),
@@ -294,11 +266,7 @@ impl CloudHypervisorInner {
             ..Default::default()
         };
 
-        let response = cloud_hypervisor_vm_vsock_add(
-            socket.try_clone().context("failed to clone socket")?,
-            vsock_config,
-        )
-        .await?;
+        let response = cloud_hypervisor_vm_vsock_add(&self.api_socket, vsock_config).await?;
 
         if let Some(detail) = response {
             debug!(sl!(), "hvsock add response: {:?}", detail);
@@ -309,19 +277,26 @@ impl CloudHypervisorInner {
 
     async fn handle_block_device(&mut self, device: BlockDevice) -> Result<DeviceType> {
         let mut block_dev = device.clone();
-        let socket = self
-            .api_socket
-            .as_ref()
-            .ok_or("missing socket")
-            .map_err(|e| anyhow!(e))?;
 
-        let disk_config = DiskConfig::try_from(device.config)?;
+        let mut disk_config = DiskConfig::try_from(device.config.clone())?;
+        disk_config.direct = device
+            .config
+            .is_direct
+            .unwrap_or(self.config.blockdev_info.block_device_cache_direct);
 
-        let response = cloud_hypervisor_vm_blockdev_add(
-            socket.try_clone().context("failed to clone socket")?,
-            disk_config,
-        )
-        .await?;
+        let block_rate_limit = RateLimiterConfig::new(
+            self.config.blockdev_info.disk_rate_limiter_bw_max_rate,
+            self.config.blockdev_info.disk_rate_limiter_ops_max_rate,
+            self.config
+                .blockdev_info
+                .disk_rate_limiter_bw_one_time_burst,
+            self.config
+                .blockdev_info
+                .disk_rate_limiter_ops_one_time_burst,
+        );
+        disk_config.rate_limiter_config = block_rate_limit;
+
+        let response = cloud_hypervisor_vm_blockdev_add(&self.api_socket, disk_config).await?;
 
         if let Some(detail) = response {
             debug!(sl!(), "blockdev add response: {:?}", detail);
@@ -338,19 +313,18 @@ impl CloudHypervisorInner {
     async fn handle_network_device(&mut self, device: NetworkDevice) -> Result<DeviceType> {
         let netdev = device.clone();
 
-        let socket = self
-            .api_socket
-            .as_ref()
-            .ok_or("missing socket")
-            .map_err(|e| anyhow!(e))?;
+        let mut clh_net_config = NetConfig::try_from(device.config)?;
+        // When using fds to pass the tap device to cloud-hypervisor, tap and id fields should be None
+        clh_net_config.tap = None;
+        clh_net_config.id = None;
 
-        let clh_net_config = NetConfig::try_from(device.config)?;
+        let files = open_named_tuntap(&netdev.config.host_dev_name, netdev.config.queue_num as u32)
+            .context("open named tuntap")?;
 
-        let response = cloud_hypervisor_vm_netdev_add(
-            socket.try_clone().context("failed to clone socket")?,
-            clh_net_config,
-        )
-        .await?;
+        let fds = files.iter().map(|f| f.as_raw_fd()).collect();
+
+        let response =
+            cloud_hypervisor_vm_netdev_add_with_fds(&self.api_socket, clh_net_config, fds).await?;
 
         if let Some(detail) = response {
             debug!(sl!(), "netdev add response: {:?}", detail);
@@ -361,28 +335,144 @@ impl CloudHypervisorInner {
 
     pub(crate) async fn get_shared_devices(
         &mut self,
-    ) -> Result<(Option<Vec<FsConfig>>, Option<Vec<NetConfig>>)> {
+    ) -> Result<(
+        Option<Vec<FsConfig>>,
+        Option<Vec<NetConfig>>,
+        Option<Vec<DeviceConfig>>,
+        Option<ProtectionDevConfig>,
+    )> {
         let mut shared_fs_devices = Vec::<FsConfig>::new();
         let mut network_devices = Vec::<NetConfig>::new();
+        let mut host_devices = Vec::<DeviceConfig>::new();
+        let mut protection_device = ProtectionDevConfig::default();
 
         while let Some(dev) = self.pending_devices.pop() {
             match dev {
                 DeviceType::ShareFs(dev) => {
                     let settings = ShareFsSettings::new(dev.config, self.vm_path.clone());
 
-                    let fs_cfg = FsConfig::try_from(settings)?;
+                    let fs_cfg = if is_rootless() {
+                        // TODO: Replace this symlink workaround if a better approach for rootless socket paths appears.
+                        // In rootless mode the virtiofsd.sock lives under the rootless directory,
+                        // and its full path can exceed the 108-byte Unix domain socket limit.
+                        // To ensure the cloud-hypervisor VMM can connect to virtiofsd, create a
+                        // short symlink inside the rootless directory and point the VMM at it.
+                        let mut fs_cfg = FsConfig::try_from(settings)?;
+                        let rootless_symlink_sanbox_jailer_root =
+                            get_rootless_symlink_sandbox_jailer_root(self.id.as_str());
+
+                        create_dir_all_with_inherit_owner(
+                            rootless_symlink_sanbox_jailer_root.as_str(),
+                            0x750,
+                        )
+                        .map_err(|e| {
+                            anyhow!(
+                                "failed to create rootless sharefs symlink jailer root dir: {}",
+                                e
+                            )
+                        })?;
+                        let virtiofsd_name = fs_cfg.socket.file_name().ok_or_else(|| {
+                            anyhow!(
+                                "failed to get virtiofsd socket file name from path: {:?}",
+                                fs_cfg.socket
+                            )
+                        })?;
+                        let virtiofsd_symlink_path =
+                            PathBuf::from(rootless_symlink_sanbox_jailer_root.as_str())
+                                .join(virtiofsd_name);
+
+                        symlink(&fs_cfg.socket, &virtiofsd_symlink_path).map_err(|e| {
+                            anyhow!(
+                                "failed to create symlink for rootless sharefs socket: {}",
+                                e
+                            )
+                        })?;
+
+                        fs_cfg.socket = virtiofsd_symlink_path;
+
+                        fs_cfg
+                    } else {
+                        FsConfig::try_from(settings)?
+                    };
 
                     shared_fs_devices.push(fs_cfg);
                 }
                 DeviceType::Network(net_device) => {
-                    let net_config = NetConfig::try_from(net_device.config)?;
+                    let network_queues_pairs =
+                        self.hypervisor_config().network_info.network_queues as usize;
+
+                    let mut net_config = NetConfig::try_from(net_device.config.clone())?;
+                    // When using fds to pass the tap device to cloud-hypervisor, tap and id fields should be None
+                    net_config.tap = None;
+                    net_config.id = None;
+
+                    net_config.num_queues = network_queues_pairs * 2;
+                    info!(
+                        sl!(),
+                        "network device queue pairs {:?}", network_queues_pairs
+                    );
+
+                    // we need ensure opening network device happens in netns.
+                    let netns = self.netns.clone().unwrap_or_default();
+                    let _netns_guard = NetnsGuard::new(&netns).context("new netns guard")?;
+                    let fds = open_named_tuntap(
+                        &net_device.config.host_dev_name,
+                        network_queues_pairs as u32,
+                    )
+                    .context("open named tuntap")?
+                    .into_iter()
+                    .map(|f| f.into_raw_fd())
+                    .collect();
+                    net_config.fds = Some(fds);
                     network_devices.push(net_config);
+                }
+                DeviceType::Vfio(vfio_device) => {
+                    // A device with multi-funtions, or a IOMMU group with one more
+                    // devices, the Primary device is selected to be passed to VM.
+                    // And the the first one is Primary device.
+                    // safe here, devices is not empty.
+                    let primary_device = vfio_device.devices.first().ok_or(anyhow!(
+                        "Primary device list empty for vfio device {:?}",
+                        vfio_device
+                    ))?;
+
+                    let primary_device = primary_device.clone();
+                    let sysfsdev = primary_device.sysfs_path.clone();
+                    let device_config = DeviceConfig {
+                        path: PathBuf::from(sysfsdev),
+                        iommu: false,
+                        ..Default::default()
+                    };
+                    info!(
+                        sl!(),
+                        "get host_devices primary device {:?}", primary_device
+                    );
+                    host_devices.push(device_config);
+                }
+                DeviceType::Protection(pdev) => {
+                    let config = pdev.config;
+                    match config {
+                        ProtectionDeviceConfig::SevSnp(sevsnp_cfg) => {
+                            if sevsnp_cfg.is_snp {
+                                protection_device.host_data = sevsnp_cfg.host_data;
+                            }
+                        }
+                        ProtectionDeviceConfig::Tdx(tdx_config) => {
+                            protection_device.mrconfigid = tdx_config.mrconfigid;
+                        }
+                        _ => info!(sl!(), "CH: unsupported protection device type"),
+                    }
                 }
                 _ => continue,
             }
         }
 
-        Ok((Some(shared_fs_devices), Some(network_devices)))
+        Ok((
+            Some(shared_fs_devices),
+            Some(network_devices),
+            Some(host_devices),
+            Some(protection_device),
+        ))
     }
 }
 
@@ -414,8 +504,9 @@ impl TryFrom<BlockConfig> for DiskConfig {
         let disk_config: DiskConfig = DiskConfig {
             path: Some(blkcfg.path_on_host.as_str().into()),
             readonly: blkcfg.is_readonly,
-            num_queues: DEFAULT_DISK_QUEUES,
-            queue_size: DEFAULT_DISK_QUEUE_SIZE,
+            num_queues: blkcfg.num_queues,
+            queue_size: blkcfg.queue_size as u16,
+            image_type: ImageType::Raw,
             ..Default::default()
         };
 
@@ -442,17 +533,8 @@ impl TryFrom<ShareFsSettings> for FsConfig {
         let cfg = settings.cfg;
         let vm_path = settings.vm_path;
 
-        let num_queues: usize = if cfg.queue_num > 0 {
-            cfg.queue_num as usize
-        } else {
-            DEFAULT_FS_QUEUES
-        };
-
-        let queue_size: u16 = if cfg.queue_num > 0 {
-            u16::try_from(cfg.queue_size)?
-        } else {
-            DEFAULT_FS_QUEUE_SIZE
-        };
+        let num_queues = cfg.queue_num as usize;
+        let queue_size = u16::try_from(cfg.queue_size)?;
 
         let socket_path = if cfg.sock_path.starts_with('/') {
             PathBuf::from(cfg.sock_path)

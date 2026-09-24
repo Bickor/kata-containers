@@ -54,13 +54,13 @@ func validateHypervisorConfig(conf *HypervisorConfig) error {
 		conf.BlockDeviceDriver = config.VirtioBlockCCW
 	}
 
-	if conf.DefaultMaxVCPUs == 0 || conf.DefaultMaxVCPUs > defaultMaxVCPUs {
-		conf.DefaultMaxVCPUs = defaultMaxVCPUs
+	// CoCo guest hardening: virtio-mmio is not hardened for confidential computing.
+	if conf.ConfidentialGuest && conf.BlockDeviceDriver == config.VirtioMmio {
+		return fmt.Errorf("confidential guests must not use virtio-mmio (use virtio-blk-pci); virtio-mmio is not hardened for CoCo")
 	}
 
-	if conf.ConfidentialGuest && conf.NumVCPUs() != conf.DefaultMaxVCPUs {
-		hvLogger.Warnf("Confidential guests do not support hotplugging of vCPUs. Setting DefaultMaxVCPUs to NumVCPUs (%d)", conf.NumVCPUs())
-		conf.DefaultMaxVCPUs = conf.NumVCPUs()
+	if conf.DefaultMaxVCPUs == 0 || conf.DefaultMaxVCPUs > defaultMaxVCPUs {
+		conf.DefaultMaxVCPUs = defaultMaxVCPUs
 	}
 
 	if conf.Msize9p == 0 && conf.SharedFS != config.VirtioFS {

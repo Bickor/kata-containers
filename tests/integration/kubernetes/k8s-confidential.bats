@@ -5,6 +5,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 
+load "${BATS_TEST_DIRNAME}/lib.sh"
 load "${BATS_TEST_DIRNAME}/../../common.bash"
 load "${BATS_TEST_DIRNAME}/confidential_common.sh"
 load "${BATS_TEST_DIRNAME}/tests_common.sh"
@@ -13,11 +14,11 @@ setup() {
 	if ! is_confidential_hardware; then
 		skip "Test is supported only on confidential hardware (which ${KATA_HYPERVISOR} is not)"
 	fi
+	setup_common || die "setup_common failed"
 	setup_unencrypted_confidential_pod
 }
 
 @test "Test unencrypted confidential container launch success and verify that we are running in a secure enclave." {
-	[[ " ${SUPPORTED_NON_TEE_HYPERVISORS} " =~ " ${KATA_HYPERVISOR} " ]] && skip "Test not supported for ${KATA_HYPERVISOR}."
 	# Start the service/deployment/pod
 	kubectl apply -f "${pod_config_dir}/pod-confidential-unencrypted.yaml"
 
@@ -29,6 +30,7 @@ setup() {
 
 	coco_enabled=""
 	for i in {1..6}; do
+		rm -f "${HOME}/.ssh/known_hosts"
 		if ! pod_ip=$(kubectl get pod -o wide | grep "confidential-unencrypted" | awk '{print $6;}'); then
 			warn "Failed to get pod IP address."
 		else
@@ -46,7 +48,8 @@ teardown() {
 	if ! is_confidential_hardware; then
 		skip "Test is supported only on confidential hardware (which ${KATA_HYPERVISOR} is not)"
 	fi
-	
+
 	kubectl describe "pod/${pod_name}" || true
 	kubectl delete -f "${pod_config_dir}/pod-confidential-unencrypted.yaml" || true
+	teardown_common "${node}" "${node_start_time:-}"
 }

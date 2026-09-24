@@ -19,6 +19,9 @@ import (
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
+
+	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/cpuset"
+	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
 )
 
 const waitLocalProcessTimeoutSecs = 3
@@ -579,24 +582,277 @@ func TestRevertBytes(t *testing.T) {
 	assert.Equal(expectedNum, num)
 }
 
+// TestIsDockerContainer validates hook-detection logic in isolation.
+// End-to-end Docker→containerd→kata integration is covered by
+// external tests (see tests/integration/kubernetes/).
 func TestIsDockerContainer(t *testing.T) {
 	assert := assert.New(t)
 
+	// nil spec
+	assert.False(IsDockerContainer(nil))
+
+	// nil hooks
+	assert.False(IsDockerContainer(&specs.Spec{}))
+
+	// Unrelated prestart hook
 	ociSpec := &specs.Spec{
 		Hooks: &specs.Hooks{
-			Prestart: []specs.Hook{
-				{
-					Args: []string{
-						"haha",
-					},
-				},
+			Prestart: []specs.Hook{ //nolint:all
+				{Args: []string{"haha"}},
 			},
 		},
 	}
 	assert.False(IsDockerContainer(ociSpec))
 
-	ociSpec.Hooks.Prestart = append(ociSpec.Hooks.Prestart, specs.Hook{
+	// Prestart hook with libnetwork (Docker < 26)
+	ociSpec.Hooks.Prestart = append(ociSpec.Hooks.Prestart, specs.Hook{ //nolint:all
 		Args: []string{"libnetwork-xxx"},
 	})
 	assert.True(IsDockerContainer(ociSpec))
+
+	// CreateRuntime hook with libnetwork (Docker >= 26)
+	ociSpec2 := &specs.Spec{
+		Hooks: &specs.Hooks{
+			CreateRuntime: []specs.Hook{
+				{Args: []string{"/usr/bin/docker-proxy", "libnetwork-setkey", "abc123", "ctrl"}},
+			},
+		},
+	}
+	assert.True(IsDockerContainer(ociSpec2))
+
+	// CreateRuntime hook without libnetwork
+	ociSpec3 := &specs.Spec{
+		Hooks: &specs.Hooks{
+			CreateRuntime: []specs.Hook{
+				{Args: []string{"/some/other/hook"}},
+			},
+		},
+	}
+	assert.False(IsDockerContainer(ociSpec3))
+}
+
+// TestDockerNetnsPath validates netns path discovery from OCI hook args.
+// This does not test the actual namespace opening or endpoint scanning;
+// see integration tests for full-path coverage.
+func TestDockerNetnsPath(t *testing.T) {
+	assert := assert.New(t)
+
+	// Valid 64-char hex sandbox IDs for test cases.
+	validID := strings.Repeat("ab", 32)        // 64 hex chars
+	validID2 := strings.Repeat("cd", 32)       // another 64 hex chars
+	invalidShortID := "abc123"                 // too short
+	invalidUpperID := strings.Repeat("AB", 32) // uppercase rejected
+
+	// nil spec
+	assert.Equal("", DockerNetnsPath(nil))
+
+	// nil hooks
+	assert.Equal("", DockerNetnsPath(&specs.Spec{}))
+
+	// Hook without libnetwork-setkey
+	spec := &specs.Spec{
+		Hooks: &specs.Hooks{
+			Prestart: []specs.Hook{ //nolint:all
+				{Args: []string{"/some/binary", "unrelated"}},
+			},
+		},
+	}
+	assert.Equal("", DockerNetnsPath(spec))
+
+	// Prestart hook with libnetwork-setkey but sandbox ID too short (rejected by regex)
+	spec = &specs.Spec{
+		Hooks: &specs.Hooks{
+			Prestart: []specs.Hook{ //nolint:all
+				{Args: []string{"/usr/bin/proxy", "libnetwork-setkey", invalidShortID, "ctrl"}},
+			},
+		},
+	}
+	assert.Equal("", DockerNetnsPath(spec))
+
+	// Prestart hook with libnetwork-setkey but uppercase hex (rejected by regex)
+	spec = &specs.Spec{
+		Hooks: &specs.Hooks{
+			Prestart: []specs.Hook{ //nolint:all
+				{Args: []string{"/usr/bin/proxy", "libnetwork-setkey", invalidUpperID, "ctrl"}},
+			},
+		},
+	}
+	assert.Equal("", DockerNetnsPath(spec))
+
+	// Prestart hook with valid sandbox ID but netns file doesn't exist on disk
+	spec = &specs.Spec{
+		Hooks: &specs.Hooks{
+			Prestart: []specs.Hook{ //nolint:all
+				{Args: []string{"/usr/bin/proxy", "libnetwork-setkey", validID, "ctrl"}},
+			},
+		},
+	}
+	assert.Equal("", DockerNetnsPath(spec))
+
+	// Prestart hook with libnetwork-setkey and existing netns file — success path
+	tmpDir := t.TempDir()
+	fakeNsDir := filepath.Join(tmpDir, "netns")
+	err := os.MkdirAll(fakeNsDir, 0755)
+	assert.NoError(err)
+	fakeNsFile := filepath.Join(fakeNsDir, validID)
+	err = os.WriteFile(fakeNsFile, []byte{}, 0644)
+	assert.NoError(err)
+
+	// Temporarily override dockerNetnsPrefixes so DockerNetnsPath can find
+	// the netns file we created under the temp directory.
+	origPrefixes := dockerNetnsPrefixes
+	dockerNetnsPrefixes = []string{fakeNsDir + "/"}
+	defer func() { dockerNetnsPrefixes = origPrefixes }()
+
+	spec = &specs.Spec{
+		Hooks: &specs.Hooks{
+			Prestart: []specs.Hook{ //nolint:all
+				{Args: []string{"/usr/bin/proxy", "libnetwork-setkey", validID, "ctrl"}},
+			},
+		},
+	}
+	assert.Equal(fakeNsFile, DockerNetnsPath(spec))
+
+	// Sandbox ID that is a directory rather than a regular file — must be rejected
+	dirID := validID2
+	err = os.MkdirAll(filepath.Join(fakeNsDir, dirID), 0755)
+	assert.NoError(err)
+	spec = &specs.Spec{
+		Hooks: &specs.Hooks{
+			Prestart: []specs.Hook{ //nolint:all
+				{Args: []string{"/usr/bin/proxy", "libnetwork-setkey", dirID, "ctrl"}},
+			},
+		},
+	}
+	assert.Equal("", DockerNetnsPath(spec))
+
+	// CreateRuntime hook with valid sandbox ID — file doesn't exist
+	validID3 := strings.Repeat("ef", 32)
+	spec = &specs.Spec{
+		Hooks: &specs.Hooks{
+			CreateRuntime: []specs.Hook{
+				{Args: []string{"/usr/bin/proxy", "libnetwork-setkey", validID3, "ctrl"}},
+			},
+		},
+	}
+	assert.Equal("", DockerNetnsPath(spec))
+
+	// Hook with libnetwork-setkey as last arg (no sandbox ID follows) — no panic
+	spec = &specs.Spec{
+		Hooks: &specs.Hooks{
+			Prestart: []specs.Hook{ //nolint:all
+				{Args: []string{"libnetwork-setkey"}},
+			},
+		},
+	}
+	assert.Equal("", DockerNetnsPath(spec))
+
+	// Empty args slice
+	spec = &specs.Spec{
+		Hooks: &specs.Hooks{
+			Prestart: []specs.Hook{ //nolint:all
+				{Args: []string{}},
+			},
+		},
+	}
+	assert.Equal("", DockerNetnsPath(spec))
+}
+
+func TestDistributeVCPUsProportionallySymmetric(t *testing.T) {
+	assert := assert.New(t)
+	nodes := []types.GuestNUMANode{
+		{HostCPUs: "0-3"},
+		{HostCPUs: "4-7"},
+	}
+	dist, err := DistributeVCPUsProportionally(nodes, 8)
+	assert.NoError(err)
+	assert.Equal([]uint32{4, 4}, dist)
+}
+
+func TestDistributeVCPUsProportionallyAsymmetric(t *testing.T) {
+	assert := assert.New(t)
+	nodes := []types.GuestNUMANode{
+		{HostCPUs: "0-7"},
+		{HostCPUs: "8-9"},
+	}
+	dist, err := DistributeVCPUsProportionally(nodes, 10)
+	assert.NoError(err)
+	assert.Equal([]uint32{8, 2}, dist)
+}
+
+func TestDistributeVCPUsProportionallyMinOnePerNode(t *testing.T) {
+	assert := assert.New(t)
+	nodes := []types.GuestNUMANode{
+		{HostCPUs: "0-99"},
+		{HostCPUs: "100"},
+	}
+	dist, err := DistributeVCPUsProportionally(nodes, 2)
+	assert.NoError(err)
+	assert.Equal(uint32(1), dist[0])
+	assert.Equal(uint32(1), dist[1])
+}
+
+func TestDistributeVCPUsProportionallyThreeNodes(t *testing.T) {
+	assert := assert.New(t)
+	nodes := []types.GuestNUMANode{
+		{HostCPUs: "0-5"},
+		{HostCPUs: "6-8"},
+		{HostCPUs: "9"},
+	}
+	// 6+3+1=10 host CPUs, 10 vCPUs: proportional = 6, 3, 1
+	dist, err := DistributeVCPUsProportionally(nodes, 10)
+	assert.NoError(err)
+	assert.Equal([]uint32{6, 3, 1}, dist)
+}
+
+func TestDistributeVCPUsProportionallyTooFewVCPUs(t *testing.T) {
+	assert := assert.New(t)
+	nodes := []types.GuestNUMANode{
+		{HostCPUs: "0"},
+		{HostCPUs: "1"},
+		{HostCPUs: "2"},
+	}
+	_, err := DistributeVCPUsProportionally(nodes, 2)
+	assert.Error(err)
+	assert.Contains(err.Error(), "must be >= NUMA node count")
+}
+
+func TestFilterNUMANodesByCPUSet(t *testing.T) {
+	assert := assert.New(t)
+
+	nodes := []types.GuestNUMANode{
+		{HostNodes: "0", HostCPUs: "0-55,112-167"},
+		{HostNodes: "1", HostCPUs: "56-111,168-223"},
+	}
+
+	// Sandbox cpuset only from node 0 -> should return 1 node
+	sandboxCPUs, _ := cpuset.Parse("1-40,113-152")
+	filtered := FilterNUMANodesByCPUSet(nodes, sandboxCPUs)
+	assert.Len(filtered, 1)
+	assert.Equal("0", filtered[0].HostNodes)
+
+	// Sandbox cpuset from both nodes -> should return 2 nodes
+	sandboxCPUs, _ = cpuset.Parse("1-40,56-80")
+	filtered = FilterNUMANodesByCPUSet(nodes, sandboxCPUs)
+	assert.Len(filtered, 2)
+
+	// Sandbox cpuset only from node 1 -> should return 1 node
+	sandboxCPUs, _ = cpuset.Parse("60-70,170-180")
+	filtered = FilterNUMANodesByCPUSet(nodes, sandboxCPUs)
+	assert.Len(filtered, 1)
+	assert.Equal("1", filtered[0].HostNodes)
+
+	// Empty cpuset -> no filtering, return all
+	emptyCPUs := cpuset.NewCPUSet()
+	filtered = FilterNUMANodesByCPUSet(nodes, emptyCPUs)
+	assert.Len(filtered, 2)
+
+	// Single-node host (1 NUMA node) -> returns 1 regardless
+	singleNode := []types.GuestNUMANode{
+		{HostNodes: "0", HostCPUs: "0-7"},
+	}
+	sandboxCPUs, _ = cpuset.Parse("0-3")
+	filtered = FilterNUMANodesByCPUSet(singleNode, sandboxCPUs)
+	assert.Len(filtered, 1)
+	assert.Equal("0", filtered[0].HostNodes)
 }

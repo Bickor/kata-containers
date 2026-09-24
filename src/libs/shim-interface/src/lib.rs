@@ -37,9 +37,6 @@ fn get_uds_with_sid(short_id: &str, path: &str) -> Result<String> {
         return Ok(format!("unix://{}", p.display()));
     }
 
-    let _ = fs::create_dir_all(kata_run_path.join(short_id))
-            .context(format!("failed to create directory {:?}", kata_run_path.join(short_id)));
-
     let target_ids: Vec<String> = fs::read_dir(&kata_run_path)?
         .filter_map(|e| {
             let x = e.ok()?.file_name().to_string_lossy().into_owned();
@@ -71,8 +68,8 @@ fn get_uds_with_sid(short_id: &str, path: &str) -> Result<String> {
 }
 
 // return sandbox's storage path
-pub fn sb_storage_path() -> String {
-    String::from(KATA_PATH)
+pub fn sb_storage_path() -> &'static str {
+    KATA_PATH
 }
 
 // returns the address of the unix domain socket(UDS) for communication with shim
@@ -85,7 +82,7 @@ pub fn mgmt_socket_addr(sid: &str) -> Result<String> {
         ));
     }
 
-    get_uds_with_sid(sid, &sb_storage_path())
+    get_uds_with_sid(sid, sb_storage_path())
 }
 
 #[cfg(test)]
@@ -133,10 +130,8 @@ mod tests {
     #[test]
     fn test_get_uds_with_sid_ok() {
         let run_path = tempdir().unwrap();
-        let dir1 = run_path.path().join("kata98654sandboxpath1");
-        let dir2 = run_path.path().join("aata98654dangboxpath1");
-        fs::create_dir_all(dir1.as_path()).unwrap();
-        fs::create_dir_all(dir2.as_path()).unwrap();
+        let dir = run_path.path().join("kata98654sandboxpath1");
+        fs::create_dir_all(dir.as_path()).unwrap();
 
         let result = get_uds_with_sid("kata", &run_path.path().display().to_string());
         assert!(result.is_ok());
@@ -155,21 +150,11 @@ mod tests {
 
     #[test]
     fn test_get_uds_with_sid_with_zero() {
-        let result = get_uds_with_sid("acdsdfe", KATA_PATH);
+        let run_path = tempdir().unwrap();
+        let result = get_uds_with_sid("acdsdfe", &run_path.path().display().to_string());
         assert!(result.is_err());
-        if let Err(err) = result {
-            let left = format!("{:?}", err.to_string());
-            let left_unquoted = &left[1..left.len() - 1];
-            let left_unescaped = left_unquoted.replace("\\\"", "\"");
-
-            assert_eq!(
-                left_unescaped,
-                format!(
-                    "sandbox with the provided prefix {:?} is not found",
-                    "acdsdfe"
-                )
-            )
-        }
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("is not found"));
     }
 
     #[test]

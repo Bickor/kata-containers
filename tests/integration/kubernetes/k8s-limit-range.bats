@@ -5,17 +5,18 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 
+load "${BATS_TEST_DIRNAME}/lib.sh"
 load "${BATS_TEST_DIRNAME}/../../common.bash"
 load "${BATS_TEST_DIRNAME}/tests_common.sh"
 
 setup() {
-	get_pod_config_dir
+	setup_common || die "setup_common failed"
+
 	namespace_name="default-cpu-example"
 	pod_name="default-cpu-test"
 	pod_yaml="${pod_config_dir}/pod-cpu-defaults.yaml"
 
 	policy_settings_dir="$(create_tmp_policy_settings_dir "${pod_config_dir}")"
-	set_namespace_to_policy_settings "${policy_settings_dir}" "${namespace_name}"
 	auto_generate_policy "${policy_settings_dir}" "${pod_yaml}"
 }
 
@@ -45,4 +46,5 @@ teardown() {
 	kubectl delete namespaces "$namespace_name"
 
 	delete_tmp_policy_settings_dir "${policy_settings_dir}"
+	teardown_common "${node}" "${node_start_time:-}"
 }

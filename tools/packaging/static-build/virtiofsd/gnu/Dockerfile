@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-FROM ubuntu:20.04
+FROM ubuntu:22.04
 ENV DEBIAN_FRONTEND=noninteractive
 ARG RUST_TOOLCHAIN
 
@@ -12,7 +12,7 @@ ENV PATH="/opt/cargo/bin/:${PATH}"
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-RUN mkdir ${RUSTUP_HOME} ${CARGO_HOME} && chmod -R a+rwX ${RUSTUP_HOME} ${CARGO_HOME}
+RUN mkdir ${RUSTUP_HOME} ${CARGO_HOME}
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
@@ -24,7 +24,8 @@ RUN apt-get update && \
         libseccomp-dev \
         unzip && \
     apt-get clean && rm -rf /var/lib/lists/ && \
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain ${RUST_TOOLCHAIN}
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain ${RUST_TOOLCHAIN} && \
+    chmod -R a+rwX ${RUSTUP_HOME} ${CARGO_HOME}
 
 RUN ARCH=$(uname -m); \
     	rust_arch=""; \
@@ -34,6 +35,7 @@ RUN ARCH=$(uname -m); \
        	case "${ARCH}" in \
             "aarch64") rust_arch="${ARCH}"; libc="musl"; arch_libc="" ;; \
             "ppc64le") rust_arch="powerpc64le"; libc="gnu"; arch_libc=${rust_arch}-linux-${libc}; extra_rust_flags="" ;; \
+            "riscv64") rust_arch="riscv64gc"; libc="gnu"; arch_libc=${ARCH}-linux-${libc}; extra_rust_flags="" ;; \
             "x86_64") rust_arch="${ARCH}"; libc="musl"; arch_libc="" ;; \
             "s390x") rust_arch="${ARCH}"; libc="gnu"; arch_libc=${rust_arch}-linux-${libc}; extra_rust_flags="" ;; \
             *) echo "Unsupported architecture: ${ARCH}" && exit 1 ;; \

@@ -33,7 +33,7 @@ use super::{
 };
 use crate::network::NetworkInfo;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct NetworkWithNetNsConfig {
     pub network_model: String,
     pub netns_path: String,
@@ -102,7 +102,18 @@ impl Network for NetworkWithNetns {
         let inner = self.inner.read().await;
         let mut interfaces = vec![];
         for e in &inner.entity_list {
-            interfaces.push(e.network_info.interface().await.context("interface")?);
+            let mut iface = e.network_info.interface().await.context("interface")?;
+            // For cold-plugged physical (VFIO) endpoints, fill device_path
+            // with the guest PCI path so the agent can do PCI-path-based MAC
+            // reconciliation for IB/RoCE VFs. device_path is empty by default
+            // because network_info_from_link builds the Interface before
+            // attach() runs.
+            if iface.device_path.is_empty() {
+                if let Some(pci_path) = e.endpoint.guest_pci_path().await {
+                    iface.device_path = pci_path;
+                }
+            }
+            interfaces.push(iface);
         }
         Ok(interfaces)
     }
@@ -140,23 +151,68 @@ impl Network for NetworkWithNetns {
 
     async fn remove(&self, h: &dyn Hypervisor) -> Result<()> {
         let inner = self.inner.read().await;
-        // The network namespace would have been deleted at this point
-        // if it has not been created by virtcontainers.
-        if !inner.network_created {
-            return Ok(());
-        }
+
+        // Always detach endpoints regardless of whether kata created the netns.
+        // Physical endpoints rebind their VF from vfio-pci back to the original
+        // host driver here.  Skipping this when network_created=false would
+        // permanently leave VFs bound to vfio-pci after pod deletion.
         {
             let _netns_guard =
                 netns::NetnsGuard::new(&inner.netns_path).context("net netns guard")?;
             for e in &inner.entity_list {
-                e.endpoint.detach(h).await.context("detach")?;
+                if let Err(err) = e.endpoint.detach(h).await {
+                    warn!(sl!(), "failed to detach endpoint: {}", err);
+                }
             }
+        }
+
+        // Only delete the network namespace if kata created it.
+        // If the CNI created the netns, it will be cleaned up by the CNI.
+        if !inner.network_created {
+            return Ok(());
         }
         let netns = get_from_path(inner.netns_path.clone())?;
         netns.remove()?;
         fs::remove_dir_all(inner.netns_path.clone()).context("failed to remove netns path")?;
         Ok(())
     }
+
+    async fn endpoints(&self) -> Vec<std::sync::Arc<dyn crate::network::endpoint::Endpoint>> {
+        let inner = self.inner.read().await;
+        inner
+            .entity_list
+            .iter()
+            .map(|e| e.endpoint.clone())
+            .collect()
+    }
+}
+
+/// Lightweight probe: enter the netns and check whether any non-loopback
+/// interface with at least one IP address exists.  Does NOT create endpoints
+/// or attach anything to the hypervisor.
+pub(crate) async fn netns_has_interfaces(netns_path: &str) -> Result<bool> {
+    let _netns_guard = netns::NetnsGuard::new(netns_path).context("netns guard for scan")?;
+    let (connection, handle, _) = rtnetlink::new_connection().context("new connection")?;
+    let thread_handler = tokio::spawn(connection);
+    defer!({
+        thread_handler.abort();
+    });
+
+    let mut links = handle.link().get().execute();
+    while let Some(msg) = links.try_next().await? {
+        let link = link::get_link_from_message(msg);
+        let attrs = link.attrs();
+        if (attrs.flags & libc::IFF_LOOPBACK as u32) != 0 {
+            continue;
+        }
+        let addrs = handle_addresses(&handle, attrs)
+            .await
+            .context("handle addresses")?;
+        if !addrs.is_empty() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 async fn get_entity_from_netns(
@@ -240,7 +296,13 @@ async fn create_endpoint(
             "{} network interface found: {}", &link_type, &attrs.name
         );
         match link_type {
-            "veth" => {
+            // "device" is the generic netlink type for interfaces whose
+            // drivers do not register a more specific kind. This includes
+            // mlx5 Scalable Functions (SFs) and other non-PCI backed
+            // netdevs that is_physical_iface() cannot classify via
+            // ethtool BusInfo. Handle them the same way as veth
+            // endpoints, using the configured network model.
+            "veth" | "device" => {
                 let ret = VethEndpoint::new(
                     &d,
                     handle,
@@ -250,7 +312,7 @@ async fn create_endpoint(
                     config.queues,
                 )
                 .await
-                .context("veth endpoint")?;
+                .context(anyhow!("{link_type} endpoint"))?;
                 Arc::new(ret)
             }
             "vlan" => {

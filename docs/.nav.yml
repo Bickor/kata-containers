@@ -1,0 +1,25 @@
+# https://lukasgeiter.github.io/mkdocs-awesome-nav/
+nav:
+  - Home:
+    - index.md
+    - Getting Started:
+      - prerequisites.md
+      - installation.md
+    - Configuration:
+        - Helm: helm-configuration.md
+        - Runtime: runtime-configuration.md
+        - Annotations: pod-annotations.md
+  - Platform Support:
+    - hypervisors.md
+  - Guides:
+    - Use Cases:
+      - NVIDIA GPU Passthrough: use-cases/NVIDIA-GPU-passthrough-and-Kata-QEMU.md
+      - NVIDIA vGPU: use-cases/NVIDIA-GPU-passthrough-and-Kata.md
+      - Intel QAT: use-cases/using-Intel-QAT-and-kata.md
+    - How To:
+      - NUMA Support: how-to/how-to-use-numa-with-kata.md
+      - Local Builds & Deployment: how-to/how-to-build-and-deploy-local-artifacts.md
+    - Contributing:
+      - Documentation: doc-contributing.md
+  - Misc:
+    - Architecture: design/architecture/

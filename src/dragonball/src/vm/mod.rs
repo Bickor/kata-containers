@@ -1,8 +1,11 @@
 // Copyright (C) 2021 Alibaba Cloud. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::HashMap;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::ops::Deref;
+#[cfg(target_arch = "x86_64")]
+use std::os::unix::io::AsRawFd;
 use std::os::unix::io::RawFd;
 
 use std::sync::{Arc, Mutex, RwLock};
@@ -12,14 +15,17 @@ use dbs_address_space::AddressSpace;
 use dbs_arch::gic::GICDevice;
 #[cfg(target_arch = "aarch64")]
 use dbs_arch::pmu::PmuError;
-use dbs_boot::InitrdConfig;
+use dbs_boot::{FirmwareType, InitrdConfig};
 use dbs_utils::epoll_manager::EpollManager;
 use dbs_utils::time::TimestampUs;
 use kvm_ioctls::VmFd;
 use linux_loader::loader::{KernelLoader, KernelLoaderResult};
 use seccompiler::BpfProgram;
+use seccompiler::{apply_filter_all_threads, Error as SecError};
 use serde_derive::{Deserialize, Serialize};
 use slog::{error, info};
+#[cfg(target_arch = "x86_64")]
+use tdx::launch::*;
 use vm_memory::{Bytes, GuestAddress, GuestAddressSpace};
 use vmm_sys_util::eventfd::EventFd;
 
@@ -32,16 +38,18 @@ use crate::address_space_manager::{
     AddressManagerError, AddressSpaceMgr, AddressSpaceMgrBuilder, GuestAddressSpaceImpl,
     GuestMemoryImpl,
 };
+use crate::api::v1::ConfidentialVmType;
 use crate::api::v1::{InstanceInfo, InstanceState};
 use crate::device_manager::console_manager::DmesgWriter;
 use crate::device_manager::{DeviceManager, DeviceMgrError, DeviceOpContext};
-use crate::error::{LoadInitrdError, Result, StartMicroVmError, StopMicrovmError};
+use crate::error::{Error, LoadInitrdError, Result, StartMicroVmError, StopMicrovmError};
 use crate::event_manager::EventManager;
 use crate::kvm_context::KvmContext;
 use crate::resource_manager::ResourceManager;
 use crate::vcpu::{VcpuManager, VcpuManagerError};
 #[cfg(feature = "hotplug")]
 use crate::vcpu::{VcpuResizeError, VcpuResizeInfo};
+use crate::{ALL_THREADS, VCPU_THREAD, VMM_THREAD};
 #[cfg(target_arch = "aarch64")]
 use dbs_arch::gic::Error as GICError;
 
@@ -208,6 +216,13 @@ pub struct Vm {
 
     #[cfg(all(feature = "hotplug", feature = "dbs-upcall"))]
     upcall_client: Option<Arc<UpcallClient<DevMgrService>>>,
+
+    firmware_type: Option<FirmwareType>,
+
+    #[cfg(target_arch = "x86_64")]
+    tdx_launcher: Option<Launcher>,
+    #[cfg(target_arch = "x86_64")]
+    tdx_capabilities: Option<TdxCapabilities>,
 }
 
 impl Vm {
@@ -220,6 +235,16 @@ impl Vm {
         let id = api_shared_info.read().unwrap().id.clone();
         let logger = slog_scope::logger().new(slog::o!("id" => id));
         let kvm = KvmContext::new(kvm_fd)?;
+        #[cfg(target_arch = "x86_64")]
+        let tdx_enabled =
+            api_shared_info.read().unwrap().confidential_vm_type == Some(ConfidentialVmType::TDX);
+        #[cfg(target_arch = "x86_64")]
+        let vm_fd = if tdx_enabled {
+            Arc::new(kvm.create_vm_with_type(KVM_X86_TDX_VM)?)
+        } else {
+            Arc::new(kvm.create_vm()?)
+        };
+        #[cfg(not(target_arch = "x86_64"))]
         let vm_fd = Arc::new(kvm.create_vm()?);
         let resource_manager = Arc::new(ResourceManager::new(Some(kvm.max_memslots())));
         let device_manager = DeviceManager::new(
@@ -228,7 +253,27 @@ impl Vm {
             epoll_manager.clone(),
             &logger,
             api_shared_info.clone(),
-        );
+        )
+        .map_err(Error::DeviceMgrError)?;
+
+        #[cfg(target_arch = "x86_64")]
+        let firmware_type = if tdx_enabled {
+            Some(FirmwareType::Tdshim)
+        } else {
+            None
+        };
+
+        #[cfg(not(target_arch = "x86_64"))]
+        let firmware_type = None;
+
+        #[cfg(target_arch = "x86_64")]
+        let (tdx_launcher, tdx_capabilities) = if tdx_enabled {
+            let mut launcher = Launcher::new(vm_fd.as_raw_fd());
+            let capabilities = launcher.get_capabilities().map_err(Error::TdxError)?;
+            (Some(launcher), Some(capabilities))
+        } else {
+            (None, None)
+        };
 
         Ok(Vm {
             epoll_manager,
@@ -254,6 +299,13 @@ impl Vm {
             irqchip_handle: None,
             #[cfg(all(feature = "hotplug", feature = "dbs-upcall"))]
             upcall_client: None,
+
+            firmware_type,
+
+            #[cfg(target_arch = "x86_64")]
+            tdx_launcher,
+            #[cfg(target_arch = "x86_64")]
+            tdx_capabilities,
         })
     }
 
@@ -404,6 +456,15 @@ impl Vm {
             AddressManagerError::GuestMemoryNotInitialized,
         ))
     }
+
+    /// Get confidential VM type for micro VM, if any
+    pub fn confidential_vm_type(&self) -> Option<ConfidentialVmType> {
+        self.shared_info
+            .read()
+            .unwrap()
+            .confidential_vm_type
+            .clone()
+    }
 }
 
 impl Vm {
@@ -421,6 +482,8 @@ impl Vm {
             self.shared_info.clone(),
             self.device_manager.io_manager(),
             self.epoll_manager.clone(),
+            #[cfg(target_arch = "x86_64")]
+            self.device_manager.irq_manager(),
         )?;
         self.vcpu_manager = Some(vcpu_manager);
 
@@ -591,6 +654,9 @@ impl Vm {
         let mut address_space_param = AddressSpaceMgrBuilder::new(&mem_type, &mem_file_path)
             .map_err(StartMicroVmError::AddressManagerError)?;
         address_space_param.set_kvm_vm_fd(self.vm_fd.clone());
+        address_space_param.toggle_use_firmware(self.firmware_type.is_some());
+        #[cfg(target_arch = "x86_64")]
+        address_space_param.toggle_kvm_mem_attr_private(self.kvm_mem_attr_private());
         self.address_space
             .create_address_space(&self.resource_manager, &numa_regions, address_space_param)
             .map_err(StartMicroVmError::AddressManagerError)?;
@@ -638,7 +704,7 @@ impl Vm {
         image: &mut F,
     ) -> std::result::Result<InitrdConfig, LoadInitrdError>
     where
-        F: Read + Seek,
+        F: Read + Seek + vm_memory::ReadVolatile,
     {
         use crate::error::LoadInitrdError::*;
 
@@ -662,7 +728,7 @@ impl Vm {
 
         // Load the image into memory
         vm_memory
-            .read_from(GuestAddress(address), image, size)
+            .read_volatile_from(GuestAddress(address), image, size)
             .map_err(|_| LoadInitrd)?;
 
         Ok(InitrdConfig {
@@ -708,10 +774,27 @@ impl Vm {
     pub fn start_microvm(
         &mut self,
         event_mgr: &mut EventManager,
-        vmm_seccomp_filter: BpfProgram,
-        vcpu_seccomp_filter: BpfProgram,
+        seccomp_filters: HashMap<String, BpfProgram>,
     ) -> std::result::Result<(), StartMicroVmError> {
         info!(self.logger, "VM: received instance start command");
+
+        if let Some(process_seccomp_filter) = seccomp_filters.get(ALL_THREADS) {
+            // Load seccomp filters for the whole process.
+            // Execution panics if filters cannot be loaded, use --seccomp-level=0 if skipping filters
+            // altogether is the desired behaviour.
+            if let Err(e) = apply_filter_all_threads(process_seccomp_filter) {
+                if !matches!(e, SecError::EmptyFilter) {
+                    error!(
+                        self.logger,
+                        "VM: failed to apply process-wide seccomp filters: {}", e
+                    );
+                    return Err(StartMicroVmError::SeccompFilters(e));
+                }
+            } else {
+                info!(self.logger, "VM: process-wide seccomp filters applied");
+            }
+        }
+
         if self.is_vm_initialized() {
             return Err(StartMicroVmError::MicroVMAlreadyRunning);
         }
@@ -737,8 +820,19 @@ impl Vm {
                 AddressManagerError::GuestMemoryNotInitialized,
             ))?;
 
-        self.init_vcpu_manager(vm_as.clone(), vcpu_seccomp_filter)
-            .map_err(StartMicroVmError::Vcpu)?;
+        #[cfg(target_arch = "x86_64")]
+        if self.confidential_vm_type() == Some(ConfidentialVmType::TDX) {
+            self.tdx_init_vm()?;
+        }
+
+        self.init_vcpu_manager(
+            vm_as.clone(),
+            seccomp_filters
+                .get(VCPU_THREAD)
+                .cloned()
+                .unwrap_or_default(),
+        )
+        .map_err(StartMicroVmError::Vcpu)?;
         self.init_microvm(event_mgr.epoll_manager(), vm_as.clone(), request_ts)?;
         self.init_configure_system(&vm_as)?;
         #[cfg(feature = "dbs-upcall")]
@@ -750,7 +844,7 @@ impl Vm {
         info!(self.logger, "VM: start vcpus");
         self.vcpu_manager()
             .map_err(StartMicroVmError::Vcpu)?
-            .start_boot_vcpus(vmm_seccomp_filter)
+            .start_boot_vcpus(seccomp_filters.get(VMM_THREAD).cloned().unwrap_or_default())
             .map_err(StartMicroVmError::Vcpu)?;
 
         // Use expect() to crash if the other thread poisoned this lock.
@@ -832,7 +926,7 @@ impl Vm {
     pub fn resize_vcpu(
         &mut self,
         config: VcpuResizeInfo,
-        sync_tx: Option<Sender<bool>>,
+        sync_tx: Option<Sender<Option<i32>>>,
     ) -> std::result::Result<(), VcpuResizeError> {
         if self.upcall_client().is_none() {
             Err(VcpuResizeError::UpcallClientMissing)
@@ -874,6 +968,8 @@ impl Vm {
     }
 }
 
+/// Unit test module for methods of struct Vm, and helper functions to shorten
+/// test code.
 #[cfg(test)]
 pub mod tests {
     #[cfg(target_arch = "aarch64")]
@@ -881,7 +977,7 @@ pub mod tests {
     #[cfg(target_arch = "x86_64")]
     use kvm_ioctls::VcpuExit;
     use linux_loader::cmdline::Cmdline;
-    use test_utils::skip_if_not_root;
+    use test_utils::skip_if_kvm_unaccessable;
     use vm_memory::GuestMemory;
     use vmm_sys_util::tempfile::TempFile;
 
@@ -889,6 +985,7 @@ pub mod tests {
     use crate::test_utils::tests::create_vm_for_test;
 
     impl Vm {
+        /// Helper function to forch change `mstate` of Vms
         pub fn set_instance_state(&mut self, mstate: InstanceState) {
             self.shared_info
             .write()
@@ -897,6 +994,7 @@ pub mod tests {
         }
     }
 
+    /// Helper function to create dummy Vm instance for testing purpose
     pub fn create_vm_instance() -> Vm {
         let instance_info = Arc::new(RwLock::new(InstanceInfo::default()));
         let epoll_manager = EpollManager::default();
@@ -905,7 +1003,7 @@ pub mod tests {
 
     #[test]
     fn test_create_vm_instance() {
-        skip_if_not_root!();
+        skip_if_kvm_unaccessable!();
         let vm = create_vm_instance();
         assert!(vm.check_health().is_err());
         assert!(vm.kernel_config.is_none());
@@ -917,7 +1015,7 @@ pub mod tests {
 
     #[test]
     fn test_vm_init_guest_memory() {
-        skip_if_not_root!();
+        skip_if_kvm_unaccessable!();
         let vm_config = VmConfigInfo {
             vcpu_count: 1,
             max_vcpu_count: 3,
@@ -991,7 +1089,7 @@ pub mod tests {
 
     #[test]
     fn test_vm_create_devices() {
-        skip_if_not_root!();
+        skip_if_kvm_unaccessable!();
         let epoll_mgr = EpollManager::default();
         let vmm = Arc::new(Mutex::new(crate::vmm::tests::create_vmm_instance(
             epoll_mgr.clone(),
@@ -1039,6 +1137,7 @@ pub mod tests {
             kernel_file.into_file(),
             None,
             cmd_line,
+            None,
         ));
 
         vm.init_devices(epoll_mgr).unwrap();
@@ -1046,7 +1145,7 @@ pub mod tests {
 
     #[test]
     fn test_vm_delete_devices() {
-        skip_if_not_root!();
+        skip_if_kvm_unaccessable!();
         let mut vm = create_vm_for_test();
         let epoll_mgr = EpollManager::default();
 
@@ -1058,7 +1157,7 @@ pub mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_run_code() {
-        skip_if_not_root!();
+        skip_if_kvm_unaccessable!();
 
         use std::io::{self, Write};
         // This example is based on https://lwn.net/Articles/658511/
@@ -1101,7 +1200,7 @@ pub mod tests {
         let vm_memory = vm.address_space.vm_memory().unwrap();
         vm_memory.write_obj(code, load_addr).unwrap();
 
-        let vcpu_fd = vm.vm_fd().create_vcpu(0).unwrap();
+        let mut vcpu_fd = vm.vm_fd().create_vcpu(0).unwrap();
         let mut vcpu_sregs = vcpu_fd.get_sregs().unwrap();
         assert_ne!(vcpu_sregs.cs.base, 0);
         assert_ne!(vcpu_sregs.cs.selector, 0);

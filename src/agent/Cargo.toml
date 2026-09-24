@@ -1,111 +1,108 @@
 [package]
 name = "kata-agent"
 version = "0.1.0"
-authors = ["The Kata Containers community <kata-dev@lists.katacontainers.io>"]
-edition = "2018"
-license = "Apache-2.0"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [dependencies]
-runtime-spec = { path = "../libs/runtime-spec" }
-oci-spec = { version = "0.6.8", features = ["runtime"] }
-rustjail = { path = "rustjail" }
-protocols = { path = "../libs/protocols", features = ["async", "with-serde"] }
-lazy_static = "1.3.0"
-ttrpc = { version = "0.8", features = ["async"], default-features = false }
-protobuf = "3.2.0"
-libc = "0.2.58"
-nix = "0.24.2"
-capctl = "0.2.0"
-serde_json = "1.0.39"
-scan_fmt = "0.2.3"
-scopeguard = "1.0.0"
-thiserror = "1.0.26"
-regex = "1.10.5"
-serial_test = "0.5.1"
-url = "2.5.0"
-derivative = "2.2.0"
-kata-sys-util = { path = "../libs/kata-sys-util" }
-kata-types = { path = "../libs/kata-types" }
-safe-path = { path = "../libs/safe-path" }
-const_format = "0.2.30"
+oci-spec.workspace = true
+lazy_static.workspace = true
+ttrpc.workspace = true
+protobuf.workspace = true
+libc.workspace = true
+nix.workspace = true
+capctl.workspace = true
+serde_json.workspace = true
+scan_fmt.workspace = true
+scopeguard.workspace = true
+thiserror.workspace = true
+regex.workspace = true
+serial_test.workspace = true
+url.workspace = true
+derivative.workspace = true
+const_format.workspace = true
 
 # Async helpers
-async-trait = "0.1.42"
-async-recursion = "0.3.2"
-futures = "0.3.30"
+async-trait.workspace = true
+async-recursion.workspace = true
+futures.workspace = true
 
 # Async runtime
-tokio = { version = "1.39.0", features = ["full"] }
-tokio-vsock = "0.3.4"
+tokio.workspace = true
+tokio-vsock.workspace = true
 
-netlink-sys = { version = "0.7.0", features = ["tokio_socket"] }
-rtnetlink = "0.8.0"
-netlink-packet-utils = "0.4.1"
-ipnetwork = "0.17.0"
+netlink-sys.workspace = true
+rtnetlink.workspace = true
+netlink-packet-route.workspace = true
+netlink-packet-core.workspace = true
+ipnetwork.workspace = true
 
-# Note: this crate sets the slog 'max_*' features which allows the log level
-# to be modified at runtime.
-logging = { path = "../libs/logging" }
-slog = "2.5.2"
-slog-scope = "4.1.2"
-slog-term = "2.9.0"
+slog.workspace = true
+slog-scope.workspace = true
+slog-term.workspace = true
 
 # Redirect ttrpc log calls
-slog-stdlog = "4.0.0"
-log = "0.4.11"
+slog-stdlog.workspace = true
+log.workspace = true
 
-cfg-if = "1.0.0"
-prometheus = { version = "0.13.0", features = ["process"] }
-procfs = "0.12.0"
+cfg-if.workspace = true
+prometheus.workspace = true
+procfs.workspace = true
 
-anyhow = "1"
+anyhow.workspace = true
 
-cgroups = { package = "cgroups-rs", version = "0.3.3" }
+cgroups.workspace = true
 
 # Tracing
-tracing = "0.1.26"
-tracing-subscriber = "0.2.18"
-tracing-opentelemetry = "0.13.0"
-opentelemetry = { version = "0.14.0", features = ["rt-tokio-current-thread"] }
-vsock-exporter = { path = "vsock-exporter" }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+# TODO: bump tracing-opentelemetry to sync with version in workspace
+tracing-opentelemetry = "0.17.0"
+opentelemetry.workspace = true
 
 # Configuration
-serde = { version = "1.0.129", features = ["derive"] }
-toml = "0.5.8"
-clap = { version = "3.0.1", features = ["derive"] }
-strum = "0.26.2"
-strum_macros = "0.26.2"
+serde.workspace = true
+toml.workspace = true
+clap.workspace = true
+strum.workspace = true
+strum_macros.workspace = true
 
-# Image pull/decrypt
-image-rs = { git = "https://github.com/confidential-containers/guest-components", rev = "v0.10.0", default-features = false, optional = true }
+# Local dependencies
+kata-agent-policy = { workspace = true, optional = true }
+mem-agent.workspace = true
+rustjail.workspace = true
+protocols = { workspace = true, features = ["async", "with-serde"] }
+kata-sys-util.workspace = true
+kata-types.workspace = true
+runtime-spec.workspace = true
+safe-path.workspace = true
+# Note: this crate sets the slog 'max_*' features which allows the log level
+# to be modified at runtime.
+logging.workspace = true
+vsock-exporter.workspace = true
 
-# Agent Policy
-regorus = { version = "0.1.4", default-features = false, features = [
-    "arc",
-    "regex",
-], optional = true }
+# Initdata
+base64 = { workspace = true }
+sha2 = "0.10.8"
+async-compression = { version = "0.4.22", features = ["tokio", "gzip"] }
+
+container-device-interface = "0.1.1"
+
+[target.'cfg(target_arch = "s390x")'.dependencies]
+pv_core = { git = "https://github.com/ibm-s390-linux/s390-tools", rev = "4942504a9a2977d49989a5e5b7c1c8e07dc0fa41", package = "s390_pv_core" }
 
 [dev-dependencies]
-tempfile = "3.1.0"
-test-utils = { path = "../libs/test-utils" }
-which = "4.3.0"
-rstest = "0.18.0"
-async-std = { version = "1.12.0", features = ["attributes"] }
+tempfile.workspace = true
+which.workspace = true
+rstest.workspace = true
 
-[workspace]
-members = ["rustjail"]
+test-utils.workspace = true
 
 [profile.release]
 lto = true
 
 [features]
-# The default-pull feature would support all pull types, including sharing images by virtio-fs and pulling images in the guest
-default-pull = ["guest-pull"]
 seccomp = ["rustjail/seccomp"]
-standard-oci-runtime = ["rustjail/standard-oci-runtime"]
-agent-policy = ["regorus"]
-guest-pull = ["image-rs/kata-cc-rustls-tls"]
-
-[[bin]]
-name = "kata-agent"
-path = "src/main.rs"
+agent-policy = ["kata-agent-policy"]
+init-data = []

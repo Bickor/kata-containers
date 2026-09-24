@@ -8,14 +8,13 @@ kind: Pod
 metadata:
   name: constraints-cpu-test
 spec:
-  terminationGracePeriodSeconds: 0
   runtimeClassName: kata
   containers:
   - name: first-cpu-container
     image: quay.io/prometheus/busybox:latest
     command:
         - sleep
-        - "30"
+        - "infinity"
     resources:
       limits:
         cpu: "1"

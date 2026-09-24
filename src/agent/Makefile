@@ -41,35 +41,21 @@ ifeq ($(AGENT_POLICY),yes)
     override EXTRA_RUSTFEATURES += agent-policy
 endif
 
-##VAR PULL_TYPE=default|guest-pull define if agent enables the guest pull image feature
-PULL_TYPE ?= default
-ifeq ($(PULL_TYPE),default)
-    override EXTRA_RUSTFEATURES += default-pull
-# Enable guest pull image feature of rust build
-else ifeq ($(PULL_TYPE),guest-pull)
-    override EXTRA_RUSTFEATURES += guest-pull
-endif
+##VAR INIT_DATA=yes|no define if agent enables the init data feature
+INIT_DATA ?= yes
 
+# Enable the init data fature of rust build
+ifeq ($(INIT_DATA),yes)
+    override EXTRA_RUSTFEATURES += init-data
+endif
 
 include ../../utils.mk
-
-ifeq ($(ARCH), ppc64le)
-    override ARCH = powerpc64le
-endif
-
-##VAR STANDARD_OCI_RUNTIME=yes|no define if agent enables standard oci runtime feature
-STANDARD_OCI_RUNTIME := no
-
-# Enable standard oci runtime feature of rust build
-ifeq ($(STANDARD_OCI_RUNTIME),yes)
-    override EXTRA_RUSTFEATURES += standard-oci-runtime
-endif
 
 ifneq ($(EXTRA_RUSTFEATURES),)
     override EXTRA_RUSTFEATURES := --features "$(EXTRA_RUSTFEATURES)"
 endif
 
-TARGET_PATH = target/$(TRIPLE)/$(BUILD_TYPE)/$(TARGET)
+TARGET_PATH = ../../target/$(TRIPLE)/$(BUILD_TYPE)/$(TARGET)
 
 ##VAR DESTDIR=<path> is a directory prepended to each installed target file
 DESTDIR ?=
@@ -136,7 +122,7 @@ $(TARGET): $(GENERATED_CODE) $(TARGET_PATH)
 $(TARGET_PATH): show-summary
 	@RUSTFLAGS="$(EXTRA_RUSTFLAGS) --deny warnings" cargo build --target $(TRIPLE) $(if $(findstring release,$(BUILD_TYPE)),--release) $(EXTRA_RUSTFEATURES)
 
-$(GENERATED_FILES): %: %.in
+$(GENERATED_FILES): %: %.in $(VERSION_FILE)
 	@sed $(foreach r,$(GENERATED_REPLACEMENTS),-e 's|@$r@|$($r)|g') "$<" > "$@"
 
 ##TARGET optimize: optimized  build
@@ -153,13 +139,9 @@ clean:
 	@rm -f $(GENERATED_FILES)
 	@rm -f tarpaulin-report.html
 
-vendor:
-	@cargo vendor
-
-
 #TARGET test: run cargo tests
 test: $(GENERATED_FILES)
-	@RUST_LIB_BACKTRACE=0 RUST_BACKTRACE=1 cargo test --all --target $(TRIPLE) $(EXTRA_RUSTFEATURES) -- --nocapture
+	@RUST_LIB_BACKTRACE=0 RUST_BACKTRACE=1 cargo test -p kata-agent --target $(TRIPLE) $(EXTRA_RUSTFEATURES) -- --nocapture
 
 ##TARGET check: run test
 check: $(GENERATED_FILES) standard_rust_check
@@ -226,9 +208,15 @@ codecov-html: check_tarpaulin
 	help \
 	optimize \
 	show-header \
-	show-summary \
-	vendor
+	show-summary
 
 ##TARGET generate-protocols: generate/update grpc agent protocols
 generate-protocols:
+	image=$$(docker build -q \
+	  --build-arg GO_VERSION=$$(yq '.languages.golang.version' $(CURDIR)/../../versions.yaml) \
+	  --build-arg PROTOC_VERSION=$$(yq '.externals.protoc.version' $(CURDIR)/../../versions.yaml | grep -oE "[0-9.]+") \
+	  --build-arg PROTOC_GEN_GO_VERSION=$$(yq '.externals.protoc-gen-go.version' $(CURDIR)/../../versions.yaml) \
+	  --build-arg TTRPC_VERSION=$$(yq '.externals.ttrpc.version' $(CURDIR)/../../versions.yaml) \
+	  $(CURDIR)/../../tools/packaging/static-build/codegen) && \
+	docker run --rm --workdir /kata/src/agent -v $(CURDIR)/../..:/kata --user $(shell id -u) $$image \
 	../libs/protocols/hack/update-generated-proto.sh all

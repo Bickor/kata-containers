@@ -9,11 +9,11 @@ kind: Pod
 metadata:
   name: handlers
 spec:
-  terminationGracePeriodSeconds: 0
   runtimeClassName: kata
   containers:
   - name: handlers-container
-    image: quay.io/fidencio/${nginx_version}
+    image: ${NGINX_IMAGE}
+    imagePullPolicy: Always
     lifecycle:
       postStart:
         exec:

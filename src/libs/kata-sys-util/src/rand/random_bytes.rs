@@ -6,7 +6,8 @@
 
 use std::fmt;
 
-use rand::RngCore;
+use rand::rng as thread_rng;
+use rand::Rng;
 
 pub struct RandomBytes {
     pub bytes: Vec<u8>,
@@ -15,7 +16,7 @@ pub struct RandomBytes {
 impl RandomBytes {
     pub fn new(n: usize) -> Self {
         let mut bytes = vec![0u8; n];
-        rand::thread_rng().fill_bytes(&mut bytes);
+        thread_rng().fill_bytes(&mut bytes);
         Self { bytes }
     }
 }
@@ -23,7 +24,7 @@ impl RandomBytes {
 impl fmt::LowerHex for RandomBytes {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         for byte in &self.bytes {
-            write!(f, "{:x}", byte)?;
+            write!(f, "{byte:x}")?;
         }
         Ok(())
     }
@@ -32,7 +33,7 @@ impl fmt::LowerHex for RandomBytes {
 impl fmt::UpperHex for RandomBytes {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         for byte in &self.bytes {
-            write!(f, "{:X}", byte)?;
+            write!(f, "{byte:X}")?;
         }
         Ok(())
     }
@@ -48,11 +49,11 @@ mod tests {
         assert_eq!(b.bytes.len(), 16);
 
         // check lower hex
-        let lower_hex = format!("{:x}", b);
+        let lower_hex = format!("{b:x}");
         assert_eq!(lower_hex, lower_hex.to_lowercase());
 
         // check upper hex
-        let upper_hex = format!("{:X}", b);
+        let upper_hex = format!("{b:X}");
         assert_eq!(upper_hex, upper_hex.to_uppercase());
 
         // check new random bytes

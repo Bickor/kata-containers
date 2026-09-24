@@ -83,7 +83,12 @@ func newQemuArch(config HypervisorConfig) (qemuArch, error) {
 	}
 
 	if config.ImagePath != "" {
-		kernelParams, err := GetKernelRootParams(config.RootfsType, true, false)
+		kernelParams, err := GetKernelRootParams(
+			config.RootfsType,
+			true,
+			false,
+			config.KernelVerityParams,
+		)
 		if err != nil {
 			return nil, err
 		}
@@ -113,8 +118,6 @@ func (q *qemuS390x) appendConsole(ctx context.Context, devices []govmmQemu.Devic
 	if err != nil {
 		return devices, fmt.Errorf("Failed to append console %v", err)
 	}
-
-	q.kernelParams = append(q.kernelParams, Param{"console", "ttysclp0"})
 
 	serial := govmmQemu.SerialDevice{
 		Driver:        virtioSerialCCW,
@@ -196,10 +199,8 @@ func (q *qemuS390x) appendVhostUserDevice(ctx context.Context, devices []govmmQe
 	return devices, nil
 }
 
-// supportGuestMemoryHotplug return false for s390x architecture. The pc-dimm backend device for s390x
-// is not support. PC-DIMM is not listed in the devices supported by qemu-system-s390x -device help
 func (q *qemuS390x) supportGuestMemoryHotplug() bool {
-	return false
+	return q.protection == noneProtection
 }
 
 func (q *qemuS390x) appendNetwork(ctx context.Context, devices []govmmQemu.Device, endpoint Endpoint) ([]govmmQemu.Device, error) {
@@ -304,6 +305,15 @@ func (q *qemuS390x) appendIOMMU(devices []govmmQemu.Device) ([]govmmQemu.Device,
 	return devices, fmt.Errorf("S390x does not support appending a vIOMMU")
 }
 
+func (q *qemuS390x) setEndpointDevicePath(endpoint Endpoint, bridgeAddr int, devAddr string) error {
+	ccwDev, err := types.CcwDeviceFrom(bridgeAddr, devAddr)
+	if err != nil {
+		return err
+	}
+	endpoint.SetCcwDevice(ccwDev)
+	return nil
+}
+
 func (q *qemuS390x) addDeviceToBridge(ctx context.Context, ID string, t types.Type) (string, types.Bridge, error) {
 	addr, b, err := genericAddDeviceToBridge(ctx, q.Bridges, ID, types.CCW)
 	if err != nil {
@@ -337,13 +347,14 @@ func (q *qemuS390x) enableProtection() error {
 
 // appendProtectionDevice appends a QEMU object for Secure Execution.
 // Takes devices and returns updated version. Takes BIOS and returns it (no modification on s390x).
-func (q *qemuS390x) appendProtectionDevice(devices []govmmQemu.Device, firmware, firmwareVolume string) ([]govmmQemu.Device, string, error) {
+func (q *qemuS390x) appendProtectionDevice(devices []govmmQemu.Device, firmware, firmwareVolume string, initdataDigest []byte) ([]govmmQemu.Device, string, error) {
 	switch q.protection {
 	case seProtection:
 		return append(devices,
 			govmmQemu.Object{
-				Type: govmmQemu.SecExecGuest,
-				ID:   secExecID,
+				Type:           govmmQemu.SecExecGuest,
+				ID:             secExecID,
+				InitdataDigest: initdataDigest,
 			}), firmware, nil
 	case noneProtection:
 		return devices, firmware, nil
@@ -375,8 +386,62 @@ func (q *qemuS390x) appendVFIODevice(devices []govmmQemu.Device, vfioDev config.
 	return devices
 }
 
+func (q *qemuS390x) buildInitdataDevice(ctx context.Context, devices []govmmQemu.Device, initdataImage string) []govmmQemu.Device {
+
+	var transport govmmQemu.VirtioTransport
+	var devNo string
+
+	transport = govmmQemu.TransportCCW
+	id := "initdata"
+	addr, bridge, err := q.addDeviceToBridge(ctx, id, types.CCW)
+	if err != nil {
+		hvLogger.WithError(err).Error("Failed to allocate CCW address for initdata")
+		return nil
+	}
+	devNo, err = bridge.AddressFormatCCW(addr)
+	if err != nil {
+		hvLogger.WithError(err).Error("Failed to format CCW address for initdata")
+		return nil
+	}
+	hvLogger.WithField("devno", devNo).Info("Using dynamic CCW DevNo for initdata")
+
+	device := govmmQemu.BlockDevice{
+		Driver:    govmmQemu.VirtioBlock,
+		Transport: transport,
+		ID:        id,
+		File:      initdataImage,
+		SCSI:      false,
+		WCE:       false,
+		AIO:       govmmQemu.Threads,
+		Interface: "none",
+		Format:    "raw",
+		DevNo:     devNo,
+	}
+
+	devices = append(devices, device)
+	return devices
+}
+
 // Query QMP to find a device's PCI path given its QOM path or ID
 func (q *qemuS390x) qomGetPciPath(qemuID string, qmpCh *qmpChannel) (types.PciPath, error) {
 	hvLogger.Warnf("qomGetPciPath not implemented for s390x")
 	return types.PciPath{}, nil
+}
+
+func (q *qemuS390x) memoryTopology(memoryMb, hostMemoryMb uint64, slots uint8) govmmQemu.Memory {
+	// For no hotplug memory, set hostMemoryMb to memoryMb, otherwise will cause
+	// `invalid value of maxmem: maximum memory size (0x0) must be at least the initial memory size`
+	if hostMemoryMb == 0 {
+		hostMemoryMb = memoryMb
+	}
+
+	memMax := fmt.Sprintf("%dM", hostMemoryMb)
+	mem := fmt.Sprintf("%dM", memoryMb)
+	memory := govmmQemu.Memory{
+		Size:   mem,
+		Slots:  slots,
+		MaxMem: memMax,
+	}
+
+	return memory
 }

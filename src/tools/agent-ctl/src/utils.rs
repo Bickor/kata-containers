@@ -3,20 +3,25 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-use crate::types::{Config, CopyFileInput, Options, SetPolicyInput};
+use crate::image;
+use crate::types::*;
+use crate::vm::vm_utils;
 use anyhow::{anyhow, Result};
 use oci::{Root as ociRoot, Spec as ociSpec};
 use oci_spec::runtime as oci;
-use protocols::agent::{CopyFileRequest, SetPolicyRequest};
-use protocols::oci::{Mount as ttrpcMount, Root as ttrpcRoot, Spec as ttrpcSpec};
-use rand::Rng;
+use protocols::agent::{CopyFileRequest, CreateContainerRequest, SetPolicyRequest};
+use protocols::oci::{
+    Mount as ttrpcMount, Process as ttrpcProcess, Root as ttrpcRoot, Spec as ttrpcSpec,
+};
+use rand::RngExt;
+use safe_path::scoped_join;
 use serde::de::DeserializeOwned;
 use slog::{debug, warn};
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::Read;
 use std::os::unix::fs::MetadataExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 // Length of a sandbox identifier
@@ -29,6 +34,10 @@ const MIN_HOSTNAME_LEN: u8 = 8;
 
 // Name of the OCI configuration file found at the root of an OCI bundle.
 const CONFIG_FILE: &str = "config.json";
+
+// Path to OCI configuration template
+const OCI_CONFIG_TEMPLATE: &str =
+    "/opt/kata/share/defaults/kata-containers/agent-ctl/oci_config.json";
 
 lazy_static! {
     // Create a mutable hash map statically
@@ -90,7 +99,7 @@ pub fn signame_to_signum(name: &str) -> Result<u8> {
     let mut search_term = if name.starts_with("SIG") {
         name.to_string()
     } else {
-        format!("SIG{}", name)
+        format!("SIG{name}")
     };
 
     search_term = search_term.to_uppercase();
@@ -205,11 +214,11 @@ pub fn get_option(name: &str, options: &mut Options, args: &str) -> Result<Strin
 
 pub fn generate_random_hex_string(len: u32) -> String {
     const CHARSET: &[u8] = b"abcdef0123456789";
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
 
     let str: String = (0..len)
         .map(|_| {
-            let idx = rng.gen_range(0..CHARSET.len());
+            let idx = rng.random_range(0..CHARSET.len());
             CHARSET[idx] as char
         })
         .collect();
@@ -491,4 +500,85 @@ pub fn make_set_policy_request(input: &SetPolicyInput) -> Result<SetPolicyReques
     let mut req = SetPolicyRequest::default();
     req.set_policy(policy_data);
     Ok(req)
+}
+
+fn fix_oci_process_args(spec: &mut ttrpcSpec, bundle: &str) -> Result<()> {
+    let config_path = scoped_join(bundle, CONFIG_FILE)?;
+
+    let file = File::open(config_path)?;
+    let oci_from_config: ociSpec = serde_json::from_reader(file)?;
+
+    let mut process: ttrpcProcess = match &oci_from_config.process() {
+        Some(p) => p.clone().into(),
+        None => {
+            return Err(anyhow!("Failed to set container process args"));
+        }
+    };
+
+    spec.mut_Process().set_Args(process.take_Args());
+    Ok(())
+}
+
+// Helper function to generate create container request
+pub fn make_create_container_request(
+    input: CreateContainerInput,
+    shared_path: String,
+) -> Result<CreateContainerRequest> {
+    // read in the oci configuration template
+    if !Path::new(OCI_CONFIG_TEMPLATE).exists() {
+        warn!(sl!(), "make_create_container_request: Missig template file");
+        return Err(anyhow!("Missing OCI Config template file"));
+    }
+
+    let file = File::open(OCI_CONFIG_TEMPLATE)?;
+    let spec: ociSpec = serde_json::from_reader(file)?;
+
+    let mut req = CreateContainerRequest::default();
+
+    let c_id = if !input.id.is_empty() {
+        input.id
+    } else {
+        random_container_id()
+    };
+
+    debug!(
+        sl!(),
+        "make_create_container_request: pulling container image"
+    );
+
+    // Pull and unpack the container image
+    let image_bundle = image::pull_image(&input.image, &c_id)?;
+
+    let bundle = match shared_path.as_str() {
+        "" => image_bundle.clone(),
+        _ => {
+            debug!(
+                sl!(),
+                "make_create_container_request: setting up fs sharing path"
+            );
+            let share_bundle = vm_utils::share_rootfs(&image_bundle, &shared_path, &c_id)?;
+            req.mut_storages().push(vm_utils::get_virtiofs_storage());
+            share_bundle
+        }
+    };
+
+    let mut ttrpc_spec = oci_to_ttrpc(&bundle, &c_id, &spec)?;
+
+    // Rootfs has been handled with bundle after pulling image
+    // Fix the container process argument.
+    fix_oci_process_args(&mut ttrpc_spec, &image_bundle)?;
+
+    req.set_container_id(c_id);
+    req.set_OCI(ttrpc_spec);
+
+    debug!(sl!(), "CreateContainer request generated successfully");
+
+    Ok(req)
+}
+
+pub fn remove_container_image_mount(c_id: &str, share_fs: &str) -> Result<()> {
+    if !share_fs.is_empty() {
+        vm_utils::unshare_rootfs(share_fs, c_id)?;
+    }
+    image::remove_image_mount(c_id)
 }

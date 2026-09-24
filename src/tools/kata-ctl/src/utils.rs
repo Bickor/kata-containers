@@ -30,7 +30,7 @@ pub const PROC_VERSION_FILE: &str = "/proc/version";
 
 pub fn get_kernel_version(proc_version_file: &str) -> Result<String> {
     let contents = fs::read_to_string(proc_version_file)
-        .context(format!("Failed to read file {}", proc_version_file))?;
+        .context(format!("Failed to read file {proc_version_file}"))?;
 
     let fields: Vec<&str> = contents.split_whitespace().collect();
 
@@ -70,11 +70,7 @@ pub fn get_distro_details(os_release: &str, os_release_clr: &str) -> Result<(Str
                 if e.kind() == std::io::ErrorKind::NotFound {
                     continue;
                 } else {
-                    return Err(anyhow!(
-                        "Error reading file {}: {}",
-                        release_file,
-                        e.to_string()
-                    ));
+                    return Err(anyhow!("Error reading file {}: {}", release_file, e));
                 }
             }
             Ok(contents) => {
@@ -105,7 +101,13 @@ pub fn get_distro_details(os_release: &str, os_release_clr: &str) -> Result<(Str
     Ok((name, version))
 }
 
-#[cfg(any(target_arch = "s390x", target_arch = "x86_64", target_arch = "aarch64"))]
+#[cfg(any(
+    target_arch = "s390x",
+    target_arch = "x86_64",
+    target_arch = "aarch64",
+    all(target_arch = "powerpc64", target_endian = "little"),
+))]
+#[allow(clippy::const_is_empty)]
 pub fn get_generic_cpu_details(cpu_info_file: &str) -> Result<(String, String)> {
     let cpu_info = kata_sys_util::cpu::get_single_cpu_info(cpu_info_file, "\n\n")?;
     let lines = cpu_info.lines();
@@ -147,7 +149,7 @@ pub fn supports_vsocks(vsock_path: &str) -> Result<bool> {
     let metadata = fs::metadata(vsock_path).map_err(|err| {
         anyhow!(
             "Host system does not support vhost-vsock (try running (`sudo modprobe vhost_vsock`) : {}",
-            err.to_string()
+            err
         )
     })?;
     Ok(metadata.is_file())
@@ -262,7 +264,7 @@ mod tests {
             arch_specific::ARCH_CPU_MODEL_FIELD,
             expected_model_name
         );
-        writeln!(file, "{}", contents).unwrap();
+        writeln!(file, "{contents}").unwrap();
         let res = get_generic_cpu_details(path.to_str().unwrap());
         assert_eq!(res.as_ref().unwrap().0, expected_vendor_id);
         assert_eq!(res.as_ref().unwrap().1, expected_model_name);

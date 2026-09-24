@@ -166,19 +166,95 @@ moment.
 See [this issue](https://github.com/kata-containers/runtime/issues/2812) for more details.
 [Another issue](https://github.com/kata-containers/kata-containers/issues/1728) focuses on the case of `emptyDir`.
 
-## Host resource sharing
+### Kubernetes [hostPath][k8s-hostpath] volumes
 
-### Privileged containers
+In Kata, Kubernetes hostPath volumes can mount host directories and
+regular files into the guest VM via filesystem sharing, if it is enabled
+through the `shared_fs` [configuration][runtime-config] flag.
+
+By default:
+
+ - Non-TEE environment: Filesystem sharing is used to mount host files.
+ - TEE environment: Filesystem sharing is disabled. Instead, host files
+   are copied into the guest VM when the container starts, and file
+   changes are *not* synchronized between the host and the guest.
+
+In some cases, the behavior of hostPath volumes in Kata is further
+different compared to `runc` containers:
+
+**Mounting host block devices**: When a hostPath volume is of type
+[`BlockDevice`][k8s-blockdevice], Kata hotplugs the host block device
+into the guest and exposes it directly to the container.
+
+**Mounting guest devices**: When the source path of a hostPath volume is
+under `/dev` (or `/dev` itself), and the path corresponds to a
+non-regular file (i.e., a device, directory, or any other special file)
+or is not accessible by the Kata shim, the Kata agent bind mounts the
+source path directly from the *guest* filesystem into the container.
+
+[runtime-config]: /src/runtime/README.md#configuration
+[k8s-hostpath]: https://kubernetes.io/docs/concepts/storage/volumes/#hostpath
+[k8s-blockdevice]: https://kubernetes.io/docs/concepts/storage/volumes/#hostpath-volume-types
+
+### Mounting `procfs` and `sysfs`
+
+For security reasons, the following mounts are disallowed:
+
+| Type              | Source    | Destination                      | Rationale      |
+|-------------------|-----------|----------------------------------|----------------|
+| `bind`            | `!= proc` | `/proc`                          | CVE-2019-16884 |
+| `bind`            | `*`       | `/proc/*` (see exceptions below) | CVE-2019-16884 |
+| `proc \|\| sysfs` | `*`       | not a directory (e.g. symlink)   | CVE-2019-19921 |
+
+For bind mounts under /proc, these destinations are allowed:
+
+ * `/proc/cpuinfo`
+ * `/proc/diskstats`
+ * `/proc/meminfo`
+ * `/proc/stat`
+ * `/proc/swaps`
+ * `/proc/uptime`
+ * `/proc/loadavg`
+ * `/proc/net/dev`
+
+## Privileged containers
 
 Privileged support in Kata is essentially different from `runc` containers.
-The container runs with elevated capabilities within the guest and is granted
-access to guest devices instead of the host devices.
+The container runs with elevated capabilities within the guest.
 This is also true with using `securityContext privileged=true` with Kubernetes.
 
-The container may also be granted full access to a subset of host devices
-(https://github.com/kata-containers/runtime/issues/1568).
+Importantly, the default behavior to pass the host devices to a
+privileged container is not supported in Kata Containers and needs to be
+disabled, see [Privileged Kata Containers](how-to/privileged.md).
 
-See [Privileged Kata Containers](how-to/privileged.md) for how to configure some of this behavior.
+## Guest pulled container images
+
+When using features like **nydus guest-pull**, set user/group IDs explicitly in the pod spec.
+If the ID values are omitted:
+
+- Your workload might be executed with unexpected user/group ID values, because image layers
+  may be unavailable to containerd, so image config (including user/group) is not applied.
+- If using policy or genpolicy, the generated policy may detect these unexpected values and
+  reject the creation of workload containers.
+
+Set `securityContext` explicitly. Use **pod-level** `spec.securityContext` (for Pods) or
+`spec.template.spec.securityContext` (for controllers like Deployments) and/or **container-level**
+`spec.containers[].securityContext`. Include at least:
+- `runAsUser` — primary user ID
+- `runAsGroup` — primary group ID
+- `fsGroup` — volume group ownership (often reflected as a supplemental group)
+- `supplementalGroups` — list of additional group IDs (if needed)
+
+Example:
+
+ ```yaml
+ # Explicit user/group/supplementary groups to support nydus guest-pull
+ securityContext:
+   runAsUser: 0
+   runAsGroup: 0
+   fsGroup: 0
+   supplementalGroups: [1, 2, 3, 4, 6, 10, 11, 20, 26, 27]
+ ```
 
 # Appendices
 

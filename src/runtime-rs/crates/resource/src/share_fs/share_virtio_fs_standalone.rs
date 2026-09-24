@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-use std::{collections::HashMap, process::Stdio, sync::Arc};
+use std::{collections::HashMap, path::Path, process::Stdio, sync::Arc};
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -18,18 +18,19 @@ use tokio::{
 };
 
 use agent::Storage;
-use hypervisor::{device::device_manager::DeviceManager, Hypervisor};
-use kata_types::config::hypervisor::SharedFsInfo;
+use hypervisor::{device::device_manager::DeviceManager, utils::chown_to_parent, Hypervisor};
+use kata_types::{config::hypervisor::SharedFsInfo, rootless::is_rootless};
 
 use super::{
     share_virtio_fs::generate_sock_path, utils::ensure_dir_exist, utils::get_host_ro_shared_path,
     virtio_fs_share_mount::VirtiofsShareMount, MountedInfo, ShareFs, ShareFsMount,
 };
 use crate::share_fs::{
+    kata_guest_share_dir,
     share_virtio_fs::{
         prepare_virtiofs, FS_TYPE_VIRTIO_FS, KATA_VIRTIO_FS_DEV_TYPE, MOUNT_GUEST_TAG,
     },
-    KATA_GUEST_SHARE_DIR, VIRTIO_FS,
+    VIRTIO_FS,
 };
 
 #[derive(Debug, Clone)]
@@ -71,7 +72,7 @@ impl ShareVirtioFsStandalone {
         })
     }
 
-    fn virtiofsd_args(&self, sock_path: &str) -> Result<Vec<String>> {
+    fn virtiofsd_args(&self, sock_path: &str, disable_guest_selinux: bool) -> Result<Vec<String>> {
         let source_path = get_host_ro_shared_path(&self.config.id);
         ensure_dir_exist(&source_path)?;
         let shared_dir = source_path
@@ -85,10 +86,6 @@ impl ShareVirtioFsStandalone {
             String::from(shared_dir),
             String::from("--cache"),
             self.config.virtio_fs_cache.clone(),
-            String::from("--sandbox"),
-            String::from("none"),
-            String::from("--seccomp"),
-            String::from("none"),
         ];
 
         if !self.config.virtio_fs_extra_args.is_empty() {
@@ -96,16 +93,58 @@ impl ShareVirtioFsStandalone {
             args.append(&mut extra_args);
         }
 
+        if !disable_guest_selinux {
+            args.push(String::from("--xattr"));
+        }
+
         Ok(args)
     }
 
     async fn setup_virtiofsd(&self, h: &dyn Hypervisor) -> Result<()> {
         let sock_path = generate_sock_path(&h.get_jailer_root().await?);
-        let args = self.virtiofsd_args(&sock_path).context("virtiofsd args")?;
+        let disable_guest_selinux = h.hypervisor_config().await.disable_guest_selinux;
+
+        let socket_path = if is_rootless() {
+            // In rootless mode, we use relative socket paths instead of absolute paths
+            // because the absolute path with rootless prefix can exceed the unix socket path length limit (typically 108 bytes)
+            // By using a relative path and changing the working directory, we can keep the socket path short
+            let sock_file = Path::new(sock_path.as_str())
+                .file_name()
+                .ok_or_else(|| anyhow!("failed to get file name of {:?}", sock_path))?;
+            sock_file.to_string_lossy().to_string()
+        } else {
+            sock_path.clone()
+        };
+
+        let args = self
+            .virtiofsd_args(&socket_path, disable_guest_selinux)
+            .context("virtiofsd args")?;
 
         let mut cmd = Command::new(&self.config.virtio_fs_daemon);
         let child_cmd = cmd.args(&args).stderr(Stdio::piped());
+
+        if is_rootless() {
+            // Change working directory to socket's parent directory
+            // This allows virtiofsd to create the socket file using the short relative path
+            // avoiding the unix socket path length limitation
+            let work_dir = Path::new(&sock_path)
+                .parent()
+                .ok_or_else(|| anyhow!("failed to get parent dir of {:?}", sock_path))?;
+            child_cmd.current_dir(work_dir);
+        }
+
         let child = child_cmd.spawn().context("spawn virtiofsd")?;
+
+        if is_rootless() {
+            // wait for the socket to be created
+            for _ in 0..10 {
+                if Path::new(&sock_path).exists() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            chown_to_parent(&sock_path)?;
+        }
 
         // update virtiofsd pid{
         {
@@ -206,7 +245,8 @@ impl ShareFs for ShareVirtioFsStandalone {
             fs_type: String::from(FS_TYPE_VIRTIO_FS),
             fs_group: None,
             options: vec![String::from("nodev")],
-            mount_point: String::from(KATA_GUEST_SHARE_DIR),
+            mount_point: kata_guest_share_dir(),
+            shared: false,
         };
 
         storages.push(shared_volume);
@@ -215,5 +255,11 @@ impl ShareFs for ShareVirtioFsStandalone {
 
     fn mounted_info_set(&self) -> Arc<Mutex<HashMap<String, MountedInfo>>> {
         self.mounted_info_set.clone()
+    }
+
+    async fn stop(&self) -> Result<()> {
+        self.shutdown_virtiofsd()
+            .await
+            .context("failed to stop virtiofsd daemon")
     }
 }

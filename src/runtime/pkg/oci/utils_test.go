@@ -16,7 +16,7 @@ import (
 	"testing"
 
 	ctrAnnotations "github.com/containerd/containerd/pkg/cri/annotations"
-	podmanAnnotations "github.com/containers/podman/v4/pkg/annotations"
+	crioAnnotations "github.com/cri-o/cri-o/pkg/annotations"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/stretchr/testify/assert"
 	"golang.org/x/sys/unix"
@@ -224,22 +224,22 @@ func TestContainerType(t *testing.T) {
 		},
 		{
 			description:     "crio unexpected annotation, expect error",
-			annotationKey:   podmanAnnotations.ContainerType,
+			annotationKey:   crioAnnotations.ContainerType,
 			annotationValue: "foo",
 			expectedType:    vc.UnknownContainerType,
 			expectedErr:     true,
 		},
 		{
 			description:     "crio sandbox",
-			annotationKey:   podmanAnnotations.ContainerType,
-			annotationValue: string(podmanAnnotations.ContainerTypeSandbox),
+			annotationKey:   crioAnnotations.ContainerType,
+			annotationValue: string(crioAnnotations.ContainerTypeSandbox),
 			expectedType:    vc.PodSandbox,
 			expectedErr:     false,
 		},
 		{
 			description:     "crio container",
-			annotationKey:   podmanAnnotations.ContainerType,
-			annotationValue: string(podmanAnnotations.ContainerTypeContainer),
+			annotationKey:   crioAnnotations.ContainerType,
+			annotationValue: string(crioAnnotations.ContainerTypeContainer),
 			expectedType:    vc.PodContainer,
 			expectedErr:     false,
 		},
@@ -287,7 +287,7 @@ func TestSandboxIDSuccessful(t *testing.T) {
 	assert := assert.New(t)
 
 	ociSpec.Annotations = map[string]string{
-		podmanAnnotations.SandboxID: testSandboxID,
+		crioAnnotations.SandboxID: testSandboxID,
 	}
 
 	sandboxID, err := SandboxID(ociSpec)
@@ -373,6 +373,95 @@ func TestDevicePathEmpty(t *testing.T) {
 
 	_, err := containerDeviceInfos(ociSpec)
 	assert.NotNil(t, err, "This test should fail as path cannot be empty for device")
+}
+
+func TestDeviceCgroupAccessIsReadOnly(t *testing.T) {
+	assert := assert.New(t)
+
+	i64 := func(v int64) *int64 { return &v }
+	major, minor := int64(8), int64(0)
+
+	rule := func(allow bool, typ string, maj, min *int64, access string) specs.LinuxDeviceCgroup {
+		return specs.LinuxDeviceCgroup{
+			Allow:  allow,
+			Type:   typ,
+			Major:  maj,
+			Minor:  min,
+			Access: access,
+		}
+	}
+
+	resources := func(rules ...specs.LinuxDeviceCgroup) *specs.LinuxResources {
+		return &specs.LinuxResources{Devices: rules}
+	}
+
+	tests := []struct {
+		name      string
+		resources *specs.LinuxResources
+		expected  bool
+	}{
+		{"nil resources", nil, false},
+		{"no rules", resources(), false},
+		{"exact match read-only (rm)", resources(rule(true, "b", i64(major), i64(minor), "rm")), true},
+		{"exact match read-only (r)", resources(rule(true, "b", i64(major), i64(minor), "r")), true},
+		{"exact match read-write (rwm)", resources(rule(true, "b", i64(major), i64(minor), "rwm")), false},
+		{"type all (a) read-only", resources(rule(true, "a", i64(major), i64(minor), "rm")), true},
+		{"empty type read-only", resources(rule(true, "", i64(major), i64(minor), "rm")), true},
+		{"deny rule is ignored", resources(rule(false, "b", i64(major), i64(minor), "rm")), false},
+		{"wildcard major is ignored", resources(rule(true, "b", nil, i64(minor), "rm")), false},
+		{"wildcard minor is ignored", resources(rule(true, "b", i64(major), nil, "rm")), false},
+		{"type mismatch is ignored", resources(rule(true, "c", i64(major), i64(minor), "rm")), false},
+		{"different device is ignored", resources(rule(true, "b", i64(9), i64(1), "rm")), false},
+		{
+			"first exact match wins",
+			resources(
+				rule(true, "b", i64(major), i64(minor), "rm"),
+				rule(true, "b", i64(major), i64(minor), "rwm"),
+			),
+			true,
+		},
+	}
+
+	for _, tt := range tests {
+		assert.Equal(tt.expected, deviceCgroupAccessIsReadOnly(tt.resources, "b", major, minor), tt.name)
+	}
+}
+
+func TestContainerDeviceInfosReadOnly(t *testing.T) {
+	assert := assert.New(t)
+
+	// Stub the host BLKROGET probe so the test is deterministic and does no
+	// real device I/O: only the probe-only device (8:32) reports read-only.
+	savedProbe := blockDeviceReadOnlyProbe
+	defer func() { blockDeviceReadOnlyProbe = savedProbe }()
+	blockDeviceReadOnlyProbe = func(major, minor int64) bool {
+		return major == 8 && minor == 32
+	}
+
+	i64 := func(v int64) *int64 { return &v }
+
+	var ociSpec specs.Spec
+	ociSpec.Linux = &specs.Linux{
+		Devices: []specs.LinuxDevice{
+			{Path: "/dev/cgroup-ro-blk", Type: "b", Major: 8, Minor: 0},
+			{Path: "/dev/rw-blk", Type: "b", Major: 8, Minor: 16},
+			{Path: "/dev/blkroget-ro-blk", Type: "b", Major: 8, Minor: 32},
+		},
+		Resources: &specs.LinuxResources{
+			Devices: []specs.LinuxDeviceCgroup{
+				{Allow: true, Type: "b", Major: i64(8), Minor: i64(0), Access: "rm"},
+				{Allow: true, Type: "b", Major: i64(8), Minor: i64(16), Access: "rwm"},
+				{Allow: true, Type: "b", Major: i64(8), Minor: i64(32), Access: "rwm"},
+			},
+		},
+	}
+
+	devices, err := containerDeviceInfos(ociSpec)
+	assert.NoError(err)
+	assert.Len(devices, 3)
+	assert.True(devices[0].ReadOnly, "device with cgroup access \"rm\" should be read-only")
+	assert.False(devices[1].ReadOnly, "device with cgroup access \"rwm\" and writable host device should be read-write")
+	assert.True(devices[2].ReadOnly, "device flagged read-only via BLKROGET should be read-only even with \"rwm\" cgroup access")
 }
 
 func TestGetShmSize(t *testing.T) {
@@ -483,9 +572,6 @@ func TestAddAssetAnnotations(t *testing.T) {
 		vcAnnotations.HypervisorPath: fakeAssetFile,
 		vcAnnotations.HypervisorHash: "bbbbb",
 
-		vcAnnotations.HypervisorCtlPath: fakeAssetFile,
-		vcAnnotations.HypervisorCtlHash: "cc",
-
 		vcAnnotations.ImagePath: fakeAssetFile,
 		vcAnnotations.ImageHash: "52ss2550983",
 
@@ -533,7 +619,6 @@ func TestAddAssetAnnotations(t *testing.T) {
 	// Check that it works if all path lists are enabled
 	runtimeConfig.HypervisorConfig.HypervisorPathList = []string{tmpdirGlob}
 	runtimeConfig.HypervisorConfig.JailerPathList = []string{tmpdirGlob}
-	runtimeConfig.HypervisorConfig.HypervisorCtlPathList = []string{tmpdirGlob}
 
 	err = addAnnotations(ocispec, &config, runtimeConfig)
 	assert.NoError(err)
@@ -624,7 +709,6 @@ func TestAddHypervisorAnnotations(t *testing.T) {
 		HypervisorType: vc.QemuHypervisor,
 	}
 	runtimeConfig.HypervisorConfig.EnableAnnotations = []string{".*"}
-	runtimeConfig.HypervisorConfig.FileBackedMemRootList = []string{"/dev/shm*"}
 	runtimeConfig.HypervisorConfig.VirtioFSDaemonList = []string{"/bin/*ls*"}
 
 	ocispec.Annotations[vcAnnotations.KernelParams] = "vsyscall=emulate iommu=on"
@@ -638,7 +722,6 @@ func TestAddHypervisorAnnotations(t *testing.T) {
 	ocispec.Annotations[vcAnnotations.MemOffset] = "512"
 	ocispec.Annotations[vcAnnotations.VirtioMem] = "true"
 	ocispec.Annotations[vcAnnotations.MemPrealloc] = "true"
-	ocispec.Annotations[vcAnnotations.FileBackedMemRootDir] = "/dev/shm"
 	ocispec.Annotations[vcAnnotations.HugePages] = "true"
 	ocispec.Annotations[vcAnnotations.IOMMU] = "true"
 	ocispec.Annotations[vcAnnotations.BlockDeviceDriver] = "virtio-scsi"
@@ -669,6 +752,8 @@ func TestAddHypervisorAnnotations(t *testing.T) {
 	// 10Mbit
 	ocispec.Annotations[vcAnnotations.RxRateLimiterMaxRate] = "10000000"
 	ocispec.Annotations[vcAnnotations.TxRateLimiterMaxRate] = "10000000"
+	ocispec.Annotations[vcAnnotations.BlockDeviceLogicalSectorSize] = "512"
+	ocispec.Annotations[vcAnnotations.BlockDevicePhysicalSectorSize] = "4096"
 
 	err := addAnnotations(ocispec, &sbConfig, runtimeConfig)
 	assert.NoError(err)
@@ -680,7 +765,6 @@ func TestAddHypervisorAnnotations(t *testing.T) {
 	assert.Equal(sbConfig.HypervisorConfig.MemOffset, uint64(512))
 	assert.Equal(sbConfig.HypervisorConfig.VirtioMem, true)
 	assert.Equal(sbConfig.HypervisorConfig.MemPrealloc, true)
-	assert.Equal(sbConfig.HypervisorConfig.FileBackedMemRootDir, "/dev/shm")
 	assert.Equal(sbConfig.HypervisorConfig.HugePages, true)
 	assert.Equal(sbConfig.HypervisorConfig.IOMMU, true)
 	assert.Equal(sbConfig.HypervisorConfig.BlockDeviceDriver, "virtio-scsi")
@@ -710,6 +794,8 @@ func TestAddHypervisorAnnotations(t *testing.T) {
 	assert.Equal(sbConfig.HypervisorConfig.LegacySerial, true)
 	assert.Equal(sbConfig.HypervisorConfig.RxRateLimiterMaxRate, uint64(10000000))
 	assert.Equal(sbConfig.HypervisorConfig.TxRateLimiterMaxRate, uint64(10000000))
+	assert.Equal(sbConfig.HypervisorConfig.BlockDeviceLogicalSectorSize, uint32(512))
+	assert.Equal(sbConfig.HypervisorConfig.BlockDevicePhysicalSectorSize, uint32(4096))
 
 	// In case an absurd large value is provided, the config value if not over-ridden
 	ocispec.Annotations[vcAnnotations.DefaultVCPUs] = "655536"
@@ -728,6 +814,80 @@ func TestAddHypervisorAnnotations(t *testing.T) {
 	ocispec.Annotations[vcAnnotations.DefaultMaxVCPUs] = "1"
 	ocispec.Annotations[vcAnnotations.DefaultMemory] = fmt.Sprintf("%d", vc.MinHypervisorMemory+1)
 	assert.Error(err)
+}
+
+func TestBlockDeviceSectorSizeAnnotations(t *testing.T) {
+	assert := assert.New(t)
+
+	runtimeConfig := RuntimeConfig{
+		HypervisorType: vc.QemuHypervisor,
+	}
+	runtimeConfig.HypervisorConfig.EnableAnnotations = []string{".*"}
+
+	newSpec := func() specs.Spec {
+		return specs.Spec{Annotations: make(map[string]string)}
+	}
+	newConfig := func() vc.SandboxConfig {
+		return vc.SandboxConfig{Annotations: make(map[string]string)}
+	}
+
+	// Valid: 0 means "use hypervisor default", no override applied
+	for _, v := range []string{"0", "512", "1024", "2048", "4096", "8192", "16384", "32768", "65536"} {
+		spec := newSpec()
+		cfg := newConfig()
+		spec.Annotations[vcAnnotations.BlockDeviceLogicalSectorSize] = v
+		spec.Annotations[vcAnnotations.BlockDevicePhysicalSectorSize] = v
+		assert.NoError(addAnnotations(spec, &cfg, runtimeConfig), "expected valid size %s to be accepted", v)
+	}
+
+	// Invalid: not a power of 2
+	for _, v := range []string{"3", "100", "1000", "3000", "5000"} {
+		spec := newSpec()
+		cfg := newConfig()
+		spec.Annotations[vcAnnotations.BlockDeviceLogicalSectorSize] = v
+		assert.Error(addAnnotations(spec, &cfg, runtimeConfig), "expected non-power-of-2 size %s to be rejected", v)
+	}
+
+	// Invalid: below minimum (512)
+	for _, v := range []string{"1", "256"} {
+		spec := newSpec()
+		cfg := newConfig()
+		spec.Annotations[vcAnnotations.BlockDeviceLogicalSectorSize] = v
+		assert.Error(addAnnotations(spec, &cfg, runtimeConfig), "expected below-minimum size %s to be rejected", v)
+	}
+
+	// Invalid: above maximum (65536)
+	for _, v := range []string{"131072", "1048576"} {
+		spec := newSpec()
+		cfg := newConfig()
+		spec.Annotations[vcAnnotations.BlockDevicePhysicalSectorSize] = v
+		assert.Error(addAnnotations(spec, &cfg, runtimeConfig), "expected above-maximum size %s to be rejected", v)
+	}
+
+	// Logical 4096 with physical 4096 — both valid
+	spec := newSpec()
+	cfg := newConfig()
+	spec.Annotations[vcAnnotations.BlockDeviceLogicalSectorSize] = "4096"
+	spec.Annotations[vcAnnotations.BlockDevicePhysicalSectorSize] = "4096"
+	assert.NoError(addAnnotations(spec, &cfg, runtimeConfig))
+	assert.Equal(cfg.HypervisorConfig.BlockDeviceLogicalSectorSize, uint32(4096))
+	assert.Equal(cfg.HypervisorConfig.BlockDevicePhysicalSectorSize, uint32(4096))
+
+	// Logical 512 with physical 4096 — both valid
+	spec = newSpec()
+	cfg = newConfig()
+	spec.Annotations[vcAnnotations.BlockDeviceLogicalSectorSize] = "512"
+	spec.Annotations[vcAnnotations.BlockDevicePhysicalSectorSize] = "4096"
+	assert.NoError(addAnnotations(spec, &cfg, runtimeConfig))
+	assert.Equal(cfg.HypervisorConfig.BlockDeviceLogicalSectorSize, uint32(512))
+	assert.Equal(cfg.HypervisorConfig.BlockDevicePhysicalSectorSize, uint32(4096))
+
+	// Invalid: logical > physical
+	spec = newSpec()
+	cfg = newConfig()
+	spec.Annotations[vcAnnotations.BlockDeviceLogicalSectorSize] = "4096"
+	spec.Annotations[vcAnnotations.BlockDevicePhysicalSectorSize] = "512"
+	assert.Error(addAnnotations(spec, &cfg, runtimeConfig), "logical > physical should be rejected")
 }
 
 func TestAddRemoteHypervisorAnnotations(t *testing.T) {
@@ -775,10 +935,40 @@ func TestAddRemoteHypervisorAnnotations(t *testing.T) {
 	assert.NoError(err)
 
 	// When initdata specified, remote hypervisor annotations do have the annotation added.
-	ocispec.Annotations[vcAnnotations.Initdata] = "initdata"
+	// Note that the initdata annotation parsing logic will extract it into plaintext
+	ocispec.Annotations[vcAnnotations.Initdata] = "H4sIAFlC92cAAytLLSrOzM9TsFVQMtAz1DNQ4krMSc8vyizJyAWJFWckGpmaKXFFpySWJMZyKSUm6pXk5+YoAeXU1dW5QJhLKTklA4toQX5OZnKlXlFqej6yBABS/5JkcQAAAA=="
 	err = addAnnotations(ocispec, &sbConfig, runtimeConfig)
 	assert.NoError(err)
-	assert.Equal(sbConfig.HypervisorConfig.Initdata, "initdata")
+	assert.Equal(sbConfig.HypervisorConfig.Initdata, `version = "0.1.0"
+algorithm = "sha256"
+[data]
+"aa.toml" = '''
+'''
+
+"cdh.toml" = '''
+'''
+
+"policy.rego" = '''
+'''
+`)
+	assert.Equal(sbConfig.HypervisorConfig.InitdataDigest, []byte{0xc6, 0x69, 0x4b, 0xb7, 0xa2, 0x9d, 0x6f, 0x37, 0xec, 0x72, 0xa1, 0x55, 0x82, 0xe0, 0x4, 0xb9, 0xf3, 0x14, 0x21, 0x59, 0x68, 0x2d, 0xb8, 0x50, 0x9a, 0x30, 0x44, 0x7, 0x41, 0x9a, 0x49, 0xe5})
+
+	// When GPU annotations are specified, remote hypervisor annotations have the annotation added
+	ocispec.Annotations[vcAnnotations.DefaultGPUs] = "-1"
+	err = addAnnotations(ocispec, &sbConfig, runtimeConfig)
+	assert.Error(err)
+
+	ocispec.Annotations[vcAnnotations.DefaultGPUs] = "1"
+	err = addAnnotations(ocispec, &sbConfig, runtimeConfig)
+	assert.NoError(err)
+	assert.Equal(sbConfig.HypervisorConfig.DefaultGPUs, uint32(1))
+
+	// When GPU annotations are specified, remote hypervisor annotations have the annotation added
+	ocispec.Annotations[vcAnnotations.DefaultGPUModel] = "tesla"
+	err = addAnnotations(ocispec, &sbConfig, runtimeConfig)
+	assert.NoError(err)
+	assert.Equal(sbConfig.HypervisorConfig.DefaultGPUModel, "tesla")
+
 }
 
 func TestAddProtectedHypervisorAnnotations(t *testing.T) {
@@ -803,27 +993,22 @@ func TestAddProtectedHypervisorAnnotations(t *testing.T) {
 	// Enable annotations
 	runtimeConfig.HypervisorConfig.EnableAnnotations = []string{".*"}
 
-	ocispec.Annotations[vcAnnotations.FileBackedMemRootDir] = "/dev/shm"
 	ocispec.Annotations[vcAnnotations.VirtioFSDaemon] = "/bin/false"
 	ocispec.Annotations[vcAnnotations.EntropySource] = "/dev/urandom"
 
-	config.HypervisorConfig.FileBackedMemRootDir = "do-not-touch"
 	config.HypervisorConfig.VirtioFSDaemon = "dangerous-daemon"
 	config.HypervisorConfig.EntropySource = "truly-random"
 
 	err = addAnnotations(ocispec, &config, runtimeConfig)
 	assert.Error(err)
-	assert.Equal(config.HypervisorConfig.FileBackedMemRootDir, "do-not-touch")
 	assert.Equal(config.HypervisorConfig.VirtioFSDaemon, "dangerous-daemon")
 	assert.Equal(config.HypervisorConfig.EntropySource, "truly-random")
 
 	// Now enable them and check again
-	runtimeConfig.HypervisorConfig.FileBackedMemRootList = []string{"/dev/*m"}
 	runtimeConfig.HypervisorConfig.VirtioFSDaemonList = []string{"/bin/*ls*"}
 	runtimeConfig.HypervisorConfig.EntropySourceList = []string{"/dev/*random*"}
 	err = addAnnotations(ocispec, &config, runtimeConfig)
 	assert.NoError(err)
-	assert.Equal(config.HypervisorConfig.FileBackedMemRootDir, "/dev/shm")
 	assert.Equal(config.HypervisorConfig.VirtioFSDaemon, "/bin/false")
 	assert.Equal(config.HypervisorConfig.EntropySource, "/dev/urandom")
 
@@ -859,6 +1044,9 @@ func TestAddRuntimeAnnotations(t *testing.T) {
 
 	runtimeConfig := RuntimeConfig{
 		HypervisorType: vc.QemuHypervisor,
+		HypervisorConfig: vc.HypervisorConfig{
+			EnableAnnotations: []string{"cc_init_data"},
+		},
 	}
 
 	ocispec.Annotations[vcAnnotations.DisableGuestSeccomp] = "true"
@@ -866,7 +1054,9 @@ func TestAddRuntimeAnnotations(t *testing.T) {
 	ocispec.Annotations[vcAnnotations.DisableNewNetNs] = "true"
 	ocispec.Annotations[vcAnnotations.InterNetworkModel] = "macvtap"
 	ocispec.Annotations[vcAnnotations.CreateContainerTimeout] = "100"
-	ocispec.Annotations[vcAnnotations.Initdata] = "initdata"
+
+	// Note that the initdata annotation parsing logic will extract it into plaintext
+	ocispec.Annotations[vcAnnotations.Initdata] = "H4sIAFlC92cAAytLLSrOzM9TsFVQMtAz1DNQ4krMSc8vyizJyAWJFWckGpmaKXFFpySWJMZyKSUm6pXk5+YoAeXU1dW5QJhLKTklA4toQX5OZnKlXlFqej6yBABS/5JkcQAAAA=="
 
 	addAnnotations(ocispec, &config, runtimeConfig)
 	assert.Equal(config.DisableGuestSeccomp, true)
@@ -874,7 +1064,20 @@ func TestAddRuntimeAnnotations(t *testing.T) {
 	assert.Equal(config.NetworkConfig.DisableNewNetwork, true)
 	assert.Equal(config.NetworkConfig.InterworkingModel, vc.NetXConnectMacVtapModel)
 	assert.Equal(config.CreateContainerTimeout, uint64(100))
-	assert.Equal(config.HypervisorConfig.Initdata, "initdata")
+	assert.Equal(config.HypervisorConfig.Initdata, `version = "0.1.0"
+algorithm = "sha256"
+[data]
+"aa.toml" = '''
+'''
+
+"cdh.toml" = '''
+'''
+
+"policy.rego" = '''
+'''
+`)
+	assert.Equal(config.HypervisorConfig.InitdataDigest, []byte{0xc6, 0x69, 0x4b, 0xb7, 0xa2, 0x9d, 0x6f, 0x37, 0xec, 0x72, 0xa1, 0x55, 0x82, 0xe0, 0x4, 0xb9, 0xf3, 0x14, 0x21, 0x59, 0x68, 0x2d, 0xb8, 0x50, 0x9a, 0x30, 0x44, 0x7, 0x41, 0x9a, 0x49, 0xe5})
+
 }
 
 func TestRegexpContains(t *testing.T) {
@@ -946,15 +1149,15 @@ func TestIsCRIOContainerManager(t *testing.T) {
 		result      bool
 	}{
 		{
-			annotations: map[string]string{podmanAnnotations.ContainerType: "abc"},
+			annotations: map[string]string{crioAnnotations.ContainerType: "abc"},
 			result:      false,
 		},
 		{
-			annotations: map[string]string{podmanAnnotations.ContainerType: podmanAnnotations.ContainerTypeSandbox},
+			annotations: map[string]string{crioAnnotations.ContainerType: crioAnnotations.ContainerTypeSandbox},
 			result:      true,
 		},
 		{
-			annotations: map[string]string{podmanAnnotations.ContainerType: podmanAnnotations.ContainerTypeContainer},
+			annotations: map[string]string{crioAnnotations.ContainerType: crioAnnotations.ContainerTypeContainer},
 			result:      true,
 		},
 	}
@@ -1099,7 +1302,7 @@ func TestParseAnnotationBoolConfiguration(t *testing.T) {
 			ocispec := specs.Spec{
 				Annotations: map[string]string{tc.annotationKey: annotaionValue},
 			}
-			var val bool = false
+			val := false
 
 			err := newAnnotationConfiguration(ocispec, tc.annotationKey).setBool(func(v bool) {
 				val = v
@@ -1139,6 +1342,13 @@ func makeSizingAnnotations(memory, quota, period string) *specs.Spec {
 	spec.Annotations[ctrAnnotations.SandboxMem] = memory
 
 	return &spec
+}
+
+func makeSizingAnnotationsWithShares(memory, quota, period, shares string) *specs.Spec {
+	spec := makeSizingAnnotations(memory, quota, period)
+	spec.Annotations[ctrAnnotations.SandboxCPUShares] = shares
+
+	return spec
 }
 
 func TestCalculateContainerSizing(t *testing.T) {
@@ -1253,6 +1463,42 @@ func TestCalculateSandboxSizing(t *testing.T) {
 			spec:        makeSizingAnnotations("4294967296", "400", "100"),
 			expectedCPU: 4,
 			expectedMem: 4096,
+		},
+		// cpuManagerPolicy=static: kubelet leaves the quota
+		// unconstrained (-1) and pins CPUs via cpuset, so the CPU
+		// count must be derived from the shares (1024 shares per CPU).
+		{
+			spec:        makeSizingAnnotationsWithShares("1048576", "-1", "100", "2048"),
+			expectedCPU: 2,
+			expectedMem: 1,
+		},
+		// Shares that don't divide evenly are rounded up.
+		{
+			spec:        makeSizingAnnotationsWithShares("0", "-1", "100", "1536"),
+			expectedCPU: 2,
+			expectedMem: 0,
+		},
+		// BestEffort sandbox: no CPU request means quota is 0/absent,
+		// but the cgroup still carries the floor shares value (2). This
+		// must contribute 0 vCPUs, otherwise every sandbox (e.g. a
+		// peer-pod) would be inflated by one vCPU.
+		{
+			spec:        makeSizingAnnotationsWithShares("0", "0", "100", "2"),
+			expectedCPU: 0,
+			expectedMem: 0,
+		},
+		// An explicit quota always wins over shares: the shares-based
+		// fallback only applies when the quota is unconstrained.
+		{
+			spec:        makeSizingAnnotationsWithShares("0", "200", "100", "8192"),
+			expectedCPU: 2,
+			expectedMem: 0,
+		},
+		// Unconstrained quota but no shares set: nothing to derive from.
+		{
+			spec:        makeSizingAnnotationsWithShares("0", "-1", "100", "0"),
+			expectedCPU: 0,
+			expectedMem: 0,
 		},
 	}
 

@@ -80,7 +80,7 @@ filesystem components to generate an initrd.
 3. When generating an image, the initrd is extracted to obtain the base rootfs for
 the image.
 
-Ubuntu is the default distro for building the rootfs, to use a different one, you can set `DISTRO=alpine|clearlinux|debian|ubuntu|cbl-mariner`.
+Ubuntu is the default distro for building the rootfs, to use a different one, you can set `DISTRO=alpine|debian|ubuntu|cbl-mariner`.
 For example `make USE_DOCKER=true DISTRO=alpine rootfs` will make an Alpine rootfs using Docker.
 
 ### Rootfs creation
@@ -178,20 +178,9 @@ $ make BUILD_METHOD=dracut DRACUT_KVERSION=5.2.1-23-kata AGENT_INIT=yes initrd
 
 ### Custom images
 
-The Kata Containers kernel and rootfs images are by design "minimal". If advanced, 
-site specific, or customized features are required, then building a customized 
+The Kata Containers kernel and rootfs images are by design "minimal". If advanced,
+site specific, or customized features are required, then building a customized
 kernel and/or rootfs may be required.
-
-The below are some examples which may help or be useful for generating a 
-customized system.
-
-#### Intel® QuickAssist Technology (QAT) customized kernel and rootfs
-
-As documented in the
-[Intel® QAT Kata use-case documentation](../../docs/use-cases/using-Intel-QAT-and-kata.md),
-enabling this hardware requires a customized kernel and rootfs to work with Kata. 
-To ease building of the kernel and rootfs, a [Dockerfile](./dockerfiles/QAT) is 
-supplied, that when run, generates the required kernel and rootfs binaries.
 
 ## Testing
 

@@ -4,7 +4,6 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 MK_DIR         := $(shell dirname $(realpath $(lastword $(MAKEFILE_LIST))))
-TEST_RUNNER    := $(MK_DIR)/tests/test_images.sh
 ROOTFS_BUILDER := $(MK_DIR)/rootfs-builder/rootfs.sh
 INITRD_BUILDER := $(MK_DIR)/initrd-builder/initrd_builder.sh
 IMAGE_BUILDER  := $(MK_DIR)/image-builder/image_builder.sh
@@ -93,7 +92,7 @@ rootfs-%: $(ROOTFS_BUILD_DEST)/.%$(ROOTFS_MARKER_SUFFIX)
 
 .PRECIOUS: $(ROOTFS_BUILD_DEST)/.%$(ROOTFS_MARKER_SUFFIX)
 $(ROOTFS_BUILD_DEST)/.%$(ROOTFS_MARKER_SUFFIX):: rootfs-builder/%
-	$(call silent_run,Creating rootfs for "$*",$(ROOTFS_BUILDER) -o $(VERSION_COMMIT) -r $(ROOTFS_BUILD_DEST)/$*_rootfs $*)
+	$(call silent_run,Creating rootfs for "$*",$(ROOTFS_BUILDER) -o $(VERSION_COMMIT) -d -r $(ROOTFS_BUILD_DEST)/$*_rootfs $*)
 	@touch $@
 
 # To generate a dracut rootfs, we first generate a dracut initrd and then
@@ -155,18 +154,6 @@ $(DRACUT_OVERLAY_DIR):
 	$(ROOTFS_BUILDER) -o $(VERSION_COMMIT) -r $@
 	mkdir -p $@/etc/modules-load.d
 	echo $(DRACUT_KMODULES) | tr " " "\n" > $@/etc/modules-load.d/kata-modules.conf
-
-.PHONY: test
-test:
-	$(TEST_RUNNER) "$(DISTRO)"
-
-.PHONY: test-image-only
-test-image-only:
-	$(TEST_RUNNER) --test-images-only "$(DISTRO)"
-
-.PHONY: test-initrd-only
-test-initrd-only:
-	$(TEST_RUNNER) --test-initrds-only "$(DISTRO)"
 
 .PHONY: list-distros
 list-distros:

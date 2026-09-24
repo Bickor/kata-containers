@@ -23,7 +23,6 @@ import (
 	containerd_types "github.com/containerd/containerd/api/types"
 	"github.com/containerd/containerd/mount"
 	"github.com/containerd/typeurl/v2"
-	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/config"
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/utils"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/annotations"
@@ -41,8 +40,8 @@ import (
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/katautils"
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/katautils/katatrace"
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/oci"
-	vc "github.com/kata-containers/kata-containers/src/runtime/virtcontainers"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/compatoci"
+	"tags.cncf.io/container-device-interface/pkg/cdi"
 )
 
 type startManagementServerFunc func(s *service, ctx context.Context, ociSpec *specs.Spec)
@@ -52,7 +51,7 @@ var defaultStartManagementServerFunc startManagementServerFunc = func(s *service
 	shimLog.Info("management server started")
 }
 
-func copyLayersToMounts(rootFs *vc.RootFs, spec *specs.Spec) error {
+func copyLayersToMounts(rootFs *virtcontainers.RootFs, spec *specs.Spec) error {
 	for _, o := range rootFs.Options {
 		if !strings.HasPrefix(o, annotations.FileSystemLayer) {
 			continue
@@ -75,7 +74,7 @@ func copyLayersToMounts(rootFs *vc.RootFs, spec *specs.Spec) error {
 }
 
 func create(ctx context.Context, s *service, r *taskAPI.CreateTaskRequest) (*container, error) {
-	rootFs := vc.RootFs{}
+	rootFs := virtcontainers.RootFs{}
 	if len(r.Rootfs) == 1 {
 		m := r.Rootfs[0]
 		rootFs.Source = m.Source
@@ -108,26 +107,16 @@ func create(ctx context.Context, s *service, r *taskAPI.CreateTaskRequest) (*con
 	}
 
 	switch containerType {
-	case vc.PodSandbox, vc.SingleContainer:
+	case virtcontainers.PodSandbox, virtcontainers.SingleContainer:
 		if s.sandbox != nil {
 			return nil, fmt.Errorf("cannot create another sandbox in sandbox: %s", s.sandbox.ID())
 		}
-		// We can provide additional directories where to search for
-		// CDI specs if needed. immutable OS's only have specific
-		// directories where applications can write too. For instance /opt/cdi
-		//
-		// _, err = withCDI(ociSpec.Annotations, []string{"/opt/cdi"}, ociSpec)
-		//
-		// Only inject CDI devices if single_container we do not want
-		// CDI devices in the pod_sandbox
-		if containerType == vc.SingleContainer {
-			_, err = config.WithCDI(ociSpec.Annotations, []string{}, ociSpec)
-			if err != nil {
-				return nil, fmt.Errorf("adding CDI devices failed")
-			}
-		}
 
 		s.config = runtimeConfig
+		err = coldPlugDevices(ctx, s, ociSpec)
+		if err != nil {
+			return nil, fmt.Errorf("device cold plug failed: %w", err)
+		}
 
 		// create tracer
 		// This is the earliest location we can create the tracer because we must wait
@@ -161,7 +150,7 @@ func create(ctx context.Context, s *service, r *taskAPI.CreateTaskRequest) (*con
 		//   2. If this is not a sandbox infrastructure container, but instead a standalone single container (analogous to "docker run..."),
 		//	then the container spec itself will contain appropriate sizing information for the entire sandbox (since it is
 		//	a single container.
-		if containerType == vc.PodSandbox {
+		if containerType == virtcontainers.PodSandbox {
 			s.config.SandboxCPUs, s.config.SandboxMemMB = oci.CalculateSandboxSizing(ociSpec)
 		} else {
 			s.config.SandboxCPUs, s.config.SandboxMemMB = oci.CalculateContainerSizing(ociSpec)
@@ -187,6 +176,13 @@ func create(ctx context.Context, s *service, r *taskAPI.CreateTaskRequest) (*con
 			}
 		}
 
+		// config.WithCDI() has used the CDI annotations to inject
+		// host-side devices. As these annotations reference device kinds
+		// that don't exist in the guest (e.g., nvidia.com/pgpu), we
+		// remove them before creating the sandbox and the containers
+		// within it.
+		removeCDIAnnotations(ociSpec.Annotations)
+
 		// Pass service's context instead of local ctx to CreateSandbox(), since local
 		// ctx will be canceled after this rpc service call, but the sandbox will live
 		// across multiple rpc service calls.
@@ -206,7 +202,7 @@ func create(ctx context.Context, s *service, r *taskAPI.CreateTaskRequest) (*con
 			defaultStartManagementServerFunc(s, ctx, ociSpec)
 		}
 
-	case vc.PodContainer:
+	case virtcontainers.PodContainer:
 		span, ctx := katatrace.Trace(s.ctx, shimLog, "create", shimTracingTags)
 		defer span.End()
 
@@ -225,6 +221,12 @@ func create(ctx context.Context, s *service, r *taskAPI.CreateTaskRequest) (*con
 				}
 			}
 		}()
+
+		// CDI annotations have been processed during PodSandbox creation
+		// and cold-plug. CDI annotations referencing device kinds that
+		// exist in the guest (e.g., nvidia.com/gpu) will be generated
+		// during device attachment.
+		removeCDIAnnotations(ociSpec.Annotations)
 
 		_, err = katautils.CreateContainer(ctx, s.sandbox, *ociSpec, rootFs, r.ID, bundlePath, disableOutput, runtimeConfig.DisableGuestEmptyDir)
 		if err != nil {
@@ -318,7 +320,11 @@ func checkAndMount(s *service, r *taskAPI.CreateTaskRequest) (bool, error) {
 			return false, nil
 		}
 
-		if m.Type == vc.NydusRootFSType {
+		if virtcontainers.IsErofsRootFS(virtcontainers.RootFs{Options: m.Options, Type: m.Type}) {
+			return false, nil
+		}
+
+		if virtcontainers.IsNydusRootFSType(m.Type) {
 			// if kata + nydus, do not mount
 			return false, nil
 		}
@@ -354,7 +360,7 @@ func doMount(mounts []*containerd_types.Mount, rootfs string) error {
 	return nil
 }
 
-func configureNonRootHypervisor(runtimeConfig *oci.RuntimeConfig, sandboxId string) error {
+func configureNonRootHypervisor(runtimeConfig *oci.RuntimeConfig, sandboxID string) error {
 	userName, err := utils.CreateVmmUser()
 	if err != nil {
 		return err
@@ -363,7 +369,7 @@ func configureNonRootHypervisor(runtimeConfig *oci.RuntimeConfig, sandboxId stri
 		if err != nil {
 			shimLog.WithFields(logrus.Fields{
 				"user_name":  userName,
-				"sandbox_id": sandboxId,
+				"sandbox_id": sandboxID,
 			}).WithError(err).Warn("configure non root hypervisor failed, delete the user")
 			if err2 := utils.RemoveVmmUser(userName); err2 != nil {
 				shimLog.WithField("userName", userName).WithError(err).Warn("failed to remove user")
@@ -391,7 +397,7 @@ func configureNonRootHypervisor(runtimeConfig *oci.RuntimeConfig, sandboxId stri
 		"user_name":  userName,
 		"uid":        uid,
 		"gid":        gid,
-		"sandbox_id": sandboxId,
+		"sandbox_id": sandboxID,
 	}).Debug("successfully created a non root user for the hypervisor")
 
 	userTmpDir := path.Join("/run/user/", fmt.Sprint(uid))
@@ -403,7 +409,7 @@ func configureNonRootHypervisor(runtimeConfig *oci.RuntimeConfig, sandboxId stri
 		}
 	}
 
-	if err = os.Mkdir(userTmpDir, vc.DirMode); err != nil {
+	if err = os.Mkdir(userTmpDir, virtcontainers.DirMode); err != nil {
 		return err
 	}
 	defer func() {
@@ -431,4 +437,17 @@ func configureNonRootHypervisor(runtimeConfig *oci.RuntimeConfig, sandboxId stri
 		return nil
 	}
 	return fmt.Errorf("failed to get the gid of /dev/kvm")
+}
+
+func removeCDIAnnotations(annotations map[string]string) {
+	if annotations == nil {
+		return
+	}
+
+	for key := range annotations {
+		if strings.HasPrefix(key, cdi.AnnotationPrefix) {
+			shimLog.Debugf("removing CDI annotation: %s=%s", key, annotations[key])
+			delete(annotations, key)
+		}
+	}
 }

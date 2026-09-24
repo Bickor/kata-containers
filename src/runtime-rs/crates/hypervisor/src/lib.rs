@@ -12,18 +12,31 @@ logging::logger_with_subsystem!(sl, "hypervisor");
 pub mod device;
 pub mod hypervisor_persist;
 pub use device::driver::*;
+pub use device::pci_path::PciPath;
 use device::DeviceType;
-#[cfg(not(target_arch = "s390x"))]
+#[cfg(all(
+    feature = "dragonball",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 pub mod dragonball;
-#[cfg(not(target_arch = "s390x"))]
+// Firecracker upstream only releases binaries for x86_64 and aarch64
+// (see https://github.com/firecracker-microvm/firecracker/releases), so there
+// is no point compiling the in-tree driver on other architectures. Use the
+// same architecture gate as `ch` (further down in this file) for consistency.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub mod firecracker;
 mod kernel_param;
 pub mod qemu;
+pub mod remote;
+pub mod selinux;
 pub use kernel_param::Param;
 pub mod utils;
 use std::collections::HashMap;
 
-#[cfg(all(feature = "cloud-hypervisor", not(target_arch = "s390x")))]
+#[cfg(all(
+    feature = "cloud-hypervisor",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 pub mod ch;
 
 use anyhow::Result;
@@ -44,31 +57,48 @@ const VM_ROOTFS_DRIVER_MMIO: &str = "virtio-blk-mmio";
 const VM_ROOTFS_ROOT_BLK: &str = "/dev/vda1";
 const VM_ROOTFS_ROOT_PMEM: &str = "/dev/pmem0p1";
 
-// Config which filesystem to use as rootfs type
-const VM_ROOTFS_FILESYSTEM_EXT4: &str = "ext4";
-const VM_ROOTFS_FILESYSTEM_XFS: &str = "xfs";
-const VM_ROOTFS_FILESYSTEM_EROFS: &str = "erofs";
-
 // before using hugepages for VM, we need to mount hugetlbfs
 // /dev/hugepages will be the mount point
 // mkdir -p /dev/hugepages
 // mount -t hugetlbfs none /dev/hugepages
-#[cfg(not(target_arch = "s390x"))]
-const DEV_HUGEPAGES: &str = "/dev/hugepages";
 pub const HUGETLBFS: &str = "hugetlbfs";
-#[cfg(not(target_arch = "s390x"))]
+// Constants required for Dragonball VMM when enabled.
+// Gated on both feature and arch so they activate together with `pub mod
+// dragonball;` above (the dragonball crate only builds on x86_64/aarch64).
+#[cfg(all(
+    feature = "dragonball",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+const DEV_HUGEPAGES: &str = "/dev/hugepages";
+#[cfg(all(
+    feature = "dragonball",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 const SHMEM: &str = "shmem";
-#[cfg(not(target_arch = "s390x"))]
+#[cfg(all(
+    feature = "dragonball",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 const HUGE_SHMEM: &str = "hugeshmem";
 
 pub const HYPERVISOR_DRAGONBALL: &str = "dragonball";
 pub const HYPERVISOR_QEMU: &str = "qemu";
 pub const HYPERVISOR_FIRECRACKER: &str = "firecracker";
+pub const HYPERVISOR_REMOTE: &str = "remote";
 
 pub const DEFAULT_HYBRID_VSOCK_NAME: &str = "kata.hvsock";
 pub const JAILER_ROOT: &str = "root";
 
-#[cfg(not(target_arch = "s390x"))]
+/// default hotplug timeout
+#[allow(dead_code)]
+const DEFAULT_HOTPLUG_TIMEOUT: u64 = 250;
+
+// Used only by the dragonball, cloud-hypervisor and firecracker drivers, all
+// of which are gated to `target_arch = "x86_64"|"aarch64"`. Without the gate
+// here, `cargo clippy --all-features -- -D warnings` (i.e. what `make check`
+// runs via utils.mk's `standard_rust_check`) fails on s390x/ppc64le/riscv64gc
+// with `enum VmmState is never used`.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[derive(PartialEq, Debug, Clone)]
 pub(crate) enum VmmState {
     NotReady,
@@ -93,7 +123,13 @@ pub struct MemoryConfig {
 #[async_trait]
 pub trait Hypervisor: std::fmt::Debug + Send + Sync {
     // vm manager
-    async fn prepare_vm(&self, id: &str, netns: Option<String>) -> Result<()>;
+    async fn prepare_vm(
+        &self,
+        id: &str,
+        netns: Option<String>,
+        annotations: &HashMap<String, String>,
+        selinux_label: Option<String>,
+    ) -> Result<()>;
     async fn start_vm(&self, timeout: i32) -> Result<()>;
     async fn stop_vm(&self) -> Result<()>;
     async fn wait_vm(&self) -> Result<i32>;
@@ -126,4 +162,15 @@ pub trait Hypervisor: std::fmt::Debug + Send + Sync {
     async fn set_guest_memory_block_size(&self, size: u32);
     async fn guest_memory_block_size(&self) -> u32;
     async fn get_passfd_listener_addr(&self) -> Result<(String, u32)>;
+
+    /// Resolve the in-guest PCIe path for a cold-plugged physical-endpoint VF
+    /// by querying QMP (query-pci + device search by QEMU device ID).
+    /// Only meaningful after the VM has started and QMP is initialised.
+    /// Default: Err (non-QEMU hypervisors do not support this).
+    async fn resolve_vfio_device_pci_path(&self, hostdev_id: &str) -> Result<PciPath> {
+        Err(anyhow::anyhow!(
+            "resolve_vfio_device_pci_path not supported for this hypervisor (device: {})",
+            hostdev_id
+        ))
+    }
 }

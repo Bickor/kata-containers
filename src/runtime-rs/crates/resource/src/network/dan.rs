@@ -79,7 +79,7 @@ impl DanInner {
 
         let mut entity_list = Vec::with_capacity(config.devices.len());
         for (idx, device) in config.devices.iter().enumerate() {
-            let name = format!("eth{}", idx);
+            let name = format!("eth{idx}");
             let endpoint: Arc<dyn Endpoint> = match &device.device {
                 Device::VhostUser {
                     path,
@@ -95,7 +95,7 @@ impl DanInner {
                         *queue_size,
                     )
                     .await
-                    .with_context(|| format!("create a vhost user endpoint, path: {}", path))?,
+                    .with_context(|| format!("create a vhost user endpoint, path: {path}"))?,
                 ),
                 Device::HostTap {
                     tap_name,
@@ -112,7 +112,7 @@ impl DanInner {
                         dev_mgr,
                     )
                     .await
-                    .with_context(|| format!("create a {} tap endpoint", tap_name))?,
+                    .with_context(|| format!("create a {tap_name} tap endpoint"))?,
                 ),
             };
 
@@ -290,6 +290,10 @@ pub(crate) struct Route {
     // Scope
     #[serde(default)]
     pub scope: u32,
+    #[serde(default)]
+    pub flags: u32,
+    #[serde(default)]
+    pub mtu: u32,
 }
 
 impl Route {
@@ -337,7 +341,7 @@ fn default_mtu() -> u64 {
 /// Path of DAN config, the file contains an array of DanDevices.
 #[inline]
 pub fn dan_config_path(config: &TomlConfig, sandbox_id: &str) -> PathBuf {
-    PathBuf::from(config.runtime.dan_conf.as_str()).join(format!("{}.json", sandbox_id))
+    PathBuf::from(config.runtime.dan_conf.as_str()).join(format!("{sandbox_id}.json"))
 }
 
 #[cfg(test)]
@@ -367,7 +371,8 @@ mod tests {
                     "source": "172.18.0.1",
                     "gateway": "172.18.31.1",
                     "scope": 0,
-                    "flags": 0
+                    "flags": 0,
+                    "mtu": 1450
                 }],
                 "neighbors": [{
                     "ip_address": "192.168.0.3/16",
@@ -399,6 +404,8 @@ mod tests {
                     source: "172.18.0.1".to_owned(),
                     gateway: "172.18.31.1".to_owned(),
                     scope: 0,
+                    flags: 0,
+                    mtu: 1450,
                 }],
                 neighbors: vec![ARPNeighbor {
                     ip_address: Some("192.168.0.3/16".to_owned()),

@@ -18,6 +18,7 @@ use dragonball::{
     vm::VmConfigInfo,
 };
 
+use crate::DEFAULT_HOTPLUG_TIMEOUT;
 use kata_sys_util::mount;
 use kata_types::{
     capabilities::{Capabilities, CapabilityBits},
@@ -28,7 +29,7 @@ use kata_types::{
 };
 use nix::mount::MsFlags;
 use persist::sandbox_persist::Persist;
-use std::cmp::Ordering;
+use std::{cmp::Ordering, time::Duration};
 use std::{collections::HashSet, fs::create_dir_all};
 use tokio::sync::mpsc;
 
@@ -37,6 +38,7 @@ const DRAGONBALL_INITRD: &str = "initrd";
 const DRAGONBALL_ROOT_FS: &str = "rootfs";
 const BALLOON_DEVICE_ID: &str = "balloon0";
 const MEM_DEVICE_ID: &str = "memmr0";
+
 #[derive(Debug)]
 pub struct DragonballInner {
     /// sandbox id
@@ -142,13 +144,15 @@ impl DragonballInner {
         let mut kernel_params = KernelParams::new(self.config.debug_info.enable_debug);
 
         if self.config.boot_info.initrd.is_empty() {
-            // get rootfs driver
+            // When booting from the image, add rootfs and verity parameters here.
             let rootfs_driver = self.config.blockdev_info.block_device_driver.clone();
-
-            kernel_params.append(&mut KernelParams::new_rootfs_kernel_params(
+            let mut rootfs_params = KernelParams::new_rootfs_kernel_params(
+                &self.config.boot_info.kernel_verity_params,
                 &rootfs_driver,
                 &self.config.boot_info.rootfs_type,
-            )?);
+                true,
+            )?;
+            kernel_params.append(&mut rootfs_params);
         }
 
         kernel_params.append(&mut KernelParams::from_string(
@@ -156,8 +160,7 @@ impl DragonballInner {
         ));
         if let Some(passfd_listener_port) = self.passfd_listener_port {
             kernel_params.append(&mut KernelParams::from_string(&format!(
-                "{}={}",
-                PASSFD_LISTENER_PORT, passfd_listener_port
+                "{PASSFD_LISTENER_PORT}={passfd_listener_port}"
             )));
         }
         info!(sl!(), "prepared kernel_params={:?}", kernel_params);
@@ -214,10 +217,7 @@ impl DragonballInner {
         }
 
         std::fs::remove_dir_all(&self.vm_path)
-            .map_err(|err| {
-                error!(sl!(), "failed to remove dir all for {}", &self.vm_path);
-                err
-            })
+            .inspect_err(|_| error!(sl!(), "failed to remove dir all for {}", &self.vm_path))
             .ok();
     }
 
@@ -234,7 +234,7 @@ impl DragonballInner {
         let vm_config = VmConfigInfo {
             serial_path: Some(serial_path),
             mem_size_mib: self.config.memory_info.default_memory as usize,
-            vcpu_count: self.config.cpu_info.default_vcpus as u8,
+            vcpu_count: self.config.cpu_info.default_vcpus.ceil() as u8,
             max_vcpu_count: self.config.cpu_info.default_maxvcpus as u8,
             mem_type,
             mem_file_path,
@@ -394,10 +394,12 @@ impl DragonballInner {
             vcpu_count: Some(new_vcpus as u8),
         };
         self.vmm_instance
-            .resize_vcpu(&cpu_resize_info)
+            .resize_vcpu(
+                &cpu_resize_info,
+                Some(Duration::from_millis(DEFAULT_HOTPLUG_TIMEOUT)),
+            )
             .context(format!(
-                "failed to do_resize_vcpus on new_vcpus={:?}",
-                new_vcpus
+                "failed to do_resize_vcpus on new_vcpus={new_vcpus:?}"
             ))?;
         Ok((old_vcpus, new_vcpus))
     }
@@ -430,7 +432,7 @@ impl DragonballInner {
                         use_shared_irq: None,
                         use_generic_irq: None,
                         f_deflate_on_oom: false,
-                        f_reporting: self.config.device_info.enable_balloon_f_reporting,
+                        f_reporting: self.config.device_info.reclaim_guest_freed_memory,
                     };
                     self.vmm_instance
                         .insert_balloon_device(balloon_config)
@@ -462,7 +464,7 @@ impl DragonballInner {
                     use_shared_irq: None,
                     use_generic_irq: None,
                     f_deflate_on_oom: false,
-                    f_reporting: self.config.device_info.enable_balloon_f_reporting,
+                    f_reporting: self.config.device_info.reclaim_guest_freed_memory,
                 };
                 self.balloon_size = had_mem_mb - new_mem_mb;
                 self.vmm_instance

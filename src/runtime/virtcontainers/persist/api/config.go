@@ -36,10 +36,6 @@ type HypervisorConfig struct {
 	// HypervisorPath is the hypervisor executable host path.
 	HypervisorPath string
 
-	// HypervisorCtlPath is the hypervisor ctl executable host path.
-	HypervisorCtlPath string
-
-	// HypervisorCtlPath is the hypervisor ctl executable host path.
 	// JailerPath is the jailer executable host path.
 	JailerPath string
 
@@ -74,9 +70,6 @@ type HypervisorConfig struct {
 	// VirtioFSCache cache mode for fs version cache
 	VirtioFSCache string
 
-	// File based memory backend root directory
-	FileBackedMemRootDir string
-
 	// VhostUserStorePath is the directory path where vhost-user devices
 	// related folders, sockets and device nodes should be.
 	VhostUserStorePath string
@@ -94,9 +87,6 @@ type HypervisorConfig struct {
 	// HypervisorPathList is the list of hypervisor paths names allowed in annotations
 	HypervisorPathList []string
 
-	// HypervisorCtlPathList is the list of hypervisor control paths names allowed in annotations
-	HypervisorCtlPathList []string
-
 	// JailerPathList is the list of jailer paths names allowed in annotations
 	JailerPathList []string
 
@@ -108,9 +98,6 @@ type HypervisorConfig struct {
 
 	// VirtioFSExtraArgs passes options to virtiofsd daemon
 	VirtioFSExtraArgs []string
-
-	// FileBackedMemRootList is the list of valid root directories values for annotations
-	FileBackedMemRootList []string
 
 	// VhostUserStorePathList is the list of valid values for vhost-user paths
 	VhostUserStorePathList []string
@@ -164,12 +151,24 @@ type HypervisorConfig struct {
 	// Denotes whether flush requests for the device are ignored.
 	BlockDeviceCacheNoflush bool
 
+	// BlockDeviceLogicalSectorSize specifies the logical sector size reported
+	// by block devices to the guest, in bytes.
+	BlockDeviceLogicalSectorSize uint32
+
+	// BlockDevicePhysicalSectorSize specifies the physical sector size reported
+	// by block devices to the guest, in bytes.
+	BlockDevicePhysicalSectorSize uint32
+
 	// DisableBlockDeviceUse disallows a block device from being used.
 	DisableBlockDeviceUse bool
 
 	// EnableIOThreads enables IO to be processed in a separate thread.
-	// Supported currently for virtio-scsi driver.
+	// Supported currently for virtio-scsi and virtio-blk(based on IndepIOThreads) driver.
 	EnableIOThreads bool
+
+	// Independent IOThreads enables IO to be processed in a separate thread, it is
+	// for QEMU hotplug device attach to iothread, like virtio-blk.
+	IndepIOThreads uint32
 
 	// Debug changes the default hypervisor and kernel parameters to
 	// enable debug output where available.

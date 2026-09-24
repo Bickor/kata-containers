@@ -12,7 +12,7 @@ use tokio::sync::RwLock;
 
 use hypervisor::{
     device::{
-        device_manager::{do_handle_device, do_update_device, DeviceManager},
+        device_manager::{do_handle_device, do_update_device, get_shared_fs_info, DeviceManager},
         driver::{ShareFsMountConfig, ShareFsMountOperation, ShareFsMountType},
         DeviceConfig,
     },
@@ -54,8 +54,12 @@ pub(crate) async fn prepare_virtiofs(
         sock_path: generate_sock_path(root),
         mount_tag: String::from(MOUNT_GUEST_TAG),
         fs_type: fs_type.to_string(),
-        queue_size: 0,
-        queue_num: 0,
+        // Pull virtio-fs queue size from the hypervisor config so the value
+        // configured via `virtio_fs_queue_size` in the toml actually reaches
+        // the VMM device line. There is currently no toml knob for the number
+        // of virtqueues, so we use a single queue (matching the prior default).
+        queue_size: get_shared_fs_info(d).await.virtio_fs_queue_size as u64,
+        queue_num: 1,
         options: vec![],
         mount_config: None,
     };
@@ -72,7 +76,7 @@ pub(crate) async fn setup_inline_virtiofs(d: &RwLock<DeviceManager>, id: &str) -
     // - source is the absolute path of PASSTHROUGH_FS_DIR on host, e.g.
     //   /run/kata-containers/shared/sandboxes/<sid>/passthrough
     // - mount point is the path relative to KATA_GUEST_SHARE_DIR in guest
-    let mnt = format!("/{}", PASSTHROUGH_FS_DIR);
+    let mnt = format!("/{PASSTHROUGH_FS_DIR}");
 
     let rw_source = utils::get_host_rw_shared_path(id).join(PASSTHROUGH_FS_DIR);
     utils::ensure_dir_exist(&rw_source).context("ensure directory exist")?;
@@ -140,7 +144,7 @@ pub async fn rafs_mount(
     // update virtio-fs device with ShareFsMountConfig
     do_update_device(d, &DeviceConfig::ShareFsCfg(sharefs_config))
         .await
-        .with_context(|| format!("fail to attach rafs {:?}", rafs_meta))?;
+        .with_context(|| format!("fail to attach rafs {rafs_meta:?}"))?;
 
     Ok(())
 }

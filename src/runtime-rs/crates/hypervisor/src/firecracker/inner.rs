@@ -4,10 +4,10 @@
 //SPDX-License-Identifier: Apache-2.0
 
 use crate::firecracker::{inner_hypervisor::FC_API_SOCKET_NAME, sl};
-use crate::HypervisorState;
 use crate::MemoryConfig;
 use crate::HYPERVISOR_FIRECRACKER;
 use crate::{device::DeviceType, VmmState};
+use crate::{selinux, HypervisorState};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use hyper::Client;
@@ -18,7 +18,6 @@ use kata_types::{
 };
 use nix::sched::{setns, CloneFlags};
 use persist::sandbox_persist::Persist;
-use std::os::unix::io::AsRawFd;
 use std::process::Stdio;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::BufReader;
@@ -46,14 +45,12 @@ pub struct FcInner {
     pub(crate) capabilities: Capabilities,
     pub(crate) fc_process: Mutex<Option<Child>>,
     pub(crate) exit_notify: Option<mpsc::Sender<()>>,
-    pub(crate) exit_waiter: Mutex<(mpsc::Receiver<()>, i32)>,
 }
 
 impl FcInner {
-    pub fn new() -> FcInner {
+    pub fn new(exit_notify: mpsc::Sender<()>) -> FcInner {
         let mut capabilities = Capabilities::new();
         capabilities.set(CapabilityBits::BlockDeviceSupport);
-        let (exit_notify, exit_waiter) = mpsc::channel(1);
 
         FcInner {
             id: String::default(),
@@ -71,7 +68,6 @@ impl FcInner {
             capabilities,
             fc_process: Mutex::new(None),
             exit_notify: Some(exit_notify),
-            exit_waiter: Mutex::new((exit_waiter, 0)),
         }
     }
 
@@ -106,16 +102,31 @@ impl FcInner {
                 cmd.args(["--api-sock", &self.asock_path]);
             }
         }
+        if self.config.security_info.disable_seccomp {
+            cmd.arg("--no-seccomp");
+        }
         debug!(sl(), "Exec: {:?}", cmd);
 
         // Make sure we're in the correct Network Namespace
         unsafe {
+            let selinux_label = self.config.security_info.selinux_label.clone();
             let _pre = cmd.pre_exec(move || {
                 if let Some(netns_path) = &netns {
                     debug!(sl(), "set netns for vmm master {:?}", &netns_path);
                     let netns_fd = std::fs::File::open(netns_path);
-                    let _ = setns(netns_fd?.as_raw_fd(), CloneFlags::CLONE_NEWNET)
-                        .context("set netns failed");
+                    let _ = setns(&netns_fd?, CloneFlags::CLONE_NEWNET).context("set netns failed");
+                }
+                if let Some(label) = selinux_label.as_ref() {
+                    if let Err(e) = selinux::set_exec_label(label) {
+                        error!(sl!(), "Failed to set SELinux label in child process: {}", e);
+                        // Don't return error here to avoid breaking the process startup
+                        // Log the error and continue
+                    } else {
+                        info!(
+                            sl!(),
+                            "Successfully set SELinux label in child process: {}", &label
+                        );
+                    }
                 }
                 Ok(())
             });
@@ -124,11 +135,10 @@ impl FcInner {
         let mut child = cmd.stderr(Stdio::piped()).spawn()?;
 
         let stderr = child.stderr.take().unwrap();
-        let exit_notify: mpsc::Sender<()> = self
+        let exit_notify = self
             .exit_notify
             .take()
             .ok_or_else(|| anyhow!("no exit notify"))?;
-
         tokio::spawn(log_fc_stderr(stderr, exit_notify));
 
         match child.id() {
@@ -216,7 +226,7 @@ async fn log_fc_stderr(stderr: ChildStderr, exit_notify: mpsc::Sender<()>) -> Re
 #[async_trait]
 impl Persist for FcInner {
     type State = HypervisorState;
-    type ConstructorArgs = ();
+    type ConstructorArgs = mpsc::Sender<()>;
 
     async fn save(&self) -> Result<Self::State> {
         Ok(HypervisorState {
@@ -231,12 +241,7 @@ impl Persist for FcInner {
             ..Default::default()
         })
     }
-    async fn restore(
-        _hypervisor_args: Self::ConstructorArgs,
-        hypervisor_state: Self::State,
-    ) -> Result<Self> {
-        let (exit_notify, exit_waiter) = mpsc::channel(1);
-
+    async fn restore(exit_notify: mpsc::Sender<()>, hypervisor_state: Self::State) -> Result<Self> {
         Ok(FcInner {
             id: hypervisor_state.id,
             asock_path: String::default(),
@@ -253,7 +258,6 @@ impl Persist for FcInner {
             capabilities: Capabilities::new(),
             fc_process: Mutex::new(None),
             exit_notify: Some(exit_notify),
-            exit_waiter: Mutex::new((exit_waiter, 0)),
         })
     }
 }

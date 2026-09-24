@@ -3,27 +3,32 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-#[cfg(target_arch = "x86_64")]
-use anyhow::anyhow;
 #[cfg(any(target_arch = "s390x", target_arch = "x86_64", target_arch = "aarch64"))]
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64;
 use std::fmt;
+#[cfg(all(target_arch = "powerpc64", target_endian = "little"))]
+use std::fs;
 #[cfg(target_arch = "x86_64")]
 use std::path::Path;
 use std::path::PathBuf;
 use thiserror::Error;
 
-#[cfg(any(target_arch = "s390x", target_arch = "powerpc64le"))]
+#[cfg(any(
+    target_arch = "s390x",
+    all(target_arch = "powerpc64", target_endian = "little")
+))]
 use nix::unistd::Uid;
 
 #[cfg(target_arch = "x86_64")]
 use std::fs;
 
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct TDXDetails {
-    pub major_version: u32,
-    pub minor_version: u32,
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SevSnpDetails {
+    pub cbitpos: u32,
+    pub phys_addr_reduction: u32,
 }
 
 #[allow(dead_code)]
@@ -31,9 +36,9 @@ pub struct TDXDetails {
 pub enum GuestProtection {
     #[default]
     NoProtection,
-    Tdx(TDXDetails),
-    Sev,
-    Snp,
+    Tdx,
+    Sev(SevSnpDetails),
+    Snp(SevSnpDetails),
     Pef,
     Se,
 }
@@ -41,13 +46,9 @@ pub enum GuestProtection {
 impl fmt::Display for GuestProtection {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            GuestProtection::Tdx(details) => write!(
-                f,
-                "tdx (major_version: {}, minor_version: {})",
-                details.major_version, details.minor_version
-            ),
-            GuestProtection::Sev => write!(f, "sev"),
-            GuestProtection::Snp => write!(f, "snp"),
+            GuestProtection::Tdx => write!(f, "tdx"),
+            GuestProtection::Sev(details) => write!(f, "sev (cbitpos: {}", details.cbitpos),
+            GuestProtection::Snp(details) => write!(f, "snp (cbitpos: {}", details.cbitpos),
             GuestProtection::Pef => write!(f, "pef"),
             GuestProtection::Se => write!(f, "se"),
             GuestProtection::NoProtection => write!(f, "none"),
@@ -78,95 +79,29 @@ pub enum ProtectionError {
 }
 
 #[cfg(target_arch = "x86_64")]
-pub const TDX_SYS_FIRMWARE_DIR: &str = "/sys/firmware/tdx/";
+pub const TDX_KVM_PARAMETER_PATH: &str = "/sys/module/kvm_intel/parameters/tdx";
 #[cfg(target_arch = "x86_64")]
 pub const SEV_KVM_PARAMETER_PATH: &str = "/sys/module/kvm_amd/parameters/sev";
 #[cfg(target_arch = "x86_64")]
 pub const SNP_KVM_PARAMETER_PATH: &str = "/sys/module/kvm_amd/parameters/sev_snp";
 
-// Module directory below TDX_SYS_FIRMWARE_DIR.
-#[cfg(target_arch = "x86_64")]
-const TDX_FW_MODULE_DIR: &str = "tdx_module";
-
-// File in TDX_FW_MODULE_DIR that specifies TDX major version number.
-#[cfg(target_arch = "x86_64")]
-const TDX_MAJOR_FILE: &str = "major_version";
-
-// File in TDX_FW_MODULE_DIR that specifies TDX minor version number.
-#[cfg(target_arch = "x86_64")]
-const TDX_MINOR_FILE: &str = "minor_version";
-
 #[cfg(target_arch = "x86_64")]
 pub fn available_guest_protection() -> Result<GuestProtection, ProtectionError> {
-    arch_guest_protection(
-        TDX_SYS_FIRMWARE_DIR,
-        SEV_KVM_PARAMETER_PATH,
-        SNP_KVM_PARAMETER_PATH,
-    )
+    arch_guest_protection(SEV_KVM_PARAMETER_PATH, SNP_KVM_PARAMETER_PATH)
 }
 
 #[cfg(target_arch = "x86_64")]
 pub fn arch_guest_protection(
-    tdx_path: &str,
     sev_path: &str,
     snp_path: &str,
 ) -> Result<GuestProtection, ProtectionError> {
-    let metadata = fs::metadata(tdx_path);
-
-    if metadata.is_ok() && metadata.unwrap().is_dir() {
-        let module_dir = safe_path::scoped_join(tdx_path, TDX_FW_MODULE_DIR).map_err(|e| {
-            ProtectionError::CannotResolvePath(
-                TDX_FW_MODULE_DIR.to_string(),
-                PathBuf::from(tdx_path),
-                anyhow!(e),
-            )
-        })?;
-
-        let major_file =
-            safe_path::scoped_join(module_dir.clone(), TDX_MAJOR_FILE).map_err(|e| {
-                ProtectionError::CannotResolvePath(
-                    TDX_MAJOR_FILE.to_string(),
-                    module_dir.clone(),
-                    anyhow!(e),
-                )
-            })?;
-
-        let minor_file =
-            safe_path::scoped_join(module_dir.clone(), TDX_MINOR_FILE).map_err(|e| {
-                ProtectionError::CannotResolvePath(
-                    TDX_MINOR_FILE.to_string(),
-                    module_dir,
-                    anyhow!(e),
-                )
-            })?;
-
-        const HEX_BASE: u32 = 16;
-        const HEX_PREFIX: &str = "0x";
-
-        let major_version_str = std::fs::read_to_string(major_file.clone()).map_err(|e| {
-            ProtectionError::FileMissing(major_file.clone().to_string_lossy().into(), e)
-        })?;
-
-        let major_version_str = major_version_str.trim_start_matches(HEX_PREFIX);
-
-        let major_version = u32::from_str_radix(major_version_str, HEX_BASE)
-            .map_err(|e| ProtectionError::FileInvalid(major_file, anyhow!(e)))?;
-
-        let minor_version_str = std::fs::read_to_string(minor_file.clone()).map_err(|e| {
-            ProtectionError::FileMissing(minor_file.clone().to_string_lossy().into(), e)
-        })?;
-
-        let minor_version_str = minor_version_str.trim_start_matches(HEX_PREFIX);
-
-        let minor_version = u32::from_str_radix(minor_version_str, HEX_BASE)
-            .map_err(|e| ProtectionError::FileInvalid(minor_file, anyhow!(e)))?;
-
-        let details = TDXDetails {
-            major_version,
-            minor_version,
-        };
-
-        return Ok(GuestProtection::Tdx(details));
+    // Check if /sys/module/kvm_intel/parameters/tdx is set to 'Y'
+    if Path::new(TDX_KVM_PARAMETER_PATH).exists() {
+        if let Ok(content) = fs::read(TDX_KVM_PARAMETER_PATH) {
+            if !content.is_empty() && content[0] == b'Y' {
+                return Ok(GuestProtection::Tdx);
+            }
+        }
     }
 
     let check_contents = |file_name: &str| -> Result<bool, ProtectionError> {
@@ -176,7 +111,7 @@ pub fn arch_guest_protection(
         }
 
         let contents = fs::read_to_string(file_name).map_err(|err| {
-            ProtectionError::CheckFailed(format!("Error reading file {} : {}", file_name, err))
+            ProtectionError::CheckFailed(format!("Error reading file {file_name} : {err}"))
         })?;
 
         if contents.trim() == "Y" {
@@ -185,12 +120,49 @@ pub fn arch_guest_protection(
         Ok(false)
     };
 
-    if check_contents(snp_path)? {
-        return Ok(GuestProtection::Snp);
-    }
+    let retrieve_sev_params = || -> Result<(u32, u32), ProtectionError> {
+        // The initial checks for AMD and SEV shouldn't be necessary due to
+        // the context this function is currently called from, however it
+        // shouldn't hurt to double-check and have better logging if anything
+        // goes wrong.
 
-    if check_contents(sev_path)? {
-        return Ok(GuestProtection::Sev);
+        let fn0 = x86_64::__cpuid(0);
+        // The values in [ ebx, edx, ecx ] spell out "AuthenticAMD" when
+        // interpreted byte-wise as ASCII.  No need to bother here with an
+        // actual conversion to string though.
+        // See also AMD64 Architecture Programmer's Manual pg. 600
+        // https://www.amd.com/content/dam/amd/en/documents/processor-tech-docs/programmer-references/24594.pdf
+        if fn0.ebx != 0x68747541 || fn0.edx != 0x69746e65 || fn0.ecx != 0x444d4163 {
+            return Err(ProtectionError::CheckFailed(
+                "Not an AMD processor".to_owned(),
+            ));
+        }
+
+        // AMD64 Architecture Prgrammer's Manual Fn8000_001f docs on pg. 640
+        let fn8000_001f = x86_64::__cpuid(0x8000_001f);
+        if fn8000_001f.eax & 0x10 == 0 {
+            return Err(ProtectionError::CheckFailed("SEV not supported".to_owned()));
+        }
+
+        let cbitpos = fn8000_001f.ebx & 0b11_1111;
+        let phys_addr_reduction = (fn8000_001f.ebx & 0b1111_1100_0000) >> 6;
+
+        Ok((cbitpos, phys_addr_reduction))
+    };
+
+    let is_snp_available = check_contents(snp_path)?;
+    let is_sev_available = is_snp_available || check_contents(sev_path)?;
+    if is_snp_available || is_sev_available {
+        let (cbitpos, phys_addr_reduction) = retrieve_sev_params()?;
+        let sev_snp_details = SevSnpDetails {
+            cbitpos,
+            phys_addr_reduction,
+        };
+        return Ok(if is_snp_available {
+            GuestProtection::Snp(sev_snp_details)
+        } else {
+            GuestProtection::Sev(sev_snp_details)
+        });
     }
 
     Ok(GuestProtection::NoProtection)
@@ -198,17 +170,13 @@ pub fn arch_guest_protection(
 
 #[cfg(target_arch = "s390x")]
 #[allow(dead_code)]
-// Guest protection is not supported on ARM64.
 pub fn available_guest_protection() -> Result<GuestProtection, ProtectionError> {
     if !Uid::effective().is_root() {
-        return Err(ProtectionError::NoPerms)?;
+        Err(ProtectionError::NoPerms)?;
     }
 
     let facilities = crate::cpu::retrieve_cpu_facilities().map_err(|err| {
-        ProtectionError::CheckFailed(format!(
-            "Error retrieving cpu facilities file : {}",
-            err.to_string()
-        ))
+        ProtectionError::CheckFailed(format!("Error retrieving cpu facilities file : {err}"))
     })?;
 
     // Secure Execution
@@ -234,23 +202,33 @@ pub fn available_guest_protection() -> Result<GuestProtection, ProtectionError> 
     Ok(GuestProtection::Se)
 }
 
-#[cfg(target_arch = "powerpc64le")]
-pub fn available_guest_protection() -> Result<check::GuestProtection, check::ProtectionError> {
+#[cfg(all(target_arch = "powerpc64", target_endian = "little"))]
+const PEF_SYS_FIRMWARE_DIR: &str = "/sys/firmware/ultravisor/";
+
+#[cfg(all(target_arch = "powerpc64", target_endian = "little"))]
+pub fn available_guest_protection() -> Result<GuestProtection, ProtectionError> {
     if !Uid::effective().is_root() {
-        return Err(check::ProtectionError::NoPerms);
+        return Err(ProtectionError::NoPerms);
     }
 
     let metadata = fs::metadata(PEF_SYS_FIRMWARE_DIR);
     if metadata.is_ok() && metadata.unwrap().is_dir() {
-        Ok(check::GuestProtection::Pef)
+        return Ok(GuestProtection::Pef);
     }
 
-    Ok(check::GuestProtection::NoProtection)
+    Ok(GuestProtection::NoProtection)
 }
 
 #[cfg(target_arch = "aarch64")]
 #[allow(dead_code)]
 // Guest protection is not supported on ARM64.
+pub fn available_guest_protection() -> Result<GuestProtection, ProtectionError> {
+    Ok(GuestProtection::NoProtection)
+}
+
+#[cfg(target_arch = "riscv64")]
+#[allow(dead_code)]
+// Guest protection is not supported on RISC-V.
 pub fn available_guest_protection() -> Result<GuestProtection, ProtectionError> {
     Ok(GuestProtection::NoProtection)
 }
@@ -268,16 +246,21 @@ mod tests {
         // Test snp
         let dir = tempdir().unwrap();
         let snp_file_path = dir.path().join("sev_snp");
+        if !snp_file_path.exists() {
+            println!("INFO: skipping {} which needs sev_snp", module_path!());
+            return;
+        }
+
         let path = snp_file_path.clone();
         let mut snp_file = fs::File::create(snp_file_path).unwrap();
         writeln!(snp_file, "Y").unwrap();
 
-        let actual = arch_guest_protection("/xyz/tmp", "/xyz/tmp", path.to_str().unwrap());
+        let actual = arch_guest_protection("/xyz/tmp", path.to_str().unwrap());
         assert!(actual.is_ok());
-        assert_eq!(actual.unwrap(), GuestProtection::Snp);
+        assert!(matches!(actual.unwrap(), GuestProtection::Snp(_)));
 
         writeln!(snp_file, "N").unwrap();
-        let actual = arch_guest_protection("/xyz/tmp", "/xyz/tmp", path.to_str().unwrap());
+        let actual = arch_guest_protection("/xyz/tmp", path.to_str().unwrap());
         assert!(actual.is_ok());
         assert_eq!(actual.unwrap(), GuestProtection::NoProtection);
     }
@@ -287,16 +270,21 @@ mod tests {
         // Test sev
         let dir = tempdir().unwrap();
         let sev_file_path = dir.path().join("sev");
+        if !sev_file_path.exists() {
+            println!("INFO: skipping {} which needs sev", module_path!());
+            return;
+        }
+
         let sev_path = sev_file_path.clone();
         let mut sev_file = fs::File::create(sev_file_path).unwrap();
         writeln!(sev_file, "Y").unwrap();
 
-        let actual = arch_guest_protection("/xyz/tmp", sev_path.to_str().unwrap(), "/xyz/tmp");
+        let actual = arch_guest_protection(sev_path.to_str().unwrap(), "/xyz/tmp");
         assert!(actual.is_ok());
-        assert_eq!(actual.unwrap(), GuestProtection::Sev);
+        assert!(matches!(actual.unwrap(), GuestProtection::Sev(_)));
 
         writeln!(sev_file, "N").unwrap();
-        let actual = arch_guest_protection("/xyz/tmp", sev_path.to_str().unwrap(), "/xyz/tmp");
+        let actual = arch_guest_protection(sev_path.to_str().unwrap(), "/xyz/tmp");
         assert!(actual.is_ok());
         assert_eq!(actual.unwrap(), GuestProtection::NoProtection);
     }
@@ -309,53 +297,28 @@ mod tests {
         let invalid_dir = invalid_dir.to_str().unwrap();
 
         let tdx_file_path = dir.path().join("tdx");
+        if !tdx_file_path.exists() {
+            println!("INFO: skipping {} which needs tdx", module_path!());
+            return;
+        }
+
         let tdx_path = tdx_file_path;
 
         std::fs::create_dir_all(tdx_path.clone()).unwrap();
 
-        let actual = arch_guest_protection(invalid_dir, invalid_dir, invalid_dir);
+        let actual = arch_guest_protection(invalid_dir, invalid_dir);
         assert!(actual.is_ok());
         assert_eq!(actual.unwrap(), GuestProtection::NoProtection);
 
-        let actual = arch_guest_protection(tdx_path.to_str().unwrap(), invalid_dir, invalid_dir);
+        let actual = arch_guest_protection(invalid_dir, invalid_dir);
         assert!(actual.is_err());
 
-        let tdx_module = tdx_path.join(TDX_FW_MODULE_DIR);
-        std::fs::create_dir_all(tdx_module.clone()).unwrap();
-
-        let major_file = tdx_module.join(TDX_MAJOR_FILE);
-        std::fs::File::create(&major_file).unwrap();
-
-        let minor_file = tdx_module.join(TDX_MINOR_FILE);
-        std::fs::File::create(&minor_file).unwrap();
-
-        let result = arch_guest_protection(tdx_path.to_str().unwrap(), invalid_dir, invalid_dir);
-        assert!(result.is_err());
-
-        std::fs::write(&major_file, b"invalid").unwrap();
-        std::fs::write(&minor_file, b"invalid").unwrap();
-
-        let result = arch_guest_protection(tdx_path.to_str().unwrap(), invalid_dir, invalid_dir);
-        assert!(result.is_err());
-
-        // Fake a TDX 1.0 environment
-        std::fs::write(&major_file, b"0x00000001").unwrap();
-        std::fs::write(&minor_file, b"0x00000000").unwrap();
-
-        let result = arch_guest_protection(tdx_path.to_str().unwrap(), invalid_dir, invalid_dir);
+        let result = arch_guest_protection(invalid_dir, invalid_dir);
         assert!(result.is_ok());
 
         let result = result.unwrap();
 
-        let details = match &result {
-            GuestProtection::Tdx(details) => details,
-            _ => panic!(),
-        };
-
-        assert_eq!(details.major_version, 1);
-        assert_eq!(details.minor_version, 0);
-
         let displayed_value = result.to_string();
-        assert_eq!(displayed_value, "tdx (major_version: 1, minor_version: 0)");
+        assert_eq!(displayed_value, "tdx");
     }
 }

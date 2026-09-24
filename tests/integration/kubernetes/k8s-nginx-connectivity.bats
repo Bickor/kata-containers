@@ -5,24 +5,21 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 
+load "${BATS_TEST_DIRNAME}/lib.sh"
 load "${BATS_TEST_DIRNAME}/../../common.bash"
 load "${BATS_TEST_DIRNAME}/tests_common.sh"
 
 setup() {
-	nginx_version="${docker_images_nginx_version}"
-	nginx_image="nginx:$nginx_version"
+	[ "${CONTAINER_RUNTIME}" == "crio" ] && skip "test not working see: https://github.com/kata-containers/kata-containers/issues/10414"
+	setup_common || die "setup_common failed"
 	busybox_image="quay.io/prometheus/busybox:latest"
 	deployment="nginx-deployment"
 
-	get_pod_config_dir
-
 	# Create test .yaml
 	yaml_file="${pod_config_dir}/test-${deployment}.yaml"
+	set_nginx_image "${pod_config_dir}/${deployment}.yaml" "${yaml_file}"
 
-	sed -e "s/\${nginx_version}/${nginx_image}/" \
-		"${pod_config_dir}/${deployment}.yaml" > "${yaml_file}"
-	
-	add_allow_all_policy_to_yaml "${yaml_file}"
+	auto_generate_policy "${pod_config_dir}" "${yaml_file}"
 }
 
 @test "Verify nginx connectivity between pods" {
@@ -32,8 +29,10 @@ setup() {
 	kubectl expose deployment/${deployment}
 
 	busybox_pod="test-nginx"
+        # We need to use `-O index.html` as the busybox' wget has a different behaviour
+        # than GNU's wget, which would just append a .n to the file name instead of bailing.
 	kubectl run $busybox_pod --restart=Never -it --image="$busybox_image" \
-		-- sh -c 'i=1; while [ $i -le '"$wait_time"' ]; do wget --timeout=5 '"$deployment"' && break; sleep 1; i=$(expr $i + 1); done'
+		-- sh -c 'i=1; while [ $i -le '"$wait_time"' ]; do wget -O index.html --timeout=5 '"$deployment"' && break; sleep 1; i=$(expr $i + 1); done'
 
 	# check pod's status, it should be Succeeded.
 	# or {.status.containerStatuses[0].state.terminated.reason} = "Completed"
@@ -42,6 +41,8 @@ setup() {
 }
 
 teardown() {
+	[ "${CONTAINER_RUNTIME}" == "crio" ] && skip "test not working see: https://github.com/kata-containers/kata-containers/issues/10414"
+
 	# Debugging information
 	kubectl describe "pod/$busybox_pod"
 	kubectl get "pod/$busybox_pod" -o yaml
@@ -54,4 +55,5 @@ teardown() {
 	kubectl delete deployment "$deployment"
 	kubectl delete service "$deployment"
 	kubectl delete pod "$busybox_pod"
+	teardown_common "${node}" "${node_start_time:-}"
 }

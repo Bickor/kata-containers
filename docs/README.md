@@ -32,6 +32,7 @@ See the [how-to documentation](how-to).
 * [Intel QAT with Kata](./use-cases/using-Intel-QAT-and-kata.md)
 * [SPDK vhost-user with Kata](./use-cases/using-SPDK-vhostuser-and-kata.md)
 * [Intel SGX with Kata](./use-cases/using-Intel-SGX-and-kata.md)
+* [IBM Crypto Express passthrough with Confidential Containers](./use-cases/CEX-passthrough-and-coco.md)
 
 ## Developer Guide
 
@@ -82,3 +83,7 @@ Documents that help to understand and contribute to Kata Containers.
 If you have a suggestion for how we can improve the
 [website](https://katacontainers.io), please raise an issue (or a PR) on
 [the repository that holds the source for the website](https://github.com/OpenStackweb/kata-netlify-refresh).
+
+### Toolchain Guidance
+
+* [Toolchain Guidance](./Toolchain-Guidance.md)

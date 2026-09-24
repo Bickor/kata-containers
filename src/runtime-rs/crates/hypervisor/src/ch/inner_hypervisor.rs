@@ -5,34 +5,45 @@
 
 use super::inner::CloudHypervisorInner;
 use crate::ch::utils::get_api_socket_path;
+use crate::ch::utils::get_rootless_symlink_sandbox_path;
 use crate::ch::utils::get_vsock_path;
 use crate::kernel_param::KernelParams;
-use crate::utils::{get_jailer_root, get_sandbox_path};
+use crate::selinux;
+use crate::utils::create_dir_all_with_inherit_owner;
+use crate::utils::remove_dir_all_if_exists;
+use crate::utils::set_groups;
+use crate::utils::vm_cleanup;
+use crate::utils::{bytes_to_megs, get_jailer_root, get_sandbox_path, megs_to_bytes};
 use crate::MemoryConfig;
 use crate::VM_ROOTFS_DRIVER_BLK;
-use crate::VM_ROOTFS_DRIVER_PMEM;
 use crate::{VcpuThreadIds, VmmState};
 use anyhow::{anyhow, Context, Result};
-use ch_config::ch_api::{
-    cloud_hypervisor_vm_create, cloud_hypervisor_vm_start, cloud_hypervisor_vmm_ping,
-    cloud_hypervisor_vmm_shutdown,
+use ch_config::ch_api::cloud_hypervisor_vm_netdev_add_with_fds;
+use ch_config::{
+    ch_api::{
+        cloud_hypervisor_vm_create, cloud_hypervisor_vm_info, cloud_hypervisor_vm_resize,
+        cloud_hypervisor_vm_start, cloud_hypervisor_vmm_ping, cloud_hypervisor_vmm_shutdown,
+    },
+    VmResize,
 };
 use ch_config::{guest_protection_is_tdx, NamedHypervisorConfig, VmConfig};
 use core::future::poll_fn;
-use futures::executor::block_on;
 use futures::future::join_all;
 use kata_sys_util::protection::{available_guest_protection, GuestProtection};
 use kata_types::capabilities::{Capabilities, CapabilityBits};
 use kata_types::config::default::DEFAULT_CH_ROOTFS_TYPE;
+use kata_types::config::hypervisor::RootlessUser;
+use kata_types::rootless::is_rootless;
 use lazy_static::lazy_static;
 use nix::sched::{setns, CloneFlags};
-use serde::{Deserialize, Serialize};
+use nix::unistd::setgid;
+use nix::unistd::setuid;
+use nix::unistd::Gid;
+use nix::unistd::Uid;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::fs;
-use std::fs::create_dir_all;
-use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::Stdio;
@@ -45,7 +56,7 @@ use tokio::task::JoinHandle;
 use tokio::time::Duration;
 use tokio::{io::AsyncBufReadExt, sync::mpsc};
 
-const CH_NAME: &str = "cloud-hypervisor";
+const CH_NAME: &str = "clh";
 
 /// Number of milliseconds to wait before retrying a CH operation.
 const CH_POLL_TIME_MS: u64 = 50;
@@ -63,14 +74,6 @@ enum CloudHypervisorLogLevel {
     Info,
     Warn,
     Error,
-}
-
-#[derive(Clone, Deserialize, Serialize)]
-pub struct VmmPingResponse {
-    pub build_version: String,
-    pub version: String,
-    pub pid: i64,
-    pub features: Vec<String>,
 }
 
 #[derive(thiserror::Error, Debug, PartialEq)]
@@ -118,23 +121,15 @@ impl CloudHypervisorInner {
     }
 
     async fn get_kernel_params(&self) -> Result<String> {
-        let cfg = self
-            .config
-            .as_ref()
-            .ok_or("no hypervisor config for CH")
-            .map_err(|e| anyhow!(e))?;
+        let cfg = &self.config;
 
         let enable_debug = cfg.debug_info.enable_debug;
 
         let confidential_guest = cfg.security_info.confidential_guest;
 
         // Note that the configuration option hypervisor.block_device_driver is not used.
-        let rootfs_driver = if confidential_guest {
-            // PMEM is not available with TDX.
-            VM_ROOTFS_DRIVER_BLK
-        } else {
-            VM_ROOTFS_DRIVER_PMEM
-        };
+        // NVDIMM is not supported for Cloud Hypervisor.
+        let rootfs_driver = VM_ROOTFS_DRIVER_BLK;
 
         let rootfs_type = match cfg.boot_info.rootfs_type.is_empty() {
             true => DEFAULT_CH_ROOTFS_TYPE,
@@ -150,7 +145,12 @@ impl CloudHypervisorInner {
         #[cfg(target_arch = "aarch64")]
         let console_param_debug = KernelParams::from_string("console=ttyAMA0,115200n8");
 
-        let mut rootfs_param = KernelParams::new_rootfs_kernel_params(rootfs_driver, rootfs_type)?;
+        let mut rootfs_params = KernelParams::new_rootfs_kernel_params(
+            &cfg.boot_info.kernel_verity_params,
+            rootfs_driver,
+            rootfs_type,
+            true,
+        )?;
 
         let mut console_params = if enable_debug {
             if confidential_guest {
@@ -164,8 +164,7 @@ impl CloudHypervisorInner {
 
         params.append(&mut console_params);
 
-        // Add the rootfs device
-        params.append(&mut rootfs_param);
+        params.append(&mut rootfs_params);
 
         // Now add some additional options required for CH
         let extra_options = [
@@ -187,29 +186,20 @@ impl CloudHypervisorInner {
     }
 
     async fn boot_vm(&mut self) -> Result<()> {
-        let (shared_fs_devices, network_devices) = self.get_shared_devices().await?;
-
-        let socket = self
-            .api_socket
-            .as_ref()
-            .ok_or("missing socket")
-            .map_err(|e| anyhow!(e))?;
+        let (shared_fs_devices, network_devices, host_devices, protection_device) =
+            self.get_shared_devices().await?;
 
         let sandbox_path = get_sandbox_path(&self.id);
 
-        std::fs::create_dir_all(sandbox_path.clone()).context("failed to create sandbox path")?;
+        create_dir_all_with_inherit_owner(sandbox_path.clone(), 0o750)
+            .context("failed to create sandbox path")?;
 
         let vsock_socket_path = get_vsock_path(&self.id)?;
 
-        let hypervisor_config = self
-            .config
-            .as_ref()
-            .ok_or("no hypervisor config for CH")
-            .map_err(|e| anyhow!(e))?;
-
         debug!(
             sl!(),
-            "generic Hypervisor configuration: {:?}", hypervisor_config
+            "generic Hypervisor configuration: {:?}",
+            self.config.clone()
         );
 
         let kernel_params = self.get_kernel_params().await?;
@@ -218,10 +208,12 @@ impl CloudHypervisorInner {
             kernel_params,
             sandbox_path,
             vsock_socket_path,
-            cfg: hypervisor_config.clone(),
+            cfg: self.config.clone(),
             guest_protection_to_use: self.guest_protection_to_use.clone(),
             shared_fs_devices,
-            network_devices,
+            host_devices,
+            protection_device,
+            ..Default::default()
         };
 
         let cfg = VmConfig::try_from(named_cfg)?;
@@ -233,17 +225,32 @@ impl CloudHypervisorInner {
             "CH specific VmConfig configuration (JSON): {:?}", serialised
         );
 
-        let response =
-            cloud_hypervisor_vm_create(socket.try_clone().context("failed to clone socket")?, cfg)
-                .await?;
+        let response = cloud_hypervisor_vm_create(&self.api_socket, cfg).await?;
 
         if let Some(detail) = response {
             debug!(sl!(), "vm boot response: {:?}", detail);
         }
 
-        let response =
-            cloud_hypervisor_vm_start(socket.try_clone().context("failed to clone socket")?)
-                .await?;
+        if let Some(network_devices) = network_devices {
+            for net in network_devices {
+                let vm_fds = net.fds.clone().unwrap_or_default();
+                let response =
+                    cloud_hypervisor_vm_netdev_add_with_fds(&self.api_socket, net, vm_fds.clone())
+                        .await
+                        .context("failed to add vm netdev with fds")?;
+
+                if let Some(detail) = response {
+                    debug!(sl!(), "vm netdev add response: {:?}", detail);
+                }
+
+                for fd in vm_fds {
+                    // Explicitly close the fd now that it has been sent to CLH.
+                    nix::unistd::close(fd).context("failed to close netdev fd")?;
+                }
+            }
+        }
+
+        let response = cloud_hypervisor_vm_start(&self.api_socket).await?;
 
         if let Some(detail) = response {
             debug!(sl!(), "vm start response: {:?}", detail);
@@ -290,7 +297,7 @@ impl CloudHypervisorInner {
 
         let api_socket = result?;
 
-        self.api_socket = Some(api_socket);
+        *self.api_socket.lock().await = Some(api_socket);
 
         Ok(())
     }
@@ -298,10 +305,7 @@ impl CloudHypervisorInner {
     async fn cloud_hypervisor_check_running(&mut self) -> Result<()> {
         let timeout_secs = self.timeout_secs;
 
-        let timeout_msg = format!(
-            "API socket connect timed out after {} seconds",
-            timeout_secs
-        );
+        let timeout_msg = format!("API socket connect timed out after {timeout_secs} seconds");
 
         let join_handle = self.cloud_hypervisor_ping_until_ready(CH_POLL_TIME_MS);
 
@@ -325,11 +329,7 @@ impl CloudHypervisorInner {
     async fn cloud_hypervisor_launch(&mut self, _timeout_secs: i32) -> Result<()> {
         self.cloud_hypervisor_ensure_not_launched().await?;
 
-        let cfg = self
-            .config
-            .as_ref()
-            .ok_or("no hypervisor config for CH")
-            .map_err(|e| anyhow!(e))?;
+        let cfg = &self.config;
 
         let debug = cfg.debug_info.enable_debug;
 
@@ -339,13 +339,7 @@ impl CloudHypervisorInner {
 
         let _ = std::fs::remove_file(api_socket_path.clone());
 
-        let binary_path = self
-            .config
-            .as_ref()
-            .ok_or("no hypervisor config for CH")
-            .map_err(|e| anyhow!(e))?
-            .path
-            .to_string();
+        let binary_path = cfg.path.to_string();
 
         let path = Path::new(&binary_path).canonicalize()?;
 
@@ -377,28 +371,60 @@ impl CloudHypervisorInner {
         }
 
         let netns = self.netns.clone();
-        if self.netns.is_some() {
-            info!(
-                sl!(),
-                "set netns for vmm : {:?}",
-                self.netns.as_ref().unwrap()
-            );
+        if let Some(netns_ref) = &self.netns {
+            info!(sl!(), "set netns for vmm : {:?}", netns_ref);
         }
 
+        let user: Option<RootlessUser> = if is_rootless() {
+            Some(
+                self.config
+                    .security_info
+                    .rootless_user
+                    .clone()
+                    .ok_or_else(|| {
+                        anyhow!("rootless user must be specified for rootless cloud-hypervisor")
+                    })?,
+            )
+        } else {
+            None
+        };
+
         unsafe {
+            let selinux_label = self.config.security_info.selinux_label.clone();
             let _pre = cmd.pre_exec(move || {
                 if let Some(netns_path) = &netns {
                     let netns_fd = std::fs::File::open(netns_path);
-                    let _ = setns(netns_fd?.as_raw_fd(), CloneFlags::CLONE_NEWNET)
-                        .context("set netns failed");
+                    let _ = setns(&netns_fd?, CloneFlags::CLONE_NEWNET).context("set netns failed");
                 }
+                if let Some(label) = selinux_label.as_ref() {
+                    if let Err(e) = selinux::set_exec_label(label) {
+                        error!(sl!(), "Failed to set SELinux label in child process: {}", e);
+                        // Don't return error here to avoid breaking the process startup
+                        // Log the error and continue
+                    } else {
+                        info!(
+                            sl!(),
+                            "Successfully set SELinux label in child process: {}", &label
+                        );
+                    }
+                }
+                if let Some(user) = &user {
+                    let groups = user.groups.clone();
+                    let gid = Gid::from_raw(user.gid);
+                    let uid = Uid::from_raw(user.uid);
+
+                    let _ = set_groups(&groups);
+                    let _ = setgid(gid).context("setgid failed");
+                    let _ = setuid(uid).context("setuid failed");
+                }
+
                 Ok(())
             });
         }
 
         debug!(sl!(), "launching {} as: {:?}", CH_NAME, cmd);
 
-        let child = cmd.spawn().context(format!("{} spawn failed", CH_NAME))?;
+        let child = cmd.spawn().context(format!("{CH_NAME} spawn failed"))?;
 
         // Save process PID
         self.pid = child.id();
@@ -426,14 +452,9 @@ impl CloudHypervisorInner {
     }
 
     async fn cloud_hypervisor_shutdown(&mut self) -> Result<()> {
-        let socket = self
-            .api_socket
-            .as_ref()
-            .ok_or("missing socket")
-            .map_err(|e| anyhow!(e))?;
-
-        let response =
-            cloud_hypervisor_vmm_shutdown(socket.try_clone().context("shutdown failed")?).await?;
+        let response = cloud_hypervisor_vmm_shutdown(&self.api_socket)
+            .await
+            .context("shutdown failed")?;
 
         if let Some(detail) = response {
             debug!(sl!(), "shutdown response: {:?}", detail);
@@ -459,7 +480,7 @@ impl CloudHypervisorInner {
 
         for result in results {
             if let Err(e) = result {
-                eprintln!("wait task error: {:#?}", e);
+                eprintln!("wait task error: {e:#?}");
 
                 wait_errors.push(e);
             }
@@ -477,12 +498,12 @@ impl CloudHypervisorInner {
         let mut child = self
             .process
             .take()
-            .ok_or(format!("{} not running", CH_NAME))
+            .ok_or(format!("{CH_NAME} not running"))
             .map_err(|e| anyhow!(e))?;
 
         let _pid = child
             .id()
-            .ok_or(format!("{} missing PID", CH_NAME))
+            .ok_or(format!("{CH_NAME} missing PID"))
             .map_err(|e| anyhow!(e))?;
 
         // Note that this kills _and_ waits for the process!
@@ -519,17 +540,10 @@ impl CloudHypervisorInner {
     }
 
     async fn cloud_hypervisor_ping_until_ready(&mut self, _poll_time_ms: u64) -> Result<()> {
-        let socket = self
-            .api_socket
-            .as_ref()
-            .ok_or("missing socket")
-            .map_err(|e| anyhow!(e))?;
-
         loop {
-            let response =
-                cloud_hypervisor_vmm_ping(socket.try_clone().context("failed to clone socket")?)
-                    .await
-                    .context("ping failed");
+            let response = cloud_hypervisor_vmm_ping(&self.api_socket)
+                .await
+                .context("ping failed");
 
             if let Ok(response) = response {
                 if let Some(detail) = response {
@@ -548,7 +562,12 @@ impl CloudHypervisorInner {
         Ok(())
     }
 
-    pub(crate) async fn prepare_vm(&mut self, id: &str, netns: Option<String>) -> Result<()> {
+    pub(crate) async fn prepare_vm(
+        &mut self,
+        id: &str,
+        netns: Option<String>,
+        selinux_label: Option<String>,
+    ) -> Result<()> {
         self.id = id.to_string();
         self.state = VmmState::NotReady;
 
@@ -557,6 +576,13 @@ impl CloudHypervisorInner {
         self.handle_guest_protection().await?;
 
         self.netns = netns;
+
+        if !self.hypervisor_config().disable_selinux {
+            if let Some(label) = selinux_label.as_ref() {
+                self.config.security_info.selinux_label = Some(label.to_string());
+                selinux::set_exec_label(label).context("failed to set SELinux process label")?;
+            }
+        }
 
         Ok(())
     }
@@ -568,11 +594,7 @@ impl CloudHypervisorInner {
     // call, if confidential_guest is set, a confidential
     // guest will be created.
     async fn handle_guest_protection(&mut self) -> Result<()> {
-        let cfg = self
-            .config
-            .as_ref()
-            .ok_or("missing hypervisor config")
-            .map_err(|e| anyhow!(e))?;
+        let cfg = &self.config;
 
         let confidential_guest = cfg.security_info.confidential_guest;
 
@@ -592,7 +614,7 @@ impl CloudHypervisorInner {
             if protection == GuestProtection::NoProtection {
                 // User wants protection, but none available.
                 return Err(anyhow!(GuestProtectionError::NoProtectionAvailable));
-            } else if let GuestProtection::Tdx(_) = protection {
+            } else if let GuestProtection::Tdx = protection {
                 info!(sl!(), "guest protection available and requested"; "guest-protection" => protection.to_string());
             } else {
                 return Err(anyhow!(GuestProtectionError::ExpectedTDXProtection(
@@ -601,7 +623,7 @@ impl CloudHypervisorInner {
             }
         } else if protection == GuestProtection::NoProtection {
             debug!(sl!(), "no guest protection available");
-        } else if let GuestProtection::Tdx(_) = protection {
+        } else if let GuestProtection::Tdx = protection {
             // CH requires TDX protection to be used.
             return Err(anyhow!(GuestProtectionError::TDXProtectionMustBeUsedWithCH));
         } else {
@@ -616,11 +638,11 @@ impl CloudHypervisorInner {
         self.run_dir = get_sandbox_path(&self.id);
         self.vm_path = self.run_dir.to_string();
 
-        create_dir_all(&self.run_dir)
+        create_dir_all_with_inherit_owner(&self.run_dir, 0o750)
             .with_context(|| anyhow!("failed to create sandbox directory {}", self.run_dir))?;
 
         if !self.jailer_root.is_empty() {
-            create_dir_all(self.jailer_root.as_str())
+            create_dir_all_with_inherit_owner(self.jailer_root.as_str(), 0o750)
                 .map_err(|e| anyhow!("Failed to create dir {} err : {:?}", self.jailer_root, e))?;
         }
 
@@ -640,7 +662,7 @@ impl CloudHypervisorInner {
         Ok(())
     }
 
-    pub(crate) fn stop_vm(&mut self) -> Result<()> {
+    pub(crate) async fn stop_vm(&mut self) -> Result<()> {
         // If the container workload exits, this method gets called. However,
         // the container manager always makes a ShutdownContainer request,
         // which results in this method being called potentially a second
@@ -652,19 +674,14 @@ impl CloudHypervisorInner {
 
         self.state = VmmState::NotReady;
 
-        block_on(self.cloud_hypervisor_shutdown()).map_err(|e| anyhow!(e))?;
+        self.cloud_hypervisor_shutdown().await?;
 
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn wait_vm(&self) -> Result<i32> {
-        debug!(sl!(), "Waiting CH vmm");
-        let mut waiter = self.exit_waiter.lock().await;
-        if let Some(exitcode) = waiter.0.recv().await {
-            waiter.1 = exitcode;
-        }
-
-        Ok(waiter.1)
+        Ok(0)
     }
 
     pub(crate) fn pause_vm(&self) -> Result<()> {
@@ -684,7 +701,7 @@ impl CloudHypervisorInner {
 
         let vsock_path = get_vsock_path(&self.id)?;
 
-        let uri = format!("{}://{}", HYBRID_VSOCK_SCHEME, vsock_path);
+        let uri = format!("{HYBRID_VSOCK_SCHEME}://{vsock_path}");
 
         Ok(uri)
     }
@@ -704,11 +721,48 @@ impl CloudHypervisorInner {
     }
 
     pub(crate) async fn cleanup(&self) -> Result<()> {
-        Ok(())
+        info!(sl!(), "CloudHypervisor::cleanup()");
+        if is_rootless() {
+            remove_dir_all_if_exists(get_rootless_symlink_sandbox_path(self.id.as_str()).as_str())?;
+        }
+        vm_cleanup(&self.config, self.vm_path.as_str())
     }
 
-    pub(crate) async fn resize_vcpu(&self, old_vcpu: u32, new_vcpu: u32) -> Result<(u32, u32)> {
-        Ok((old_vcpu, new_vcpu))
+    pub(crate) async fn resize_vcpu(
+        &self,
+        old_vcpus: u32,
+        mut new_vcpus: u32,
+    ) -> Result<(u32, u32)> {
+        info!(
+            sl!(),
+            "cloud hypervisor resize_vcpu(): {} -> {}", old_vcpus, new_vcpus
+        );
+
+        if new_vcpus == 0 {
+            return Err(anyhow!("resize to 0 vcpus requested"));
+        }
+
+        if new_vcpus > self.config.cpu_info.default_maxvcpus {
+            warn!(
+                sl!(),
+                "Cannot allocate more vcpus than the max allowed number of vcpus. The maximum allowed amount of vcpus will be used instead.");
+            new_vcpus = self.config.cpu_info.default_maxvcpus;
+        }
+
+        if new_vcpus == old_vcpus {
+            return Ok((old_vcpus, new_vcpus));
+        }
+
+        let vmresize = VmResize {
+            desired_vcpus: Some(new_vcpus as u8),
+            ..Default::default()
+        };
+
+        cloud_hypervisor_vm_resize(&self.api_socket, vmresize)
+            .await
+            .context("resize vcpus")?;
+
+        Ok((old_vcpus, new_vcpus))
     }
 
     pub(crate) async fn get_pids(&self) -> Result<Vec<u32>> {
@@ -727,7 +781,7 @@ impl CloudHypervisorInner {
 
     pub(crate) async fn get_ns_path(&self) -> Result<String> {
         if let Some(pid) = self.pid {
-            let ns_path = format!("/proc/{}/ns", pid);
+            let ns_path = format!("/proc/{pid}/ns");
             Ok(ns_path)
         } else {
             Err(anyhow!("could not get ns path"))
@@ -741,7 +795,7 @@ impl CloudHypervisorInner {
     pub(crate) async fn get_jailer_root(&self) -> Result<String> {
         let root_path = get_jailer_root(&self.id);
 
-        std::fs::create_dir_all(&root_path)?;
+        create_dir_all_with_inherit_owner(&root_path, 0o750)?;
 
         Ok(root_path)
     }
@@ -777,17 +831,89 @@ impl CloudHypervisorInner {
     }
 
     pub(crate) fn set_guest_memory_block_size(&mut self, size: u32) {
-        self._guest_memory_block_size_mb = size;
+        self.guest_memory_block_size_mb = bytes_to_megs(size as u64);
     }
 
     pub(crate) fn guest_memory_block_size_mb(&self) -> u32 {
-        self._guest_memory_block_size_mb
+        self.guest_memory_block_size_mb
     }
 
-    pub(crate) fn resize_memory(&self, _new_mem_mb: u32) -> Result<(u32, MemoryConfig)> {
-        warn!(sl!(), "CH memory resize not implemented - see https://github.com/kata-containers/kata-containers/issues/8801");
+    pub(crate) async fn resize_memory(&self, new_mem_mb: u32) -> Result<(u32, MemoryConfig)> {
+        let vminfo = cloud_hypervisor_vm_info(&self.api_socket)
+            .await
+            .context("get vminfo")?;
 
-        Ok((0, MemoryConfig::default()))
+        let current_mem_size = vminfo.config.memory.size;
+        let new_total_mem = megs_to_bytes(new_mem_mb);
+
+        info!(
+            sl!(),
+            "cloud-hypervisor::resize_memory(): asked to resize memory to {} MB, current memory is {} MB", new_mem_mb, bytes_to_megs(current_mem_size)
+        );
+
+        // Early Check to verify if boot memory is the same as requested
+        if current_mem_size == new_total_mem {
+            info!(sl!(), "VM alreay has requested memory");
+            return Ok((new_mem_mb, MemoryConfig::default()));
+        }
+
+        if current_mem_size > new_total_mem {
+            info!(sl!(), "Remove memory is not supported, nothing to do");
+            return Ok((new_mem_mb, MemoryConfig::default()));
+        }
+
+        let guest_mem_block_size = megs_to_bytes(self.guest_memory_block_size_mb);
+
+        let mut new_hotplugged_mem = new_total_mem - current_mem_size;
+
+        info!(
+            sl!(),
+            "new hotplugged mem before alignment: {} B ({} MB), guest_mem_block_size: {} MB",
+            new_hotplugged_mem,
+            bytes_to_megs(new_hotplugged_mem),
+            bytes_to_megs(guest_mem_block_size)
+        );
+
+        let is_unaligned = !new_hotplugged_mem.is_multiple_of(guest_mem_block_size);
+        if is_unaligned {
+            new_hotplugged_mem = ch_config::convert::checked_next_multiple_of(
+                new_hotplugged_mem,
+                guest_mem_block_size,
+            )
+            .ok_or(anyhow!(format!(
+                "alignment of {} B to the block size of {} B failed",
+                new_hotplugged_mem, guest_mem_block_size
+            )))?
+        }
+
+        let new_total_mem_aligned = new_hotplugged_mem + current_mem_size;
+
+        let max_total_mem = megs_to_bytes(self.config.memory_info.default_maxmemory);
+        if new_total_mem_aligned > max_total_mem {
+            return Err(anyhow!(
+                "requested memory ({} MB) is greater than maximum allowed ({} MB)",
+                bytes_to_megs(new_total_mem_aligned),
+                self.config.memory_info.default_maxmemory
+            ));
+        }
+
+        info!(
+            sl!(),
+            "hotplugged mem from {} MB to {} MB)",
+            bytes_to_megs(current_mem_size),
+            bytes_to_megs(new_total_mem_aligned)
+        );
+
+        let vmresize = VmResize {
+            desired_ram: Some(new_total_mem_aligned),
+            ..Default::default()
+        };
+
+        cloud_hypervisor_vm_resize(&self.api_socket, vmresize)
+            .await
+            .context("resize memory")?;
+
+        Ok((new_mem_mb, MemoryConfig::default()))
     }
 }
 
@@ -866,7 +992,7 @@ async fn cloud_hypervisor_log_output(
 // For performance, the line is scanned exactly once and all log levels
 // are search for.
 fn parse_ch_log_level(line: &str) -> CloudHypervisorLogLevel {
-    for (i, c) in line.chars().enumerate() {
+    for (i, c) in line.char_indices() {
         if c == 'I' && line[i..].starts_with("INFO:") {
             return CloudHypervisorLogLevel::Info;
         } else if c == 'D' && line[i..].starts_with("DEBG:") {
@@ -929,7 +1055,7 @@ fn get_guest_protection() -> Result<GuestProtection> {
     Ok(guest_protection)
 }
 
-// Return a TID/VCPU map from a specified /proc/{pid} path.
+// Return a VCPU/TID map from a specified /proc/{pid} path.
 fn get_ch_vcpu_tids(proc_path: &str) -> Result<HashMap<u32, u32>> {
     const VCPU_STR: &str = "vcpu";
 
@@ -972,7 +1098,7 @@ fn get_ch_vcpu_tids(proc_path: &str) -> Result<HashMap<u32, u32>> {
             .parse::<u32>()
             .map_err(|e| anyhow!(e).context("Invalid vcpu id."))?;
 
-        vcpus.insert(tid, vcpu_id);
+        vcpus.insert(vcpu_id, tid);
     }
 
     if vcpus.is_empty() {
@@ -985,19 +1111,17 @@ fn get_ch_vcpu_tids(proc_path: &str) -> Result<HashMap<u32, u32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kata_sys_util::protection::TDXDetails;
+    use kata_sys_util::protection::SevSnpDetails;
 
     #[cfg(target_arch = "x86_64")]
-    use kata_sys_util::protection::TDX_SYS_FIRMWARE_DIR;
+    use kata_sys_util::protection::TDX_KVM_PARAMETER_PATH;
 
     use kata_types::config::hypervisor::{Hypervisor as HypervisorConfig, SecurityInfo};
     use serial_test::serial;
-    #[cfg(target_arch = "x86_64")]
-    use std::path::PathBuf;
     use test_utils::{assert_result, skip_if_not_root};
 
     use std::fs::File;
-    use tempdir::TempDir;
+    use tempfile::Builder;
 
     fn set_fake_guest_protection(protection: Option<GuestProtection>) {
         let existing_ref = FAKE_GUEST_PROTECTION.clone();
@@ -1014,9 +1138,9 @@ mod tests {
         // available_guest_protection() requires super user privs.
         skip_if_not_root!();
 
-        let tdx_details = TDXDetails {
-            major_version: 1,
-            minor_version: 0,
+        let sev_snp_details = SevSnpDetails {
+            cbitpos: 42,
+            phys_addr_reduction: 42,
         };
 
         #[derive(Debug)]
@@ -1039,21 +1163,21 @@ mod tests {
                 result: Ok(GuestProtection::Se),
             },
             TestData {
-                value: Some(GuestProtection::Sev),
-                result: Ok(GuestProtection::Sev),
+                value: Some(GuestProtection::Sev(sev_snp_details.clone())),
+                result: Ok(GuestProtection::Sev(sev_snp_details.clone())),
             },
             TestData {
-                value: Some(GuestProtection::Snp),
-                result: Ok(GuestProtection::Snp),
+                value: Some(GuestProtection::Snp(sev_snp_details.clone())),
+                result: Ok(GuestProtection::Snp(sev_snp_details.clone())),
             },
             TestData {
-                value: Some(GuestProtection::Tdx(tdx_details.clone())),
-                result: Ok(GuestProtection::Tdx(tdx_details.clone())),
+                value: Some(GuestProtection::Tdx),
+                result: Ok(GuestProtection::Tdx),
             },
         ];
 
         for (i, d) in tests.iter().enumerate() {
-            let msg = format!("test[{}]: {:?}", i, d);
+            let msg = format!("test[{i}]: {d:?}");
 
             set_fake_guest_protection(d.value.clone());
 
@@ -1062,10 +1186,10 @@ mod tests {
                     .await
                     .unwrap();
 
-            let msg = format!("{}: actual result: {:?}", msg, result);
+            let msg = format!("{msg}: actual result: {result:?}");
 
             if std::env::var("DEBUG").is_ok() {
-                eprintln!("DEBUG: {}", msg);
+                eprintln!("DEBUG: {msg}");
             }
 
             assert_result!(d.result, result, msg);
@@ -1082,26 +1206,11 @@ mod tests {
         // available_guest_protection() requires super user privs.
         skip_if_not_root!();
 
-        let tdx_details = TDXDetails {
-            major_version: 1,
-            minor_version: 0,
-        };
-
         // Use the hosts protection, not a fake one.
         set_fake_guest_protection(None);
 
-        let tdx_fw_path = PathBuf::from(TDX_SYS_FIRMWARE_DIR);
-
-        // Simple test for Intel TDX
-        let have_tdx = if tdx_fw_path.exists() {
-            if let Ok(metadata) = std::fs::metadata(tdx_fw_path.clone()) {
-                metadata.is_dir()
-            } else {
-                false
-            }
-        } else {
-            false
-        };
+        let have_tdx = fs::read(TDX_KVM_PARAMETER_PATH)
+            .is_ok_and(|content| !content.is_empty() && content[0] == b'Y');
 
         let protection =
             task::spawn_blocking(|| -> Result<GuestProtection> { get_guest_protection() })
@@ -1110,16 +1219,13 @@ mod tests {
                 .unwrap();
 
         if std::env::var("DEBUG").is_ok() {
-            let msg = format!(
-                "tdx_fw_path: {:?}, have_tdx: {:?}, protection: {:?}",
-                tdx_fw_path, have_tdx, protection
-            );
+            let msg = format!("have_tdx: {have_tdx:?}, protection: {protection:?}");
 
-            eprintln!("DEBUG: {}", msg);
+            eprintln!("DEBUG: {msg}");
         }
 
         if have_tdx {
-            assert_eq!(protection, GuestProtection::Tdx(tdx_details));
+            assert_eq!(protection, GuestProtection::Tdx);
         } else {
             assert_eq!(protection, GuestProtection::NoProtection);
         }
@@ -1142,11 +1248,6 @@ mod tests {
             guest_protection_to_use: GuestProtection,
         }
 
-        let tdx_details = TDXDetails {
-            major_version: 1,
-            minor_version: 0,
-        };
-
         let tests = &[
             TestData {
                 confidential_guest: false,
@@ -1162,15 +1263,15 @@ mod tests {
             },
             TestData {
                 confidential_guest: false,
-                available_protection: Some(GuestProtection::Tdx(tdx_details.clone())),
+                available_protection: Some(GuestProtection::Tdx),
                 result: Err(anyhow!(GuestProtectionError::TDXProtectionMustBeUsedWithCH)),
-                guest_protection_to_use: GuestProtection::Tdx(tdx_details.clone()),
+                guest_protection_to_use: GuestProtection::Tdx,
             },
             TestData {
                 confidential_guest: true,
-                available_protection: Some(GuestProtection::Tdx(tdx_details.clone())),
+                available_protection: Some(GuestProtection::Tdx),
                 result: Ok(()),
-                guest_protection_to_use: GuestProtection::Tdx(tdx_details),
+                guest_protection_to_use: GuestProtection::Tdx,
             },
             TestData {
                 confidential_guest: false,
@@ -1189,7 +1290,7 @@ mod tests {
         ];
 
         for (i, d) in tests.iter().enumerate() {
-            let msg = format!("test[{}]: {:?}", i, d);
+            let msg = format!("test[{i}]: {d:?}");
 
             set_fake_guest_protection(d.available_protection.clone());
 
@@ -1209,10 +1310,10 @@ mod tests {
 
             let result = ch.handle_guest_protection().await;
 
-            let msg = format!("{}: actual result: {:?}", msg, result);
+            let msg = format!("{msg}: actual result: {result:?}");
 
             if std::env::var("DEBUG").is_ok() {
-                eprintln!("DEBUG: {}", msg);
+                eprintln!("DEBUG: {msg}");
             }
 
             if d.result.is_ok() && result.is_ok() {
@@ -1223,8 +1324,7 @@ mod tests {
 
             assert_eq!(
                 ch.guest_protection_to_use, d.guest_protection_to_use,
-                "{}",
-                msg
+                "{msg}"
             );
         }
 
@@ -1261,7 +1361,7 @@ mod tests {
         ];
 
         for (i, d) in tests.iter().enumerate() {
-            let msg = format!("test[{}]: {:?}", i, d);
+            let msg = format!("test[{i}]: {d:?}");
 
             let mut ch = CloudHypervisorInner::default();
 
@@ -1278,10 +1378,10 @@ mod tests {
 
                 let result = ch.get_kernel_params().await;
 
-                let msg = format!("{}: actual result: {:?}", msg, result);
+                let msg = format!("{msg}: actual result: {result:?}");
 
                 if std::env::var("DEBUG").is_ok() {
-                    eprintln!("DEBUG: {}", msg);
+                    eprintln!("DEBUG: {msg}");
                 }
 
                 if d.fails {
@@ -1397,17 +1497,17 @@ mod tests {
         ];
 
         for (i, d) in tests.iter().enumerate() {
-            let msg = format!("test[{}]: {:?}", i, d);
+            let msg = format!("test[{i}]: {d:?}");
 
             let level = parse_ch_log_level(d.line);
 
-            let msg = format!("{}: actual level: {:?}", msg, level);
+            let msg = format!("{msg}: actual level: {level:?}");
 
             if std::env::var("DEBUG").is_ok() {
-                eprintln!("DEBUG: {}", msg);
+                eprintln!("DEBUG: {msg}");
             }
 
-            assert_eq!(d.level, level, "{}", msg);
+            assert_eq!(d.level, level, "{msg}");
         }
     }
 
@@ -1416,7 +1516,7 @@ mod tests {
         let path_dir = "/tmp/proc";
         let file_name = "1";
 
-        let tmp_dir = TempDir::new(path_dir).unwrap();
+        let tmp_dir = Builder::new().prefix("proc").tempdir().unwrap();
         let file_path = tmp_dir.path().join(file_name);
         let _tmp_file = File::create(file_path.as_os_str()).unwrap();
         let file_path_name = file_path.as_path().to_str().map(|s| s.to_string());
@@ -1449,19 +1549,80 @@ mod tests {
         ];
 
         for (i, d) in tests.iter().enumerate() {
-            let msg = format!("test: [{}]: {:?}", i, d);
+            let msg = format!("test: [{i}]: {d:?}");
 
             if std::env::var("DEBUG").is_ok() {
                 println!("DEBUG: {msg}");
             }
 
             let result = get_ch_vcpu_tids(d.proc_path);
-            let msg = format!("{}, result: {:?}", msg, result);
+            let msg = format!("{msg}, result: {result:?}");
 
             let expected_error = format!("{}", d.result.as_ref().unwrap_err());
             let actual_error = format!("{}", result.unwrap_err());
 
             assert!(actual_error == expected_error, "{}", msg);
         }
+    }
+
+    #[actix_rt::test]
+    async fn test_get_ch_vcpu_tids_mapping() {
+        let tmp_dir = Builder::new().prefix("fake-proc-pid").tempdir().unwrap();
+        let task_dir = tmp_dir.path().join("task");
+        fs::create_dir_all(&task_dir).unwrap();
+
+        #[derive(Debug)]
+        struct ThreadInfo<'a> {
+            tid: &'a str,
+            comm: &'a str,
+        }
+
+        let threads = &[
+            // Non-vcpu thread, should be skipped.
+            ThreadInfo {
+                tid: "1000",
+                comm: "main_thread\n",
+            },
+            ThreadInfo {
+                tid: "2001",
+                comm: "vcpu0\n",
+            },
+            ThreadInfo {
+                tid: "2002",
+                comm: "vcpu1\n",
+            },
+            ThreadInfo {
+                tid: "2003",
+                comm: "vcpu2\n",
+            },
+        ];
+
+        for t in threads {
+            let tid_dir = task_dir.join(t.tid);
+            fs::create_dir_all(&tid_dir).unwrap();
+            fs::write(tid_dir.join("comm"), t.comm).unwrap();
+        }
+
+        let proc_path = tmp_dir.path().to_str().unwrap();
+        let result = get_ch_vcpu_tids(proc_path);
+
+        let msg = format!("result: {result:?}");
+
+        if std::env::var("DEBUG").is_ok() {
+            println!("DEBUG: {msg}");
+        }
+
+        let vcpus = result.unwrap();
+
+        // The mapping must be vcpu_id -> tid.
+        assert_eq!(vcpus.len(), 3, "non-vcpu threads should be excluded");
+        assert_eq!(vcpus[&0], 2001, "vcpu 0 should map to tid 2001");
+        assert_eq!(vcpus[&1], 2002, "vcpu 1 should map to tid 2002");
+        assert_eq!(vcpus[&2], 2003, "vcpu 2 should map to tid 2003");
+
+        assert!(
+            !vcpus.contains_key(&1000),
+            "non-vcpu thread should not be in the map"
+        );
     }
 }

@@ -102,9 +102,6 @@ const (
 	// QemuHypervisor is the QEMU hypervisor.
 	QemuHypervisor HypervisorType = "qemu"
 
-	// AcrnHypervisor is the ACRN hypervisor.
-	AcrnHypervisor HypervisorType = "acrn"
-
 	// ClhHypervisor is the ICH hypervisor.
 	ClhHypervisor HypervisorType = "clh"
 
@@ -173,12 +170,6 @@ type HypervisorConfig struct {
 	// HypervisorPathList is the list of hypervisor paths names allowed in annotations
 	HypervisorPathList []string
 
-	// HypervisorCtlPathList is the list of hypervisor control paths names allowed in annotations
-	HypervisorCtlPathList []string
-
-	// HypervisorCtlPath is the hypervisor ctl executable host path.
-	HypervisorCtlPath string
-
 	// JailerPath is the jailer executable host path.
 	JailerPath string
 
@@ -225,12 +216,6 @@ type HypervisorConfig struct {
 	// VirtioFSExtraArgs passes options to virtiofsd daemon
 	VirtioFSExtraArgs []string
 
-	// File based memory backend root directory
-	FileBackedMemRootDir string
-
-	// FileBackedMemRootList is the list of valid root directories values for annotations
-	FileBackedMemRootList []string
-
 	// PFlash image paths
 	PFlash []string
 
@@ -255,8 +240,12 @@ type HypervisorConfig struct {
 	DisableBlockDeviceUse bool
 
 	// EnableIOThreads enables IO to be processed in a separate thread.
-	// Supported currently for virtio-scsi driver.
+	// Supported currently for virtio-scsi and virtio-blk(based on IndepIOThreads) driver.
 	EnableIOThreads bool
+
+	// Independent IOThreads enables IO to be processed in a separate thread, it is
+	// for QEMU hotplug device attach to iothread, like virtio-blk.
+	IndepIOThreads uint32
 
 	// Debug changes the default hypervisor and kernel parameters to
 	// enable debug output where available.

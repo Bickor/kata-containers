@@ -11,8 +11,13 @@
 
 #[cfg(target_arch = "aarch64")]
 use dbs_arch::pmu::PmuError;
+#[cfg(target_arch = "x86_64")]
+use dbs_boot::tdshim::TdvfError;
 #[cfg(feature = "dbs-virtio-devices")]
 use dbs_virtio_devices::Error as VirtioError;
+
+#[cfg(target_arch = "x86_64")]
+use tdx::launch::Error as TdxError;
 
 #[cfg(feature = "host-device")]
 use crate::device_manager::vfio_dev_mgr::VfioDeviceError;
@@ -77,6 +82,15 @@ pub enum Error {
     /// Cannot open the VM file descriptor.
     #[error(transparent)]
     Vm(vm::VmError),
+
+    /// Fail to create device manager system
+    #[error("failed to create device manager system: {0}")]
+    DeviceMgrError(#[source] device_manager::DeviceMgrError),
+
+    #[cfg(target_arch = "x86_64")]
+    /// TDX related error
+    #[error("TDX error: {0}")]
+    TdxError(TdxError),
 }
 
 /// Errors associated with starting the instance.
@@ -215,6 +229,46 @@ pub enum StartMicroVmError {
     /// Failed to register DMA memory address range.
     #[error("failure while registering DMA address range: {0:?}")]
     RegisterDMAAddress(#[source] VfioDeviceError),
+
+    /// Cannot build seccomp filters.
+    #[error("failure while configuring seccomp filters: {0}")]
+    SeccompFilters(#[source] seccompiler::Error),
+
+    #[cfg(target_arch = "x86_64")]
+    /// Cannot enable split irqchip
+    #[error("Failed to enable split irqchip: {0}")]
+    EnableSplitIrqchip(#[source] vmm_sys_util::errno::Error),
+
+    /// Missing firmware file
+    #[error("Cannot start microvm due to missing firmware file")]
+    MissingFirmwareFile,
+
+    #[cfg(target_arch = "x86_64")]
+    /// TDVF errors
+    #[error("TDVF error: {0}")]
+    TdvfError(#[source] TdvfError),
+
+    #[cfg(target_arch = "x86_64")]
+    /// Missing tdshim section
+    #[error("Missing tdshim section: {0}")]
+    MissingTdshimSection(&'static str),
+
+    /// Guest address space not initialized
+    #[error("Guest address space not initialized")]
+    GuestMemoryNotInitialized,
+
+    /// Initrd is not supported
+    #[error("Initrd is not supported")]
+    InitrdNotSupported,
+
+    #[cfg(target_arch = "x86_64")]
+    /// TDX related error
+    #[error("Tdx error: {0}")]
+    TdxError(TdxError),
+
+    /// Guest memory error
+    #[error("Guest memory error: {0}")]
+    GuestMemoryError(#[source] vm_memory::guest_memory::Error),
 }
 
 /// Errors associated with starting the instance.

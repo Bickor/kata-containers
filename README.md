@@ -1,6 +1,7 @@
 <img src="https://object-storage-ca-ymq-1.vexxhost.net/swift/v1/6e4619c416ff4bd19e1c087f27a43eea/www-images-prod/openstack-logo/kata/SVG/kata-1.svg" width="900">
 
 [![CI | Publish Kata Containers payload](https://github.com/kata-containers/kata-containers/actions/workflows/payload-after-push.yaml/badge.svg)](https://github.com/kata-containers/kata-containers/actions/workflows/payload-after-push.yaml) [![Kata Containers Nightly CI](https://github.com/kata-containers/kata-containers/actions/workflows/ci-nightly.yaml/badge.svg)](https://github.com/kata-containers/kata-containers/actions/workflows/ci-nightly.yaml)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/kata-containers/kata-containers/badge)](https://scorecard.dev/viewer/?uri=github.com/kata-containers/kata-containers)
 
 # Kata Containers
 
@@ -73,7 +74,7 @@ See the [official documentation](docs) including:
 - [Developer guide](docs/Developer-Guide.md)
 - [Design documents](docs/design)
   - [Architecture overview](docs/design/architecture)
-  - [Architecture 3.0 overview](docs/design/architecture_3.0/)
+  - [Architecture 4.0 overview](docs/design/architecture_4.0/)
 
 ## Configuration
 
@@ -104,7 +105,7 @@ Please raise an issue
 [in this repository](https://github.com/kata-containers/kata-containers/issues).
 
 > **Note:**
-> If you are reporting a security issue, please follow the [vulnerability reporting process](https://github.com/kata-containers/community#vulnerability-handling)
+> If you are reporting a security issue, please follow the [vulnerability reporting process](SECURITY.md)
 
 ## Developers
 
@@ -138,7 +139,6 @@ The table below lists the remaining parts of the project:
 | [`agent-ctl`](src/tools/agent-ctl) | utility | Tool that provides low-level access for testing the agent. |
 | [`kata-ctl`](src/tools/kata-ctl) | utility | Tool that provides advanced commands and debug facilities. |
 | [`trace-forwarder`](src/tools/trace-forwarder) | utility | Agent tracing helper. |
-| [`runk`](src/tools/runk) | utility | Standard OCI container runtime based on the agent. |
 | [`ci`](.github/workflows) | CI | Continuous Integration configuration files and scripts. |
 | [`ocp-ci`](ci/openshift-ci/README.md) | CI | Continuous Integration configuration for the OpenShift pipelines. |
 | [`katacontainers.io`](https://github.com/kata-containers/www.katacontainers.io) | Source for the [`katacontainers.io`](https://www.katacontainers.io) site. |
@@ -152,10 +152,6 @@ Kata Containers is now
 ## General tests
 
 See the [tests documentation](tests/README.md).
-
-## Metrics tests
-
-See the [metrics documentation](tests/metrics/README.md).
 
 ## Glossary of Terms
 

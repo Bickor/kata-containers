@@ -9,6 +9,7 @@ package virtcontainers
 
 import (
 	"context"
+	b64 "encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"io/fs"
@@ -57,12 +58,21 @@ func unmountNoFollow(path string) error {
 	return syscall.Unmount(path, syscall.MNT_DETACH|UmountNoFollow)
 }
 
-// Resolve the K8S root dir if it is a symbolic link
-func resolveRootDir() string {
-	rootDir, err := os.Readlink(defaultKubernetesRootDir)
+// resolveRootDirWithBase returns the resolved (followed symlink) kubelet root path.
+// If base is non-empty it is used as the root; otherwise defaultKubernetesRootDir is used.
+func resolveRootDirWithBase(base string) string {
+	if base == "" {
+		base = defaultKubernetesRootDir
+	}
+	rootDir, err := os.Readlink(base)
 	if err != nil {
-		// Use the default root dir in case of any errors resolving the root dir symlink
-		return defaultKubernetesRootDir
+		return base
+	}
+	if !filepath.IsAbs(rootDir) {
+		rootDir, err = filepath.Abs(filepath.Join(filepath.Dir(base), rootDir))
+		if err != nil {
+			return base
+		}
 	}
 	return rootDir
 }
@@ -84,15 +94,20 @@ type FilesystemShare struct {
 	prepared bool
 }
 
-func NewFilesystemShare(s *Sandbox) (FilesystemSharer, error) {
+func NewFilesystemShare(s *Sandbox) (*FilesystemShare, error) {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		return nil, fmt.Errorf("Creating watcher returned error %w", err)
 	}
 
-	kubernetesRootDir := resolveRootDir()
-	configVolRegex := regexp.MustCompile("^" + kubernetesRootDir + configVolRegexString)
-	timestampDirRegex := regexp.MustCompile("^" + kubernetesRootDir + configVolRegexString + timestampDirRegexString)
+	baseRoot := ""
+	if s.config != nil {
+		baseRoot = s.config.KubeletRootDir
+	}
+	kubernetesRootDir := resolveRootDirWithBase(baseRoot)
+	quotedRoot := regexp.QuoteMeta(kubernetesRootDir)
+	configVolRegex := regexp.MustCompile("^" + quotedRoot + configVolRegexString)
+	timestampDirRegex := regexp.MustCompile("^" + quotedRoot + configVolRegexString + timestampDirRegexString)
 
 	return &FilesystemShare{
 		prepared:           false,
@@ -316,7 +331,8 @@ func (f *FilesystemShare) ShareFile(ctx context.Context, c *Container, m *Mount)
 				return err
 			}
 
-			if !(info.Mode().IsRegular() || info.Mode().IsDir() || (info.Mode()&os.ModeSymlink) == os.ModeSymlink) {
+			mode := info.Mode()
+			if !mode.IsRegular() && !mode.IsDir() && mode&os.ModeSymlink != os.ModeSymlink {
 				f.Logger().WithField("ignored-file", srcPath).Debug("Ignoring file as FS sharing not supported")
 				if srcPath == srcRoot {
 					// Ignore the mount if this is not a regular file (excludes socket, device, ...) as it cannot be handled by
@@ -534,16 +550,120 @@ func (f *FilesystemShare) shareRootFilesystemWithVirtualVolume(ctx context.Conte
 	}, nil
 }
 
+func (f *FilesystemShare) shareRootFilesystemWithErofs(ctx context.Context, c *Container) (*SharedFile, error) {
+	guestPath := filepath.Join("/run/kata-containers/", c.id, c.rootfsSuffix)
+	var rootFsStorages []*grpc.Storage
+	var rwStor *grpc.Storage
+
+	for i, d := range c.devices {
+		// ref: https://github.com/containerd/containerd/blob/v2.2.0/plugins/snapshots/erofs/erofs.go#L166
+		if filepath.Base(d.ContainerPath) == "layer.erofs" {
+			device := c.sandbox.devManager.GetDeviceByID(d.ID)
+			if device == nil {
+				return nil, fmt.Errorf("failed to find device by id %q", d.ID)
+			}
+			vol, err := handleBlockVolume(c, device)
+			if err != nil {
+				return nil, err
+			}
+			filename := b64.URLEncoding.EncodeToString([]byte(vol.Source))
+			vol.Fstype = "erofs"
+			vol.Options = append(vol.Options, "ro")
+			vol.MountPoint = filepath.Join(defaultKataGuestVirtualVolumedir, filename)
+			c.devices[i].ContainerPath = vol.MountPoint
+			rootFsStorages = append(rootFsStorages, vol)
+			// ref: https://github.com/containerd/containerd/blob/v2.2.0/plugins/snapshots/erofs/erofs.go#L161
+		} else if filepath.Base(d.ContainerPath) == "rwlayer.img" {
+			device := c.sandbox.devManager.GetDeviceByID(d.ID)
+			if device == nil {
+				return nil, fmt.Errorf("failed to find device by id %q", d.ID)
+			}
+			vol, err := handleBlockVolume(c, device)
+			if err != nil {
+				return nil, err
+			}
+			filename := b64.URLEncoding.EncodeToString([]byte(vol.Source))
+			vol.Fstype = "ext4"
+			vol.MountPoint = filepath.Join(defaultKataGuestVirtualVolumedir, filename)
+			c.devices[i].ContainerPath = vol.MountPoint
+			rwStor = vol
+		}
+	}
+
+	overlayDirDriverOption := "io.katacontainers.volume.overlayfs.create_directory"
+	var rootfsUpperDir, rootfsWorkDir string
+	if rwStor != nil {
+		rootfsUpperDir = filepath.Join(rwStor.MountPoint, "upper")
+		rootfsWorkDir = filepath.Join(rwStor.MountPoint, "work")
+	} else {
+		rootfsUpperDir = filepath.Join("/run/kata-containers/", c.id, "fs")
+		rootfsWorkDir = filepath.Join("/run/kata-containers/", c.id, "work")
+	}
+	rootfs := &grpc.Storage{}
+	rootfs.MountPoint = guestPath
+	rootfs.Source = typeOverlayFS
+	rootfs.Fstype = typeOverlayFS
+	rootfs.Driver = kataOverlayDevType
+	rootfs.DriverOptions = append(rootfs.DriverOptions, fmt.Sprintf("%s=%s", overlayDirDriverOption, rootfsUpperDir))
+	rootfs.DriverOptions = append(rootfs.DriverOptions, fmt.Sprintf("%s=%s", overlayDirDriverOption, rootfsWorkDir))
+	rootfs.Options = []string{}
+	for _, v := range rootFsStorages {
+		if len(rootfs.Options) == 0 {
+			rootfs.Options = append(rootfs.Options, fmt.Sprintf("%s=%s", lowerDir, v.MountPoint))
+		} else {
+			rootfs.Options[0] = (rootfs.Options[0] + fmt.Sprintf(":%s", v.MountPoint))
+		}
+	}
+	rootfs.Options = append(rootfs.Options, fmt.Sprintf("%s=%s", upperDir, rootfsUpperDir))
+	rootfs.Options = append(rootfs.Options, fmt.Sprintf("%s=%s", workDir, rootfsWorkDir))
+
+	if rwStor != nil {
+		rootFsStorages = append(rootFsStorages, rwStor)
+	}
+	rootFsStorages = append(rootFsStorages, rootfs)
+
+	return &SharedFile{
+		containerStorages: rootFsStorages,
+		guestPath:         guestPath,
+	}, nil
+}
+
+func forceGuestPull(c *Container) (*SharedFile, error) {
+	sf := &SharedFile{
+		guestPath: filepath.Join("/run/kata-containers/", c.id, c.rootfsSuffix),
+	}
+	guestPullVolume := &types.KataVirtualVolume{
+		VolumeType: types.KataVirtualVolumeImageGuestPullType,
+		ImagePull: &types.ImagePullVolume{
+			Metadata: map[string]string{},
+		},
+	}
+	vol, err := handleVirtualVolumeStorageObject(c, "", guestPullVolume)
+	if err != nil {
+		return nil, fmt.Errorf("forcing guest pull virtual volume: %w", err)
+	}
+	sf.containerStorages = append(sf.containerStorages, vol)
+	return sf, nil
+}
+
 // func (c *Container) shareRootfs(ctx context.Context) (*grpc.Storage, string, error) {
 func (f *FilesystemShare) ShareRootFilesystem(ctx context.Context, c *Container) (*SharedFile, error) {
+	if f.sandbox.IsGuestPullForced() {
+		return forceGuestPull(c)
+	}
 
 	if HasOptionPrefix(c.rootFs.Options, VirtualVolumePrefix) {
 		return f.shareRootFilesystemWithVirtualVolume(ctx, c)
 	}
 
-	if c.rootFs.Type == NydusRootFSType {
+	if IsNydusRootFSType(c.rootFs.Type) {
 		return f.shareRootFilesystemWithNydus(ctx, c)
 	}
+
+	if IsErofsRootFS(c.rootFs) {
+		return f.shareRootFilesystemWithErofs(ctx, c)
+	}
+
 	rootfsGuestPath := filepath.Join(kataGuestSharedDir(), c.id, c.rootfsSuffix)
 
 	if HasOptionPrefix(c.rootFs.Options, annotations.FileSystemLayer) {
@@ -580,21 +700,17 @@ func (f *FilesystemShare) ShareRootFilesystem(ctx context.Context, c *Container)
 			f.Logger().Error("malformed block drive")
 			return nil, fmt.Errorf("malformed block drive")
 		}
-		switch {
-		case f.sandbox.config.HypervisorConfig.BlockDeviceDriver == config.VirtioMmio:
+		switch f.sandbox.config.HypervisorConfig.BlockDeviceDriver {
+		case config.VirtioMmio:
 			rootfsStorage.Driver = kataMmioBlkDevType
 			rootfsStorage.Source = blockDrive.VirtPath
-		case f.sandbox.config.HypervisorConfig.BlockDeviceDriver == config.VirtioBlockCCW:
+		case config.VirtioBlockCCW:
 			rootfsStorage.Driver = kataBlkCCWDevType
 			rootfsStorage.Source = blockDrive.DevNo
-		case f.sandbox.config.HypervisorConfig.BlockDeviceDriver == config.VirtioBlock:
+		case config.VirtioBlock:
 			rootfsStorage.Driver = kataBlkDevType
-			if f.sandbox.config.HypervisorType == AcrnHypervisor {
-				rootfsStorage.Source = blockDrive.VirtPath
-			} else {
-				rootfsStorage.Source = blockDrive.PCIPath.String()
-			}
-		case f.sandbox.config.HypervisorConfig.BlockDeviceDriver == config.VirtioSCSI:
+			rootfsStorage.Source = blockDrive.PCIPath.String()
+		case config.VirtioSCSI:
 			rootfsStorage.Driver = kataSCSIDevType
 			rootfsStorage.Source = blockDrive.SCSIAddr
 		default:
@@ -641,7 +757,7 @@ func (f *FilesystemShare) ShareRootFilesystem(ctx context.Context, c *Container)
 }
 
 func (f *FilesystemShare) UnshareRootFilesystem(ctx context.Context, c *Container) error {
-	if c.rootFs.Type == NydusRootFSType {
+	if IsNydusRootFSType(c.rootFs.Type) {
 		if err2 := nydusContainerCleanup(ctx, getMountPath(c.sandbox.id), c); err2 != nil {
 			f.Logger().WithError(err2).Error("rollback failed nydusContainerCleanup")
 		}

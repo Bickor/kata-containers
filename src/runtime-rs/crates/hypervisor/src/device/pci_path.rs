@@ -33,9 +33,9 @@ impl PciSlot {
     }
 }
 
-impl ToString for PciSlot {
-    fn to_string(&self) -> String {
-        format!("{:02x}", self.0)
+impl std::fmt::Display for PciSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:02x}", self.0)
     }
 }
 
@@ -49,8 +49,7 @@ impl TryFrom<&str> for PciSlot {
 
         let base = 16;
         let n = u64::from_str_radix(s, base).context(format!(
-            "convert string to number with base {:?} failed.",
-            base
+            "convert string to number with base {base:?} failed."
         ))?;
         if n >> PCI_SLOT_BITS > 0 {
             return Err(anyhow!(
@@ -116,14 +115,17 @@ impl PciPath {
     }
 }
 
-impl ToString for PciPath {
-    // method to format the PciPath into a string
-    fn to_string(&self) -> String {
-        self.slots
-            .iter()
-            .map(|pci_slot| format!("{:02x}", pci_slot.0))
-            .collect::<Vec<String>>()
-            .join("/")
+impl std::fmt::Display for PciPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            self.slots
+                .iter()
+                .map(|pci_slot| format!("{:02x}", pci_slot.0))
+                .collect::<Vec<String>>()
+                .join("/")
+        )
     }
 }
 

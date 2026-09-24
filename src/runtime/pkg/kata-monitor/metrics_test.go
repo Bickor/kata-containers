@@ -119,7 +119,7 @@ func TestEncodeMetricFamily(t *testing.T) {
 
 	// create encoder
 	buf := bytes.NewBufferString("")
-	encoder := expfmt.NewEncoder(buf, expfmt.FmtText)
+	encoder := expfmt.NewEncoder(buf, expfmt.NewFormat(expfmt.TypeTextPlain))
 
 	// encode metrics to text format
 	err := encodeMetricFamily(mfs, encoder)
@@ -138,9 +138,11 @@ func TestEncodeMetricFamily(t *testing.T) {
 			continue
 		}
 		// only check kata_monitor_running_shim_count and kata_monitor_scrape_count
-		if fields[0] == "kata_monitor_running_shim_count" {
+		switch fields[0] {
+		case "kata_monitor_running_shim_count":
 			assert.Equal("11", fields[1], "kata_monitor_running_shim_count should be 11")
-		} else if fields[0] == "kata_monitor_scrape_count" {
+
+		case "kata_monitor_scrape_count":
 			assert.Equal("2", fields[1], "kata_monitor_scrape_count should be 2")
 		}
 	}

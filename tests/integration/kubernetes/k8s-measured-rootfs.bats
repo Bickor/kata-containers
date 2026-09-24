@@ -5,55 +5,68 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 
+load "${BATS_TEST_DIRNAME}/../../common.bash"
 load "${BATS_TEST_DIRNAME}/lib.sh"
 load "${BATS_TEST_DIRNAME}/tests_common.sh"
 
+case "${KATA_HYPERVISOR}" in
+	*-runtime-rs)
+		shim_config_file="/opt/kata/share/defaults/kata-containers/runtime-rs/runtimes/${KATA_HYPERVISOR}/configuration-${KATA_HYPERVISOR}.toml"
+		;;
+	*)
+		shim_config_file="/opt/kata/share/defaults/kata-containers/runtimes/${KATA_HYPERVISOR}/configuration-${KATA_HYPERVISOR}.toml"
+		;;
+esac
+
 check_and_skip() {
-	# Currently the kernel-confidential, isn't built withh measured rootfs support, so this test
-	# should be skipped until it is
-	# See https://github.com/kata-containers/kata-containers/issues/9612,
-	# https://github.com/kata-containers/kata-containers/issues/7235
-	# and https://github.com/kata-containers/kata-containers/issues/7415
-	skip "measured rootfs tests not implemented for hypervisor: $KATA_HYPERVISOR"
+	if is_confidential_runtime_class "${KATA_HYPERVISOR}"; then
+		if [[ "$(uname -m)" == "s390x" ]]; then
+			skip "measured rootfs tests not implemented for s390x"
+		fi
+		return
+	else
+		skip "measured rootfs tests not implemented for hypervisor: ${KATA_HYPERVISOR}"
+	fi
 }
 
 setup() {
 	check_and_skip
-	setup_common
+
+	setup_common || die "setup_common failed"
 }
 
-teardown() {
-	check_and_skip
+@test "Test cannot launch pod with measured boot enabled and incorrect hash" {
+	ensure_yq
+	nginx_registry=$(get_from_kata_deps ".docker_images.nginx.registry")
+	nginx_digest=$(get_from_kata_deps ".docker_images.nginx.digest")
+	nginx_image="${nginx_registry}@${nginx_digest}"
 
-	kubectl describe -f "${pod_config}" || true
-	kubectl delete -f "${pod_config}" || true
-}
+	pod_config="$(new_pod_config "${nginx_image}" "kata-${KATA_HYPERVISOR}")"
+	auto_generate_policy "${pod_config_dir}" "${pod_config}"
 
-@test "Test cannnot launch pod with measured boot enabled and incorrect hash" {
-	pod_config="$(new_pod_config nginx "kata-${KATA_HYPERVISOR}")"
+	incorrect_hash="1111111111111111111111111111111111111111111111111111111111111111"
 
-	incorrect_hash="5180b1568c2ba972e4e06ee0a55976acae8329f2a5d1d2004395635e1ec4a76e"
+	# Read verity parameters from config, then override via annotations.
+	kernel_verity_params=$(exec_host "$node" "sed -n 's/^kernel_verity_params = \"\\(.*\\)\"/\\1/p' ${shim_config_file}" || true)
+	[ -n "${kernel_verity_params}" ] || die "Missing kernel_verity_params in ${shim_config_file}"
 
-	# Despite the kernel being built with support, it is not currently enabled
-	# on configuration.toml. To avoid editing that file on the worker node,
-	# here it will be enabled via pod annotations.
+	kernel_verity_params=$(printf '%s\n' "$kernel_verity_params" | sed -E "s/root_hash=[^,]*/root_hash=${incorrect_hash}/")
 	set_metadata_annotation "$pod_config" \
-		"io.katacontainers.config.hypervisor.kernel_params" \
-		"rootfs_verity.scheme=dm-verity rootfs_verity.hash=$incorrect_hash"
+		"io.katacontainers.config.hypervisor.kernel_verity_params" \
+		"${kernel_verity_params}"
 	# Run on a specific node so we know from where to inspect the logs
 	set_node "$pod_config" "$node"
-
-#	Skip adding the policy, as it's causing the test to fail.
-#	See more details on: https://github.com/kata-containers/kata-containers/issues/9612
-#	# Add an "allow all" policy if policy testing is enabled.
-#	add_allow_all_policy_to_yaml "$pod_config"
 
 	# For debug sake
 	echo "Pod $pod_config file:"
 	cat $pod_config
 
-	assert_pod_fail "$pod_config"
+	assert_pod_container_creating "$pod_config"
+	assert_logs_contain "$node" kata "${node_start_time}" "verity: .* metadata block .* is corrupted"
+}
 
-	assert_logs_contain "$node" kata "$node_start_time" \
-		'verity: .* metadata block .* is corrupted'
+teardown() {
+	check_and_skip
+
+	teardown_common "${node}" "${node_start_time:-}"
 }

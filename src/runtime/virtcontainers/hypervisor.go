@@ -7,11 +7,16 @@ package virtcontainers
 
 import (
 	"bufio"
+	"bytes"
+	"compress/gzip"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"math"
 	"os"
+	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 
 	"github.com/pkg/errors"
@@ -41,9 +46,6 @@ const (
 
 	// QemuHypervisor is the QEMU hypervisor.
 	QemuHypervisor HypervisorType = "qemu"
-
-	// AcrnHypervisor is the ACRN hypervisor.
-	AcrnHypervisor HypervisorType = "acrn"
 
 	// ClhHypervisor is the ICH hypervisor.
 	ClhHypervisor HypervisorType = "clh"
@@ -90,9 +92,10 @@ const (
 )
 
 var (
-	hvLogger                   = logrus.WithField("source", "virtcontainers/hypervisor")
-	noGuestMemHotplugErr error = errors.New("guest memory hotplug not supported")
-	conflictingAssets    error = errors.New("cannot set both image and initrd at the same time")
+	hvLogger                        = logrus.WithField("source", "virtcontainers/hypervisor")
+	noGuestMemHotplugErr      error = errors.New("guest memory hotplug not supported")
+	s390xVirtioMemRequiredErr error = errors.New("memory hotplug on s390x requires virtio-mem to be enabled")
+	conflictingAssets         error = errors.New("cannot set both image and initrd at the same time")
 )
 
 // In some architectures the maximum number of vCPUs depends on the number of physical cores.
@@ -125,18 +128,56 @@ const (
 	EROFS RootfsType = "erofs"
 )
 
-func GetKernelRootParams(rootfstype string, disableNvdimm bool, dax bool) ([]Param, error) {
-	var kernelRootParams []Param
+func GetKernelRootParams(rootfstype string, disableNvdimm bool, dax bool, kernelVerityParams string) ([]Param, error) {
+	cfg, err := ParseKernelVerityParams(kernelVerityParams)
+	if err != nil {
+		return []Param{}, err
+	}
 
 	// EXT4 filesystem is used by default.
 	if rootfstype == "" {
 		rootfstype = string(EXT4)
 	}
 
+	if cfg != nil {
+		rootDevice := "/dev/pmem0p1"
+		hashDevice := "/dev/pmem0p2"
+		if disableNvdimm {
+			rootDevice = "/dev/vda1"
+			hashDevice = "/dev/vda2"
+		}
+
+		dataSectors := (cfg.dataBlockSize / 512) * cfg.dataBlocks
+		verityCmd := fmt.Sprintf(
+			"dm-verity,,,ro,0 %d verity 1 %s %s %d %d %d 0 sha256 %s %s",
+			dataSectors,
+			rootDevice,
+			hashDevice,
+			cfg.dataBlockSize,
+			cfg.hashBlockSize,
+			cfg.dataBlocks,
+			cfg.rootHash,
+			cfg.salt,
+		)
+
+		rootFlags, err := kernelVerityRootFlags(rootfstype)
+		if err != nil {
+			return []Param{}, err
+		}
+
+		return []Param{
+			{Key: "dm-mod.create", Value: fmt.Sprintf("\"%s\"", verityCmd)},
+			{Key: "root", Value: "/dev/dm-0"},
+			{Key: "rootflags", Value: rootFlags},
+			{Key: "rootfstype", Value: rootfstype},
+		}, nil
+	}
+
 	if disableNvdimm && dax {
 		return []Param{}, fmt.Errorf("Virtio-Blk does not support DAX")
 	}
 
+	kernelRootParams := []Param{}
 	if disableNvdimm {
 		// Virtio-Blk
 		kernelRootParams = append(kernelRootParams, Param{"root", string(VirtioBlk)})
@@ -153,7 +194,11 @@ func GetKernelRootParams(rootfstype string, disableNvdimm bool, dax bool) ([]Par
 			kernelRootParams = append(kernelRootParams, Param{"rootflags", "ro"})
 		}
 	case XFS:
-		fallthrough
+		if dax {
+			kernelRootParams = append(kernelRootParams, Param{"rootflags", "dax ro"})
+		} else {
+			kernelRootParams = append(kernelRootParams, Param{"rootflags", "ro"})
+		}
 	// EXT4 filesystem is used by default.
 	case EXT4:
 		if dax {
@@ -166,8 +211,114 @@ func GetKernelRootParams(rootfstype string, disableNvdimm bool, dax bool) ([]Par
 	}
 
 	kernelRootParams = append(kernelRootParams, Param{"rootfstype", rootfstype})
-
 	return kernelRootParams, nil
+}
+
+const (
+	verityBlockSizeBytes = 512
+)
+
+type kernelVerityConfig struct {
+	rootHash      string
+	salt          string
+	dataBlocks    uint64
+	dataBlockSize uint64
+	hashBlockSize uint64
+}
+
+func ParseKernelVerityParams(params string) (*kernelVerityConfig, error) {
+	if strings.TrimSpace(params) == "" {
+		return nil, nil
+	}
+
+	values := map[string]string{}
+	for _, field := range strings.Split(params, ",") {
+		field = strings.TrimSpace(field)
+		if field == "" {
+			continue
+		}
+		parts := strings.SplitN(field, "=", 2)
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("invalid kernel_verity_params entry: %q", field)
+		}
+		values[parts[0]] = parts[1]
+	}
+
+	cfg := &kernelVerityConfig{
+		rootHash: values["root_hash"],
+		salt:     values["salt"],
+	}
+	if cfg.rootHash == "" {
+		return nil, fmt.Errorf("missing kernel_verity_params root_hash")
+	}
+
+	parseUintField := func(name string) (uint64, error) {
+		value, ok := values[name]
+		if !ok || value == "" {
+			return 0, fmt.Errorf("missing kernel_verity_params %s", name)
+		}
+		parsed, err := strconv.ParseUint(value, 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("invalid kernel_verity_params %s %q: %w", name, value, err)
+		}
+		return parsed, nil
+	}
+
+	dataBlocks, err := parseUintField("data_blocks")
+	if err != nil {
+		return nil, err
+	}
+	dataBlockSize, err := parseUintField("data_block_size")
+	if err != nil {
+		return nil, err
+	}
+	hashBlockSize, err := parseUintField("hash_block_size")
+	if err != nil {
+		return nil, err
+	}
+
+	if cfg.salt == "" {
+		return nil, fmt.Errorf("missing kernel_verity_params salt")
+	}
+	if dataBlocks == 0 {
+		return nil, fmt.Errorf("invalid kernel_verity_params data_blocks: must be non-zero")
+	}
+	if dataBlockSize == 0 {
+		return nil, fmt.Errorf("invalid kernel_verity_params data_block_size: must be non-zero")
+	}
+	if hashBlockSize == 0 {
+		return nil, fmt.Errorf("invalid kernel_verity_params hash_block_size: must be non-zero")
+	}
+	if dataBlockSize%verityBlockSizeBytes != 0 {
+		return nil, fmt.Errorf("invalid kernel_verity_params data_block_size: must be multiple of %d", verityBlockSizeBytes)
+	}
+	if hashBlockSize%verityBlockSizeBytes != 0 {
+		return nil, fmt.Errorf("invalid kernel_verity_params hash_block_size: must be multiple of %d", verityBlockSizeBytes)
+	}
+
+	cfg.dataBlocks = dataBlocks
+	cfg.dataBlockSize = dataBlockSize
+	cfg.hashBlockSize = hashBlockSize
+
+	return cfg, nil
+}
+
+func kernelVerityRootFlags(rootfstype string) (string, error) {
+	// EXT4 filesystem is used by default.
+	if rootfstype == "" {
+		rootfstype = string(EXT4)
+	}
+
+	switch RootfsType(rootfstype) {
+	case EROFS:
+		return "ro", nil
+	case XFS:
+		return "ro", nil
+	case EXT4:
+		return "data=ordered,errors=remount-ro ro", nil
+	default:
+		return "", fmt.Errorf("unsupported rootfs type")
+	}
 }
 
 // DeviceType describes a virtualized device type.
@@ -231,9 +382,6 @@ func (hType *HypervisorType) Set(value string) error {
 	case "firecracker":
 		*hType = FirecrackerHypervisor
 		return nil
-	case "acrn":
-		*hType = AcrnHypervisor
-		return nil
 	case "clh":
 		*hType = ClhHypervisor
 		return nil
@@ -261,8 +409,6 @@ func (hType *HypervisorType) String() string {
 		return string(QemuHypervisor)
 	case FirecrackerHypervisor:
 		return string(FirecrackerHypervisor)
-	case AcrnHypervisor:
-		return string(AcrnHypervisor)
 	case ClhHypervisor:
 		return string(ClhHypervisor)
 	case StratovirtHypervisor:
@@ -357,9 +503,6 @@ type HypervisorConfig struct {
 	// HypervisorPath is the hypervisor executable host path.
 	HypervisorPath string
 
-	// HypervisorCtlPath is the hypervisor ctl executable host path.
-	HypervisorCtlPath string
-
 	// JailerPath is the jailer executable host path.
 	JailerPath string
 
@@ -397,9 +540,6 @@ type HypervisorConfig struct {
 	// VirtioFSCache cache mode for fs version cache
 	VirtioFSCache string
 
-	// File based memory backend root directory
-	FileBackedMemRootDir string
-
 	// VhostUserStorePath is the directory path where vhost-user devices
 	// related folders, sockets and device nodes should be.
 	VhostUserStorePath string
@@ -430,9 +570,6 @@ type HypervisorConfig struct {
 	// HypervisorPathList is the list of hypervisor paths names allowed in annotations
 	HypervisorPathList []string
 
-	// HypervisorCtlPathList is the list of hypervisor control paths names allowed in annotations
-	HypervisorCtlPathList []string
-
 	// JailerPathList is the list of jailer paths names allowed in annotations
 	JailerPathList []string
 
@@ -447,9 +584,6 @@ type HypervisorConfig struct {
 
 	// Enable annotations by name
 	EnableAnnotations []string
-
-	// FileBackedMemRootList is the list of valid root directories values for annotations
-	FileBackedMemRootList []string
 
 	// PFlash image paths
 	PFlash []string
@@ -475,12 +609,22 @@ type HypervisorConfig struct {
 	// The user maps to the uid.
 	User string
 
-	// The path to the file containing the AMD SEV-SNP certificate chain
-	// (including VCEK/VLEK certificates).
-	SnpCertsPath string
+	// SnpIdBlock is the 96-byte, base64-encoded blob to provide the ‘ID Block’ structure
+	// for the SNP_LAUNCH_FINISH command defined in the SEV-SNP firmware ABI (default: all-zero)
+	SnpIdBlock string
+
+	// SnpIdAuth is the 4096-byte, base64-encoded blob to provide the ‘ID Authentication Information Structure’
+	// for the SNP_LAUNCH_FINISH command defined in the SEV-SNP firmware ABI (default: all-zero)
+	SnpIdAuth string
+
+	// SnpGuestPolicy is the integer representation of the SEV-SNP guest policy.
+	SnpGuestPolicy *uint64
 
 	// KernelParams are additional guest kernel parameters.
 	KernelParams []Param
+
+	// KernelVerityParams are additional guest dm-verity parameters.
+	KernelVerityParams string
 
 	// HypervisorParams are additional hypervisor parameters.
 	HypervisorParams []Param
@@ -604,19 +748,39 @@ type HypervisorConfig struct {
 	// Denotes whether flush requests for the device are ignored.
 	BlockDeviceCacheNoflush bool
 
+	// BlockDeviceLogicalSectorSize specifies the logical sector size reported
+	// by block devices to the guest, in bytes. Common values are 512 and 4096.
+	// Set to 0 to use the hypervisor default.
+	BlockDeviceLogicalSectorSize uint32
+
+	// BlockDevicePhysicalSectorSize specifies the physical sector size reported
+	// by block devices to the guest, in bytes. Common values are 512 and 4096.
+	// Set to 0 to use the hypervisor default.
+	BlockDevicePhysicalSectorSize uint32
+
 	// DisableBlockDeviceUse disallows a block device from being used.
 	DisableBlockDeviceUse bool
 
 	// EnableIOThreads enables IO to be processed in a separate thread.
-	// Supported currently for virtio-scsi driver.
+	// Supported currently for virtio-scsi driver and virtio-blk(based on IndepIOThreads) driver.
 	EnableIOThreads bool
+
+	// Independent IOThreads enables IO to be processed in a separate thread.
+	IndepIOThreads uint32
 
 	// Debug changes the default hypervisor and kernel parameters to
 	// enable debug output where available.
 	Debug bool
 
+	// HypervisorLoglevel determines the level of logging emitted
+	// from the hypervisor. Accepts values 0-3.
+	HypervisorLoglevel uint32
+
 	// MemPrealloc specifies if the memory should be pre-allocated
 	MemPrealloc bool
+
+	// ReclaimGuestFreedMemory is a sandbox annotation that specifies whether the memory freed by the guest will be reclaimed by the hypervisor or not.
+	ReclaimGuestFreedMemory bool
 
 	// HugePages specifies if the memory should be pre-allocated from huge pages
 	HugePages bool
@@ -629,6 +793,18 @@ type HypervisorConfig struct {
 
 	// IOMMUPlatform is used to indicate if IOMMU_PLATFORM is enabled for supported devices
 	IOMMUPlatform bool
+
+	// GuestNUMANodes defines guest NUMA topology and mapping to host NUMA nodes and CPUs.
+	GuestNUMANodes []types.GuestNUMANode
+
+	// NUMAMapping is the raw user-provided NUMA mapping (TOML
+	// `numa_mapping` or the io.katacontainers.config.hypervisor.numa_mapping
+	// annotation). When empty, GuestNUMANodes was auto-derived from the
+	// host topology and may be right-sized at sandbox creation (e.g.
+	// collapsed to a single host node when the sandbox fits, or
+	// restricted to host nodes containing attached VFIO devices). When
+	// non-empty, the topology is honored verbatim.
+	NUMAMapping []string
 
 	// DisableNestingChecks is used to override customizations performed
 	// when running on top of another VMM.
@@ -687,6 +863,24 @@ type HypervisorConfig struct {
 
 	// Initdata defines the initdata passed into guest when CreateVM
 	Initdata string
+
+	// InitdataDigest represents opaque binary data attached to a TEE and typically used
+	// for Guest attestation. This will be encoded in the format expected by QEMU for each TEE type.
+	InitdataDigest []byte
+
+	// The initdata image on the host side to store the initdata and be mounted
+	// as a raw block device to guest
+	InitdataImage string
+
+	// GPU specific annotations (currently only applicable for Remote Hypervisor)
+	//DefaultGPUs specifies the number of GPUs required for the Kata VM
+	DefaultGPUs uint32
+	// DefaultGPUModel specifies GPU model like tesla, h100, readeon etc.
+	DefaultGPUModel string
+
+	// MeasurementAlgo is the algorithm for measurement
+	// This is only relevant for Arm CCA cca-guest objects
+	MeasurementAlgo string
 }
 
 // vcpu mapping from vcpu number to thread number
@@ -809,8 +1003,6 @@ func (conf *HypervisorConfig) assetPath(t types.AssetType) (string, error) {
 		return conf.InitrdPath, nil
 	case types.HypervisorAsset:
 		return conf.HypervisorPath, nil
-	case types.HypervisorCtlAsset:
-		return conf.HypervisorCtlPath, nil
 	case types.JailerAsset:
 		return conf.JailerPath, nil
 	case types.FirmwareAsset:
@@ -866,11 +1058,6 @@ func (conf *HypervisorConfig) IfPVPanicEnabled() bool {
 	return conf.GuestMemoryDumpPath != ""
 }
 
-// HypervisorCtlAssetPath returns the VM hypervisor ctl path
-func (conf *HypervisorConfig) HypervisorCtlAssetPath() (string, error) {
-	return conf.assetPath(types.HypervisorCtlAsset)
-}
-
 // CustomHypervisorAsset returns true if the hypervisor asset is a custom one, false otherwise.
 func (conf *HypervisorConfig) CustomHypervisorAsset() bool {
 	return conf.isCustomAsset(types.HypervisorAsset)
@@ -892,6 +1079,10 @@ func RoundUpNumVCPUs(cpus float32) uint32 {
 
 func (conf HypervisorConfig) NumVCPUs() uint32 {
 	return RoundUpNumVCPUs(conf.NumVCPUsF)
+}
+
+func (conf HypervisorConfig) NumGuestNUMANodes() uint32 {
+	return uint32(len(conf.GuestNUMANodes))
 }
 
 func appendParam(params []Param, parameter string, value string) []Param {
@@ -1072,6 +1263,10 @@ const (
 	// https://www.kernel.org/doc/html/latest/virt/kvm/s390-pv.html
 	// Exclude from lint checking for it won't be used on arm64 code
 	seProtection
+
+	// Arm Realm Management Extension (Arm Confidential Computing Architecture)
+	// https://www.arm.com/architecture/security-features/arm-confidential-compute-architecture
+	ccaProtection
 )
 
 var guestProtectionStr = [...]string{
@@ -1081,6 +1276,7 @@ var guestProtectionStr = [...]string{
 	sevProtection:  "sev",
 	snpProtection:  "snp",
 	tdxProtection:  "tdx",
+	ccaProtection:  "cca",
 }
 
 func (gp guestProtection) String() string {
@@ -1114,6 +1310,11 @@ type Hypervisor interface {
 	AddDevice(ctx context.Context, devInfo interface{}, devType DeviceType) error
 	HotplugAddDevice(ctx context.Context, devInfo interface{}, devType DeviceType) (interface{}, error)
 	HotplugRemoveDevice(ctx context.Context, devInfo interface{}, devType DeviceType) (interface{}, error)
+	// ResolveColdPlugVFIOGuestPciPaths resolves the in-guest PCI path for each
+	// VFIODev with IsPCIe=true and an empty GuestPciPath, writing the result
+	// back onto the device. Hypervisors that do not require this (e.g. CLH,
+	// which already populates GuestPciPath during hot-plug) return nil.
+	ResolveColdPlugVFIOGuestPciPaths(ctx context.Context, vfioDevs []*config.VFIODev) error
 	ResizeMemory(ctx context.Context, memMB uint32, memoryBlockSizeMB uint32, probe bool) (uint32, MemoryDevice, error)
 	ResizeVCPUs(ctx context.Context, vcpus uint32) (uint32, uint32, error)
 	GetTotalMemoryMB(ctx context.Context) uint32
@@ -1172,4 +1373,95 @@ func KernelParamFields(s string) []string {
 	}
 
 	return params
+}
+
+// prepareInitdataMount prepares the on-disk initdata image for a VM/sandbox.
+//
+// It reads the initdata payload from config.Initdata, creates a working directory
+// at /run/kata-containers/shared/initdata/<id>, builds the image file
+// (data.img) via prepareInitdataImage, and sets config.InitdataImage to the
+// resulting absolute path.
+func prepareInitdataMount(logger *logrus.Entry, id string, config *HypervisorConfig) error {
+	if len(config.Initdata) == 0 {
+		logger.Info("No initdata provided. Skip prepare initdata device")
+		return nil
+	}
+
+	logger.Info("Start to prepare initdata")
+	initdataWorkdir := filepath.Join("/run/kata-containers/shared/initdata", id)
+	initdataImagePath := filepath.Join(initdataWorkdir, "data.img")
+
+	if err := os.MkdirAll(initdataWorkdir, 0o755); err != nil {
+		logger.WithField("initdata", "create initdata image path").WithError(err).Error("mkdir failed")
+		return err
+	}
+
+	if err := prepareInitdataImage(config.Initdata, initdataImagePath); err != nil {
+		logger.WithField("initdata", "prepare initdata image").WithError(err).Error("prepare failed")
+		return err
+	}
+
+	config.InitdataImage = initdataImagePath
+	return nil
+}
+
+// prepareInitdataImage will create an image with a very simple layout
+//
+// There will be multiple sectors. The first 8 bytes are Magic number "initdata".
+// Then a "length" field of 8 bytes follows (unsigned int64).
+// Finally the gzipped initdata toml. The image will be padded to an
+// integer multiple of the sector size for alignment.
+//
+// offset 0                                8                    16
+// 0	  'i' 'n' 'i' 't' 'd' 'a' 't' 'a'  | gzip length in le  |
+// 16	  gzip(initdata toml) ...
+// (end of the last sector)  '\0' paddings
+func prepareInitdataImage(initdata string, imagePath string) error {
+	SectorSize := 512
+	var buf bytes.Buffer
+	gzipper := gzip.NewWriter(&buf)
+	defer gzipper.Close()
+
+	gzipper.Write([]byte(initdata))
+	err := gzipper.Close()
+	if err != nil {
+		return fmt.Errorf("failed to compress initdata: %v", err)
+	}
+
+	compressedInitdata := buf.Bytes()
+
+	compressedInitdataLength := len(compressedInitdata)
+	lengthBuffer := make([]byte, 8)
+	binary.LittleEndian.PutUint64(lengthBuffer, uint64(compressedInitdataLength))
+
+	paddingLength := (compressedInitdataLength+16+SectorSize-1)/SectorSize*SectorSize - (compressedInitdataLength + 16)
+	paddingBuffer := make([]byte, paddingLength)
+
+	file, err := os.OpenFile(imagePath, os.O_CREATE|os.O_RDWR, 0640)
+	if err != nil {
+		return fmt.Errorf("failed to create initdata image: %v", err)
+	}
+	defer file.Close()
+
+	_, err = file.Write([]byte("initdata"))
+	if err != nil {
+		return fmt.Errorf("failed to write magic number to initdata image: %v", err)
+	}
+
+	_, err = file.Write(lengthBuffer)
+	if err != nil {
+		return fmt.Errorf("failed to write data length to initdata image: %v", err)
+	}
+
+	_, err = file.Write([]byte(compressedInitdata))
+	if err != nil {
+		return fmt.Errorf("failed to write compressed initdata to initdata image: %v", err)
+	}
+
+	_, err = file.Write(paddingBuffer)
+	if err != nil {
+		return fmt.Errorf("failed to write compressed initdata to initdata image: %v", err)
+	}
+
+	return nil
 }

@@ -4,10 +4,11 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-use std::{convert::TryFrom, sync::Arc, usize};
+use std::{convert::TryFrom, sync::Arc};
 
 use anyhow::{anyhow, Context, Result};
 use futures::stream::TryStreamExt;
+use rtnetlink::LinkUnspec;
 
 use super::{
     network_model,
@@ -15,9 +16,6 @@ use super::{
 };
 
 const TAP_SUFFIX: &str = "_kata";
-
-#[derive(Default, Copy, Clone, Debug, PartialEq, Eq)]
-pub struct NetInterworkingModel(u32);
 
 #[derive(Default, Debug, Clone)]
 pub struct NetworkInterface {
@@ -50,13 +48,17 @@ impl NetworkPair {
     ) -> Result<Self> {
         let unique_id = kata_sys_util::rand::UUID::new();
         let model = network_model::new(model).context("new network model")?;
-        let tap_iface_name = format!("tap{}{}", idx, TAP_SUFFIX);
-        let virt_iface_name = format!("eth{}", idx);
+        let tap_iface_name = format!("tap{idx}{TAP_SUFFIX}");
+        let virt_iface_name = if name.is_empty() {
+            format!("eth{idx}")
+        } else {
+            String::from(name)
+        };
         let tap_link = create_link(handle, &tap_iface_name, queues)
             .await
             .context("create link")?;
 
-        let virt_link = get_link_by_name(handle, virt_iface_name.clone().as_str())
+        let virt_link = get_link_by_name(handle, virt_iface_name.as_str())
             .await
             .context("get link by name")?;
 
@@ -88,24 +90,30 @@ impl NetworkPair {
 
         handle
             .link()
-            .set(tap_link.attrs().index)
-            .mtu(virt_link.attrs().mtu)
+            .set(
+                LinkUnspec::new_with_index(tap_link.attrs().index)
+                    .mtu(virt_link.attrs().mtu)
+                    .build(),
+            )
             .execute()
             .await
             .context("set link mtu")?;
 
         handle
             .link()
-            .set(tap_link.attrs().index)
-            .up()
+            .set(
+                LinkUnspec::new_with_index(tap_link.attrs().index)
+                    .up()
+                    .build(),
+            )
             .execute()
             .await
             .context("set link up")?;
 
-        let mut net_pair = NetworkPair {
+        let net_pair = NetworkPair {
             tap: TapInterface {
                 id: String::from(&unique_id),
-                name: format!("br{}{}", idx, TAP_SUFFIX),
+                name: format!("br{idx}{TAP_SUFFIX}"),
                 tap_iface: NetworkInterface {
                     name: tap_iface_name,
                     hard_addr: tap_hard_addr,
@@ -120,10 +128,6 @@ impl NetworkPair {
             model,
             network_qos: false,
         };
-
-        if !name.is_empty() {
-            net_pair.virt_iface.name = String::from(name);
-        }
 
         Ok(net_pair)
     }
@@ -156,8 +160,11 @@ pub async fn create_link(
     if base.master_index != 0 {
         handle
             .link()
-            .set(base.index)
-            .master(base.master_index)
+            .set(
+                LinkUnspec::new_with_index(base.index)
+                    .controller(base.master_index)
+                    .build(),
+            )
             .execute()
             .await
             .context("set index")?;

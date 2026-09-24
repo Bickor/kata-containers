@@ -10,7 +10,7 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use hypervisor::{
     device::{
-        device_manager::{do_handle_device, get_block_driver, DeviceManager},
+        device_manager::{do_handle_device, get_block_device_info, DeviceManager},
         DeviceConfig, DeviceType,
     },
     VhostUserConfig, VhostUserType,
@@ -74,7 +74,7 @@ impl SPDKVolume {
             }
         }
 
-        let block_driver = get_block_driver(d).await;
+        let block_driver = get_block_device_info(d).await.block_device_driver;
 
         let vhu_blk_config = &mut VhostUserConfig {
             socket_path: device,
@@ -125,7 +125,7 @@ impl SPDKVolume {
             .context("generate host-guest shared path failed")?;
         storage.mount_point = guest_path.clone();
 
-        if get_mount_type(m.typ()).as_str() != "bind" {
+        if get_mount_type(m).as_str() != "bind" {
             storage.fs_type = mount_info.fs_type.clone();
         } else {
             storage.fs_type = DEFAULT_VOLUME_FS_TYPE.to_string();

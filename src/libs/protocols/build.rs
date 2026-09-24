@@ -69,15 +69,15 @@ fn use_serde(protos: &[&str], out_dir: &Path) -> Result<(), std::io::Error> {
             let out_file = Path::new(f)
                 .file_name()
                 .and_then(|s| s.to_str())
-                .ok_or(format!("failed to get proto file name for {:?}", f))
+                .ok_or(format!("failed to get proto file name for {f:?}"))
                 .map(|s| {
                     let t = s.replace(".proto", ".rs");
                     out_dir.join(t)
                 })
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+                .map_err(std::io::Error::other)?
                 .to_str()
-                .ok_or(format!("cannot convert {:?} path to string", f))
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+                .ok_or(format!("cannot convert {f:?} path to string"))
+                .map_err(std::io::Error::other)?
                 .to_string();
 
             replace_text_in_file(
@@ -166,7 +166,7 @@ fn codegen(path: &str, protos: &[&str], async_all: bool) -> Result<(), std::io::
         let generated_file = proto_filename
             .to_str()
             .ok_or("failed")
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+            .map_err(std::io::Error::other)?
             .replace(".proto", ".rs");
 
         let out_file = out_dir.join(generated_file);
@@ -174,7 +174,7 @@ fn codegen(path: &str, protos: &[&str], async_all: bool) -> Result<(), std::io::
         let out_file_str = out_file
             .to_str()
             .ok_or("failed")
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(std::io::Error::other)?;
 
         handle_file(&autogen_comment, out_file_str)?;
     }
@@ -191,6 +191,7 @@ fn real_main() -> Result<(), std::io::Error> {
             "protos/oci.proto",
             "protos/types.proto",
             "protos/csi.proto",
+            "protos/runtimeoptions.proto",
         ],
         false,
     )?;
@@ -204,6 +205,7 @@ fn real_main() -> Result<(), std::io::Error> {
                 "protos/agent.proto",
                 "protos/health.proto",
                 "protos/confidential_data_hub.proto",
+                "protos/remote.proto",
             ],
             true,
         )?;
@@ -214,6 +216,7 @@ fn real_main() -> Result<(), std::io::Error> {
             "src/confidential_data_hub_ttrpc.rs",
             "src/confidential_data_hub_ttrpc_async.rs",
         )?;
+        fs::rename("src/remote_ttrpc.rs", "src/remote_ttrpc_async.rs")?;
     }
 
     codegen(
@@ -222,9 +225,12 @@ fn real_main() -> Result<(), std::io::Error> {
             "protos/agent.proto",
             "protos/health.proto",
             "protos/confidential_data_hub.proto",
+            "protos/remote.proto",
         ],
         false,
     )?;
+
+    codegen("src", &["protos/cri-api/api.proto"], false)?;
 
     // There is a message named 'Box' in oci.proto
     // so there is a struct named 'Box', we should replace Box<Self> to ::std::boxed::Box<Self>
@@ -240,7 +246,7 @@ fn real_main() -> Result<(), std::io::Error> {
 
 fn main() {
     if let Err(e) = real_main() {
-        eprintln!("ERROR: {}", e);
+        eprintln!("ERROR: {e}");
         exit(1);
     }
 }

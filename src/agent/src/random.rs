@@ -8,13 +8,13 @@ use nix::errno::Errno;
 use nix::fcntl::{self, OFlag};
 use nix::sys::stat::Mode;
 use std::fs;
-use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
 use tracing::instrument;
 
 pub const RNGDEV: &str = "/dev/random";
-#[cfg(target_arch = "powerpc64")]
+#[cfg(all(target_arch = "powerpc64", target_endian = "little"))]
 pub const RNDADDTOENTCNT: libc::c_uint = 0x80045201;
-#[cfg(target_arch = "powerpc64")]
+#[cfg(all(target_arch = "powerpc64", target_endian = "little"))]
 pub const RNDRESEEDCRNG: libc::c_int = 0x20005207;
 #[cfg(not(target_arch = "powerpc64"))]
 pub const RNDADDTOENTCNT: libc::c_int = 0x40045201;
@@ -38,7 +38,7 @@ pub fn reseed_rng(data: &[u8]) -> Result<()> {
     let f = {
         let fd = fcntl::open(RNGDEV, OFlag::O_RDWR, Mode::from_bits_truncate(0o022))?;
         // Wrap fd with `File` to properly close descriptor on exit
-        unsafe { fs::File::from_raw_fd(fd) }
+        unsafe { fs::File::from_raw_fd(fd.into_raw_fd()) }
     };
 
     let ret = unsafe {
@@ -59,9 +59,25 @@ pub fn reseed_rng(data: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nix::errno::Errno;
     use std::fs::File;
     use std::io::prelude::*;
     use test_utils::skip_if_not_root;
+
+    /// Helper function to check if the result is an EPERM error
+    fn is_permission_error(result: &Result<()>) -> bool {
+        if let Err(e) = result {
+            if let Some(errno) = e.downcast_ref::<Errno>() {
+                if *errno == Errno::EPERM {
+                    println!(
+                        "EPERM: skipping test - reseeding RNG is not permitted in this environment"
+                    );
+                    return true;
+                }
+            }
+        }
+        false
+    }
 
     #[test]
     fn test_reseed_rng() {
@@ -73,6 +89,9 @@ mod tests {
         // Ensure the buffer was filled.
         assert!(n == POOL_SIZE);
         let ret = reseed_rng(&seed);
+        if is_permission_error(&ret) {
+            return;
+        }
         assert!(ret.is_ok());
     }
 
@@ -85,6 +104,9 @@ mod tests {
         // Ensure the buffer was filled.
         assert!(n == POOL_SIZE);
         let ret = reseed_rng(&seed);
+        if is_permission_error(&ret) {
+            return;
+        }
         if nix::unistd::Uid::effective().is_root() {
             assert!(ret.is_ok());
         } else {

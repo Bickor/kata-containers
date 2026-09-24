@@ -18,10 +18,11 @@ extern crate scopeguard;
 #[macro_use]
 extern crate slog;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use cfg_if::cfg_if;
-use clap::{AppSettings, Parser};
+use clap::Parser;
 use const_format::concatcp;
+use initdata::{InitdataReturnValue, AA_CONFIG_PATH, CDH_CONFIG_PATH};
 use nix::fcntl::OFlag;
 use nix::sys::reboot::{reboot, RebootMode};
 use nix::sys::socket::{self, AddressFamily, SockFlag, SockType, VsockAddr};
@@ -29,19 +30,20 @@ use nix::unistd::{self, dup, sync, Pid};
 use std::env;
 use std::ffi::OsStr;
 use std::fs::{self, File};
-use std::os::unix::fs as unixfs;
-use std::os::unix::io::AsRawFd;
+use std::io::ErrorKind;
+use std::os::unix::fs::{self as unixfs, FileTypeExt};
+use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
 use std::path::Path;
 use std::process::exit;
-use std::process::Command;
 use std::sync::Arc;
 use tracing::{instrument, span};
 
-mod cdh;
+mod confidential_data_hub;
 mod config;
 mod console;
 mod device;
 mod features;
+mod initdata;
 mod linux_abi;
 mod metrics;
 mod mount;
@@ -77,9 +79,6 @@ use tokio::{
     task::JoinHandle,
 };
 
-#[cfg(feature = "guest-pull")]
-mod image;
-
 mod rpc;
 mod tracer;
 
@@ -108,10 +107,9 @@ const CDH_SOCKET_URI: &str = concatcp!(UNIX_SOCKET_PREFIX, CDH_SOCKET);
 
 const API_SERVER_PATH: &str = "/usr/local/bin/api-server-rest";
 
-/// Path of ocicrypt config file. This is used by image-rs when decrypting image.
-const OCICRYPT_CONFIG_PATH: &str = "/tmp/ocicrypt_config.json";
-
-const DEFAULT_LAUNCH_PROCESS_TIMEOUT: i32 = 6;
+/// Path of ocicrypt config file. This is used by CDH when decrypting image.
+/// TODO: remove this when we move the launch of CDH out of the kata-agent.
+const OCICRYPT_CONFIG_PATH: &str = "/etc/ocicrypt_config.json";
 
 lazy_static! {
     static ref AGENT_CONFIG: AgentConfig =
@@ -123,12 +121,12 @@ lazy_static! {
 
 #[cfg(feature = "agent-policy")]
 lazy_static! {
-    static ref AGENT_POLICY: Mutex<policy::AgentPolicy> = Mutex::new(AgentPolicy::new());
+    static ref AGENT_POLICY: Mutex<AgentPolicy> = Mutex::new(AgentPolicy::new());
 }
 
 #[derive(Parser)]
 // The default clap version info doesn't match our form, so we need to override it
-#[clap(global_setting(AppSettings::DisableVersionFlag))]
+#[clap(disable_version_flag = true)]
 struct AgentOpts {
     /// Print the version information
     #[clap(short, long)]
@@ -171,10 +169,10 @@ async fn create_logger_task(rfd: RawFd, vsock_port: u32, shutdown: Receiver<bool
         )?;
 
         let addr = VsockAddr::new(libc::VMADDR_CID_ANY, vsock_port);
-        socket::bind(listenfd, &addr)?;
-        socket::listen(listenfd, 1)?;
+        socket::bind(listenfd.as_raw_fd(), &addr)?;
+        socket::listen(&listenfd, nix::sys::socket::Backlog::new(1).unwrap())?;
 
-        Box::new(util::get_vsock_stream(listenfd).await?)
+        Box::new(util::get_vsock_stream(listenfd.into_raw_fd()).await?)
     } else {
         Box::new(tokio::io::stdout())
     };
@@ -201,8 +199,8 @@ async fn real_main(init_mode: bool) -> std::result::Result<(), Box<dyn std::erro
         // dup a new file descriptor for this temporary logger writer,
         // since this logger would be dropped and it's writer would
         // be closed out of this code block.
-        let newwfd = dup(wfd)?;
-        let writer = unsafe { File::from_raw_fd(newwfd) };
+        let newwfd = dup(&wfd)?;
+        let writer = unsafe { File::from_raw_fd(newwfd.into_raw_fd()) };
 
         // Init a temporary logger used by init agent as init process
         // since before do the base mount, it wouldn't access "/proc/cmdline"
@@ -217,8 +215,9 @@ async fn real_main(init_mode: bool) -> std::result::Result<(), Box<dyn std::erro
         })?;
 
         lazy_static::initialize(&AGENT_CONFIG);
+        let cgroup_v2 = AGENT_CONFIG.unified_cgroup_hierarchy || AGENT_CONFIG.cgroup_no_v1 == "all";
 
-        init_agent_as_init(&logger, AGENT_CONFIG.unified_cgroup_hierarchy)?;
+        init_agent_as_init(&logger, cgroup_v2)?;
         drop(logger_async_guard);
     } else {
         lazy_static::initialize(&AGENT_CONFIG);
@@ -227,11 +226,15 @@ async fn real_main(init_mode: bool) -> std::result::Result<(), Box<dyn std::erro
     let config = &AGENT_CONFIG;
     let log_vport = config.log_vport as u32;
 
-    let log_handle = tokio::spawn(create_logger_task(rfd, log_vport, shutdown_rx.clone()));
+    let log_handle = tokio::spawn(create_logger_task(
+        rfd.into_raw_fd(),
+        log_vport,
+        shutdown_rx.clone(),
+    ));
 
     tasks.push(log_handle);
 
-    let writer = unsafe { File::from_raw_fd(wfd) };
+    let writer = unsafe { File::from_raw_fd(wfd.into_raw_fd()) };
 
     // Recreate a logger with the log level get from "/proc/cmdline".
     let (logger, logger_async_guard) =
@@ -300,12 +303,12 @@ async fn real_main(init_mode: bool) -> std::result::Result<(), Box<dyn std::erro
         tracer::end_tracing();
     }
 
-    eprintln!("{} shutdown complete", NAME);
+    eprintln!("{NAME} shutdown complete");
 
     let mut wait_errors: Vec<tokio::task::JoinError> = vec![];
     for result in results {
         if let Err(e) = result {
-            eprintln!("wait task error: {:#?}", e);
+            eprintln!("wait task error: {e:#?}");
             wait_errors.push(e);
         }
     }
@@ -380,13 +383,12 @@ async fn start_sandbox(
         s.rtnl.handle_localhost().await?;
     }
 
-    #[cfg(feature = "guest-pull")]
-    image::set_proxy_env_vars().await;
-
     #[cfg(feature = "agent-policy")]
     if let Err(e) = initialize_policy().await {
         error!(logger, "Failed to initialize agent policy: {:?}", e);
         // Continuing execution without a security policy could be dangerous.
+        // Give a brief moment for the logs to flush, then abort the process to stop the VM.
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
         std::process::abort();
     }
 
@@ -407,20 +409,49 @@ async fn start_sandbox(
     let (tx, rx) = tokio::sync::oneshot::channel();
     sandbox.lock().await.sender = Some(tx);
 
+    let initdata_return_value = initdata::initialize_initdata(logger).await?;
+
     let gc_procs = config.guest_components_procs;
-    if gc_procs != GuestComponentsProcs::None {
-        if !attestation_binaries_available(logger, &gc_procs) {
-            warn!(
-                logger,
-                "attestation binaries requested for launch not available"
-            );
-        } else {
-            init_attestation_components(logger, config).await?;
+    if !attestation_binaries_available(logger, &gc_procs) {
+        warn!(
+            logger,
+            "attestation binaries requested for launch not available"
+        );
+    } else {
+        init_attestation_components(logger, config, &initdata_return_value).await?;
+    }
+
+    // if policy is given via initdata, use it
+    #[cfg(feature = "agent-policy")]
+    if let Some(initdata_return_value) = initdata_return_value {
+        if let Some(policy) = &initdata_return_value._policy {
+            info!(logger, "using policy from initdata");
+            AGENT_POLICY
+                .lock()
+                .await
+                .set_policy(policy)
+                .await
+                .context("Failed to set policy from initdata")?;
         }
     }
 
+    let mut oma = None;
+    let mut _ort = None;
+    if let Some(c) = &config.mem_agent {
+        let (ma, rt) =
+            mem_agent::agent::MemAgent::new(c.memcg_config.clone(), c.compact_config.clone())
+                .map_err(|e| {
+                    error!(logger, "MemAgent::new fail: {}", e);
+                    e
+                })
+                .context("start mem-agent")?;
+        oma = Some(ma);
+        _ort = Some(rt);
+    }
+
     // vsock:///dev/vsock, port
-    let mut server = rpc::start(sandbox.clone(), config.server_addr.as_str(), init_mode).await?;
+    let mut server =
+        rpc::start(sandbox.clone(), config.server_addr.as_str(), init_mode, oma).await?;
 
     server.start().await?;
 
@@ -439,49 +470,55 @@ fn attestation_binaries_available(logger: &Logger, procs: &GuestComponentsProcs)
         _ => vec![],
     };
     for binary in binaries.iter() {
-        if !Path::new(binary).exists() {
-            warn!(logger, "{} not found", binary);
+        let exists = Path::new(binary)
+            .try_exists()
+            .unwrap_or_else(|error| match error.kind() {
+                ErrorKind::NotFound => {
+                    warn!(logger, "{} not found", binary);
+                    false
+                }
+                _ => panic!("Path existence check failed for '{}': {}", binary, error),
+            });
+
+        if !exists {
             return false;
         }
     }
     true
 }
 
-// Start-up attestation-agent, CDH and api-server-rest if they are packaged in the rootfs
-// and the corresponding procs are enabled in the agent configuration. the process will be
-// launched in the background and the function will return immediately.
-// If the CDH is started, a CDH client will be instantiated and returned.
-async fn init_attestation_components(logger: &Logger, config: &AgentConfig) -> Result<()> {
-    // skip launch of any guest-component
+async fn launch_guest_component_procs(
+    logger: &Logger,
+    config: &AgentConfig,
+    initdata_return_value: &Option<InitdataReturnValue>,
+) -> Result<()> {
     if config.guest_components_procs == GuestComponentsProcs::None {
         return Ok(());
     }
 
     debug!(logger, "spawning attestation-agent process {}", AA_PATH);
+    let mut aa_args = vec!["--attestation_sock", AA_ATTESTATION_URI];
+    if initdata_return_value.is_some() {
+        aa_args.push("--initdata-toml");
+        aa_args.push(initdata::INITDATA_TOML_PATH);
+    }
+
     launch_process(
         logger,
         AA_PATH,
-        &vec!["--attestation_sock", AA_ATTESTATION_URI],
+        aa_args,
+        Some(AA_CONFIG_PATH),
         AA_ATTESTATION_SOCKET,
-        DEFAULT_LAUNCH_PROCESS_TIMEOUT,
+        config.launch_process_timeout.as_secs(),
+        &[],
     )
+    .await
     .map_err(|e| anyhow!("launch_process {} failed: {:?}", AA_PATH, e))?;
 
     // skip launch of confidential-data-hub and api-server-rest
     if config.guest_components_procs == GuestComponentsProcs::AttestationAgent {
         return Ok(());
     }
-
-    let ocicrypt_config = serde_json::json!({
-        "key-providers": {
-            "attestation-agent":{
-                "ttrpc":CDH_SOCKET_URI
-            }
-        }
-    });
-
-    fs::write(OCICRYPT_CONFIG_PATH, ocicrypt_config.to_string().as_bytes())?;
-    env::set_var("OCICRYPT_KEYPROVIDER_CONFIG", OCICRYPT_CONFIG_PATH);
 
     debug!(
         logger,
@@ -491,14 +528,14 @@ async fn init_attestation_components(logger: &Logger, config: &AgentConfig) -> R
     launch_process(
         logger,
         CDH_PATH,
-        &vec![],
+        vec![],
+        Some(CDH_CONFIG_PATH),
         CDH_SOCKET,
-        DEFAULT_LAUNCH_PROCESS_TIMEOUT,
+        config.launch_process_timeout.as_secs(),
+        &[("OCICRYPT_KEYPROVIDER_CONFIG", OCICRYPT_CONFIG_PATH)],
     )
+    .await
     .map_err(|e| anyhow!("launch_process {} failed: {:?}", CDH_PATH, e))?;
-
-    // initialize cdh client
-    cdh::init_cdh_client().await?;
 
     // skip launch of api-server-rest
     if config.guest_components_procs == GuestComponentsProcs::ConfidentialDataHub {
@@ -513,20 +550,52 @@ async fn init_attestation_components(logger: &Logger, config: &AgentConfig) -> R
     launch_process(
         logger,
         API_SERVER_PATH,
-        &vec!["--features", &features.to_string()],
+        vec!["--features", &features.to_string()],
+        None,
         "",
         0,
+        &[],
     )
+    .await
     .map_err(|e| anyhow!("launch_process {} failed: {:?}", API_SERVER_PATH, e))?;
 
     Ok(())
 }
 
-fn wait_for_path_to_exist(logger: &Logger, path: &str, timeout_secs: i32) -> Result<()> {
+// Start-up attestation-agent, CDH and api-server-rest if they are packaged in the rootfs
+// and the corresponding procs are enabled in the agent configuration. the process will be
+// launched in the background and the function will return immediately.
+// If the CDH is started, a CDH client will be instantiated and returned.
+async fn init_attestation_components(
+    logger: &Logger,
+    config: &AgentConfig,
+    initdata_return_value: &Option<InitdataReturnValue>,
+) -> Result<()> {
+    launch_guest_component_procs(logger, config, initdata_return_value).await?;
+
+    // If a CDH socket exists, initialize the CDH client and enable ocicrypt
+    match tokio::fs::metadata(CDH_SOCKET).await {
+        Ok(md) => {
+            if md.file_type().is_socket() {
+                confidential_data_hub::init_cdh_client(CDH_SOCKET_URI).await?;
+            } else {
+                debug!(logger, "File {} is not a socket", CDH_SOCKET);
+            }
+        }
+        Err(err) => warn!(
+            logger,
+            "Failed to probe CDH socket file {}: {:?}", CDH_SOCKET, err
+        ),
+    }
+
+    Ok(())
+}
+
+async fn wait_for_path_to_exist(logger: &Logger, path: &str, timeout_secs: u64) -> Result<()> {
     let p = Path::new(path);
     let mut attempts = 0;
     loop {
-        std::thread::sleep(std::time::Duration::from_secs(1));
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         if p.exists() {
             return Ok(());
         }
@@ -543,22 +612,38 @@ fn wait_for_path_to_exist(logger: &Logger, path: &str, timeout_secs: i32) -> Res
     Err(anyhow!("wait for {} to exist timeout.", path))
 }
 
-fn launch_process(
+async fn launch_process(
     logger: &Logger,
     path: &str,
-    args: &Vec<&str>,
+    mut args: Vec<&str>,
+    config: Option<&str>,
     unix_socket_path: &str,
-    timeout_secs: i32,
+    timeout_secs: u64,
+    envs: &[(&str, &str)],
 ) -> Result<()> {
     if !Path::new(path).exists() {
-        return Err(anyhow!("path {} does not exist.", path));
+        bail!("path {} does not exist.", path);
     }
+
+    if let Some(config_path) = config {
+        if Path::new(config_path).exists() {
+            args.push("-c");
+            args.push(config_path);
+        }
+    }
+
     if !unix_socket_path.is_empty() && Path::new(unix_socket_path).exists() {
-        fs::remove_file(unix_socket_path)?;
+        tokio::fs::remove_file(unix_socket_path).await?;
     }
-    Command::new(path).args(args).spawn()?;
+
+    let mut process = tokio::process::Command::new(path);
+    process.args(args);
+    for (k, v) in envs {
+        process.env(k, v);
+    }
+    process.spawn()?;
     if !unix_socket_path.is_empty() && timeout_secs > 0 {
-        wait_for_path_to_exist(logger, unix_socket_path, timeout_secs)?;
+        wait_for_path_to_exist(logger, unix_socket_path, timeout_secs).await?;
     }
 
     Ok(())
@@ -600,7 +685,15 @@ fn init_agent_as_init(logger: &Logger, unified_cgroup_hierarchy: bool) -> Result
 
 #[cfg(feature = "agent-policy")]
 async fn initialize_policy() -> Result<()> {
-    AGENT_POLICY.lock().await.initialize().await
+    AGENT_POLICY
+        .lock()
+        .await
+        .initialize(
+            AGENT_CONFIG.log_level.as_usize(),
+            AGENT_CONFIG.policy_file.clone(),
+            None,
+        )
+        .await
 }
 
 // The Rust standard library had suppressed the default SIGPIPE behavior,
@@ -615,10 +708,10 @@ fn reset_sigpipe() {
 }
 
 use crate::config::AgentConfig;
-use std::os::unix::io::{FromRawFd, RawFd};
+use std::os::unix::io::RawFd;
 
 #[cfg(feature = "agent-policy")]
-use crate::policy::AgentPolicy;
+use kata_agent_policy::policy::AgentPolicy;
 
 #[cfg(test)]
 mod tests {
@@ -640,7 +733,7 @@ mod tests {
                 // non-root user cannot use privileged vsock port
                 vsock_port: 1,
                 test_user: TestUserType::NonRootOnly,
-                result: Err(anyhow!(nix::errno::Errno::from_i32(libc::EACCES))),
+                result: Err(anyhow!(nix::errno::Errno::from_raw(libc::EACCES))),
             },
             TestData {
                 // passing vsock_port 0 causes logger task to write to stdout
@@ -657,20 +750,25 @@ mod tests {
                 skip_if_root!();
             }
 
-            let msg = format!("test[{}]: {:?}", i, d);
+            let msg = format!("test[{i}]: {d:?}");
             let (rfd, wfd) = unistd::pipe2(OFlag::O_CLOEXEC).unwrap();
+            let rfd_raw = rfd.as_raw_fd();
+            let wfd_raw = wfd.as_raw_fd();
+            // Prevent OwnedFd from closing the fds when dropped
+            std::mem::forget(rfd);
+            std::mem::forget(wfd);
             defer!({
                 // XXX: Never try to close rfd, because it will be closed by PipeStream in
                 // create_logger_task() and it's not safe to close the same fd twice time.
-                unistd::close(wfd).unwrap();
+                unistd::close(wfd_raw).unwrap();
             });
 
             let (shutdown_tx, shutdown_rx) = channel(true);
 
             shutdown_tx.send(true).unwrap();
-            let result = create_logger_task(rfd, d.vsock_port, shutdown_rx).await;
+            let result = create_logger_task(rfd_raw, d.vsock_port, shutdown_rx).await;
 
-            let msg = format!("{}, result: {:?}", msg, result);
+            let msg = format!("{msg}, result: {result:?}");
             assert_result!(d.result, result, msg);
         }
     }

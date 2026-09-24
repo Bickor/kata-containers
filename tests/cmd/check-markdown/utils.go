@@ -13,7 +13,7 @@ import (
 	"strings"
 	"unicode"
 
-	bf "gopkg.in/russross/blackfriday.v2"
+	bf "github.com/russross/blackfriday/v2"
 )
 
 // fileExists returns true if the specified file exists, else false.
@@ -79,7 +79,7 @@ func createHeadingID(headingName string) (id string, err error) {
 	id = strings.Map(validHeadingIDChar, headingName)
 
 	id = strings.ToLower(id)
-	id = strings.Replace(id, " ", "-", -1)
+	id = strings.ReplaceAll(id, " ", "-")
 
 	return id, nil
 }

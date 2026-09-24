@@ -27,12 +27,10 @@ pub const ERR_HVSOCK_SOC_PATH_EMPTY: &str = "Hybrid VSOCK socket path cannot be 
 #[macro_export]
 macro_rules! assert_result {
     ($expected_result:expr, $actual_result:expr, $msg:expr) => {
-        if $expected_result.is_ok() {
-            let expected_level = $expected_result.as_ref().unwrap();
+        if let Ok(expected_level) = $expected_result.as_ref() {
             let actual_level = $actual_result.unwrap();
             assert!(*expected_level == actual_level, "{}", $msg);
-        } else {
-            let expected_error = $expected_result.as_ref().unwrap_err();
+        } else if let Err(expected_error) = $expected_result.as_ref() {
             let expected_error_msg = format!("{:?}", expected_error);
 
             if let Err(actual_error) = $actual_result {
@@ -65,7 +63,7 @@ pub fn make_hybrid_socket_path(
 
     let port = port_str_to_port(port_str)?;
 
-    let full_path = format!("{}_{}", socket_path, port);
+    let full_path = format!("{socket_path}_{port}");
 
     Ok(full_path)
 }
@@ -164,11 +162,11 @@ mod tests {
         ];
 
         for (i, d) in tests.iter().enumerate() {
-            let msg = format!("test[{}]: {:?}", i, d);
+            let msg = format!("test[{i}]: {d:?}");
 
             let result = port_str_to_port(d.port);
 
-            let msg = format!("{}: result: {:?}", msg, result);
+            let msg = format!("{msg}: result: {result:?}");
 
             assert_result!(d.result, result, msg);
         }
@@ -227,11 +225,11 @@ mod tests {
         ];
 
         for (i, d) in tests.iter().enumerate() {
-            let msg = format!("test[{}]: {:?}", i, d);
+            let msg = format!("test[{i}]: {d:?}");
 
             let result = str_to_vsock_port(d.port, d.default_port);
 
-            let msg = format!("{}: result: {:?}", msg, result);
+            let msg = format!("{msg}: result: {result:?}");
 
             assert_result!(d.result, result, msg);
         }
@@ -273,11 +271,11 @@ mod tests {
         ];
 
         for (i, d) in tests.iter().enumerate() {
-            let msg = format!("test[{}]: {:?}", i, d);
+            let msg = format!("test[{i}]: {d:?}");
 
             let result = str_to_vsock_cid(d.cid);
 
-            let msg = format!("{}: result: {:?}", msg, result);
+            let msg = format!("{msg}: result: {result:?}");
 
             assert_result!(d.result, result, msg);
         }
@@ -345,11 +343,11 @@ mod tests {
         ];
 
         for (i, d) in tests.iter().enumerate() {
-            let msg = format!("test[{}]: {:?}", i, d);
+            let msg = format!("test[{i}]: {d:?}");
 
             let result = make_hybrid_socket_path(d.socket_path, d.user_port, d.default_port);
 
-            let msg = format!("{}: result: {:?}", msg, result);
+            let msg = format!("{msg}: result: {result:?}");
 
             assert_result!(d.result, result, msg);
         }

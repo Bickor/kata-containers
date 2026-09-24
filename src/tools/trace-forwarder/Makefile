@@ -5,15 +5,11 @@
 
 include ../../../utils.mk
 
-ifeq ($(ARCH), ppc64le)
-     override ARCH = powerpc64le
-endif
-
 .DEFAULT_GOAL := default
 default: build
 
 build:
-	@RUSTFLAGS="$(EXTRA_RUSTFLAGS) --deny warnings" cargo build --target $(TRIPLE) --$(BUILD_TYPE)
+	@RUSTFLAGS="$(EXTRA_RUSTFLAGS) --deny warnings" cargo build -p kata-trace-forwarder --target $(TRIPLE) --$(BUILD_TYPE)
 
 static-checks-build:
 	@echo "INFO: static-checks-build do nothing.."
@@ -21,11 +17,8 @@ static-checks-build:
 clean:
 	cargo clean
 
-vendor:
-	cargo vendor
-
 test:
-	@cargo test --all -- --nocapture
+	@cargo test -p kata-trace-forwarder -- --nocapture
 
 install:
 
@@ -36,5 +29,4 @@ check: standard_rust_check
 	check \
 	clean \
 	install \
-	test \
-	vendor
+	test

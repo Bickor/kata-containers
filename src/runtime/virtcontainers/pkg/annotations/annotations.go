@@ -43,14 +43,8 @@ const (
 	// HypervisorPath is a sandbox annotation for passing a per container path pointing at the hypervisor that will run the container VM.
 	HypervisorPath = kataAnnotHypervisorPrefix + "path"
 
-	// HypervisorCtlPath is a sandbox annotation for passing a per container path pointing at the hypervisor control binary that will run the container VM.
-	HypervisorCtlPath = kataAnnotHypervisorPrefix + "ctlpath"
-
 	// JailerPath is a sandbox annotation for passing a per container path pointing at the jailer that will constrain the container VM.
 	JailerPath = kataAnnotHypervisorPrefix + "jailer_path"
-
-	// CtlPath is a sandbox annotation for passing a per container path pointing at the acrn ctl binary
-	CtlPath = kataAnnotHypervisorPrefix + "ctlpath"
 
 	// FirmwarePath is a sandbox annotation for passing a per container path pointing at the guest firmware that will run the container VM.
 	FirmwarePath = kataAnnotHypervisorPrefix + "firmware"
@@ -71,9 +65,6 @@ const (
 	// HypervisorHash is an sandbox annotation for passing a container hypervisor binary SHA-512 hash value.
 	HypervisorHash = kataAnnotHypervisorPrefix + "hypervisor_hash"
 
-	// HypervisorCtlHash is a sandbox annotation for passing a container hypervisor control binary SHA-512 hash value.
-	HypervisorCtlHash = kataAnnotHypervisorPrefix + "hypervisorctl_hash"
-
 	// JailerHash is an sandbox annotation for passing a jailer binary SHA-512 hash value.
 	JailerHash = kataAnnotHypervisorPrefix + "jailer_hash"
 
@@ -92,6 +83,9 @@ const (
 
 	// KernelParams is a sandbox annotation for passing additional guest kernel parameters.
 	KernelParams = kataAnnotHypervisorPrefix + "kernel_params"
+
+	// KernelVerityParams is a sandbox annotation for passing guest dm-verity parameters.
+	KernelVerityParams = kataAnnotHypervisorPrefix + "kernel_verity_params"
 
 	// MachineType is a sandbox annotation to specify the type of machine being emulated by the hypervisor.
 	MachineType = kataAnnotHypervisorPrefix + "machine_type"
@@ -141,6 +135,12 @@ const (
 	// UseLegacySerial sets legacy serial device for guest console if available and implemented for architecture
 	UseLegacySerial = kataAnnotHypervisorPrefix + "use_legacy_serial"
 
+	// GPU specific annotations used by remote hypervisor for instance selection
+	// Number of GPUs required in the Kata VM
+	DefaultGPUs = kataAnnotHypervisorPrefix + "default_gpus"
+	// GPU model - tesla, h100, radeon etc..
+	DefaultGPUModel = kataAnnotHypervisorPrefix + "default_gpu_model"
+
 	//
 	// CPU Annotations
 	//
@@ -170,6 +170,9 @@ const (
 	// MemPrealloc is a sandbox annotation that specifies the memory space used for nvdimm device by the hypervisor.
 	MemPrealloc = kataAnnotHypervisorPrefix + "enable_mem_prealloc"
 
+	// ReclaimGuestFreedMemory is a sandbox annotation that specifies whether the memory freed by the guest will be reclaimed by the hypervisor or not.
+	ReclaimGuestFreedMemory = kataAnnotHypervisorPrefix + "reclaim_guest_freed_memory"
+
 	// HugePages is a sandbox annotation to specify if the memory should be pre-allocated from huge pages
 	HugePages = kataAnnotHypervisorPrefix + "enable_hugepages"
 
@@ -179,8 +182,8 @@ const (
 	// Enable Hypervisor Devices IOMMU_PLATFORM
 	IOMMUPlatform = kataAnnotHypervisorPrefix + "enable_iommu_platform"
 
-	// FileBackedMemRootDir is a sandbox annotation to soecify file based memory backend root directory
-	FileBackedMemRootDir = kataAnnotHypervisorPrefix + "file_mem_backend"
+	// NUMAMapping is a sandbox annotation that specifies mapping VM NUMA nodes to host NUMA nodes.
+	NUMAMapping = kataAnnotHypervisorPrefix + "numa_mapping"
 
 	//
 	// Shared File System related annotations
@@ -218,8 +221,12 @@ const (
 	DisableBlockDeviceUse = kataAnnotHypervisorPrefix + "disable_block_device_use"
 
 	// EnableIOThreads is a sandbox annotation to enable IO to be processed in a separate thread.
-	// Supported currently for virtio-scsi driver.
+	// Supported currently for virtio-scsi and virtio-blk(based on IndepIOThreads) driver.
 	EnableIOThreads = kataAnnotHypervisorPrefix + "enable_iothreads"
+
+	// Independent IOThreads enables IO to be processed in a separate thread, it is
+	// for QEMU hotplug device attach to iothread, like virtio-blk.
+	IndepIOThreads = kataAnnotHypervisorPrefix + "indep_iothreads"
 
 	// BlockDeviceCacheSet is a sandbox annotation that specifies cache-related options will be set to block devices or not.
 	BlockDeviceCacheSet = kataAnnotHypervisorPrefix + "block_device_cache_set"
@@ -231,6 +238,21 @@ const (
 	// BlockDeviceCacheNoflush is a sandbox annotation that specifies cache-related options for block devices.
 	// Denotes whether flush requests for the device are ignored.
 	BlockDeviceCacheNoflush = kataAnnotHypervisorPrefix + "block_device_cache_noflush"
+
+	// BlockDeviceLogicalSectorSize is a sandbox annotation that specifies the logical sector size
+	// reported by block devices to the guest, in bytes. Common values are 512 and 4096.
+	// Set to 0 to use the hypervisor default.
+	// NOTE: the annotation key uses the abbreviated "blk_logical_sector_size" rather than
+	// "block_device_logical_sector_size" (as used in the config file) because Kubernetes
+	// enforces a 63-character limit on annotation name segments, and the full name with the
+	// "io.katacontainers.config.hypervisor." prefix would exceed that limit.
+	BlockDeviceLogicalSectorSize = kataAnnotHypervisorPrefix + "blk_logical_sector_size"
+
+	// BlockDevicePhysicalSectorSize is a sandbox annotation that specifies the physical sector size
+	// reported by block devices to the guest, in bytes. Common values are 512 and 4096.
+	// Set to 0 to use the hypervisor default.
+	// NOTE: see BlockDeviceLogicalSectorSize for the reason the annotation key is abbreviated.
+	BlockDevicePhysicalSectorSize = kataAnnotHypervisorPrefix + "blk_physical_sector_size"
 
 	// RxRateLimiterMaxRate is a sandbox annotation that specifies max rate on network I/O inbound bandwidth.
 	RxRateLimiterMaxRate = kataAnnotHypervisorPrefix + "rx_rate_limiter_max_rate"
@@ -245,7 +267,7 @@ const (
 	EnableRootlessHypervisor = kataAnnotHypervisorPrefix + "rootless"
 
 	// Initdata is the initdata passed in when CreateVM
-	Initdata = kataConfAnnotationsPrefix + "runtime.cc_init_data"
+	Initdata = kataConfAnnotationsPrefix + "hypervisor.cc_init_data"
 )
 
 // Runtime related annotations
@@ -283,6 +305,9 @@ const (
 
 	// CreateContainerTimeout is a sandbox annotaion that sets the create container timeout.
 	CreateContainerTimeout = kataAnnotRuntimePrefix + "create_container_timeout"
+
+	// ForceGuestPull is a sandbox annotation that sets experimental_force_guest_pull.
+	ForceGuestPull = kataAnnotRuntimePrefix + "experimental_force_guest_pull"
 )
 
 // Agent related annotations
@@ -306,11 +331,19 @@ const (
 	AgentTrace = kataAnnotAgentPrefix + "enable_tracing"
 
 	// AgentContainerPipeSize is an annotation to specify the size of the pipes created for containers
-	AgentContainerPipeSize       = kataAnnotAgentPrefix + ContainerPipeSizeOption
-	ContainerPipeSizeOption      = "container_pipe_size"
-	ContainerPipeSizeKernelParam = "agent." + ContainerPipeSizeOption
-	CdhApiTimeoutOption          = "cdh_api_timeout"
-	CdhApiTimeoutKernelParam     = "agent." + CdhApiTimeoutOption
+	AgentContainerPipeSize          = kataAnnotAgentPrefix + ContainerPipeSizeOption
+	ContainerPipeSizeOption         = "container_pipe_size"
+	ContainerPipeSizeKernelParam    = "agent." + ContainerPipeSizeOption
+	CdhApiTimeoutOption             = "cdh_api_timeout"
+	CdhApiTimeoutKernelParam        = "agent." + CdhApiTimeoutOption
+	LaunchProcessTimeoutOption      = "launch_process_timeout"
+	LaunchProcessTimeoutKernelParam = "agent." + LaunchProcessTimeoutOption
+
+	// VisibleCdiDevices, when enabled, lets the agent translate a
+	// container's VISIBLE_CDI_DEVICES environment variable into CDI GPU
+	// device requests inside the guest.
+	VisibleCdiDevicesOption      = "visible_cdi_devices"
+	VisibleCdiDevicesKernelParam = "agent." + VisibleCdiDevicesOption
 
 	// Policy is an annotation containing the contents of an agent policy file, base64 encoded.
 	Policy = kataAnnotAgentPrefix + "policy"

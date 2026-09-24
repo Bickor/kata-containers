@@ -1,25 +1,28 @@
 # Privileged Kata Containers
 
+> [!WARNING]
+> Whilst this functionality is supported, it can decrease the security of Kata Containers if not configured correctly.
+
 Kata Containers supports creation of containers that are "privileged" (i.e. have additional capabilities and access
 that is not normally granted).
 
-## Warnings
+## Enabling privileged containers without host devices
 
-**Warning:** Whilst this functionality is supported, it can decrease the security of Kata Containers if not configured 
-correctly.
+> [!TIP]
+> When Kata Containers is installed through
+> [kata-deploy](/tools/packaging/kata-deploy/helm-chart/README.md#kata-deploy-helm-chart), this mitigation is configured
+> out of the box, hence there is no action required in that case.
 
-### Host Devices
+By default, a privileged container attempts to expose all devices from the host. This is generally not supported in Kata
+Containers as the container is running a different kernel than the host.
 
-By default, when privileged is enabled for a container, all the `/dev/*` block devices from the host are mounted
-into the guest. This will allow the privileged container inside the Kata guest to gain access to mount any block device 
-from the host, a potentially undesirable side-effect that decreases the security of Kata.
+Instead, the following sections document how to disable this behavior in different container runtimes. Note that this
+mitigation does not affect a container's ability to mount *guest* devices.
 
-The following sections document how to configure this behavior in different container runtimes.
-
-#### Containerd
+## Containerd
 
 The Containerd allows configuring the privileged host devices behavior for each runtime in the containerd config. This is
-done with the `privileged_without_host_devices` option. Setting this to `true` will disable hot plugging of the host 
+done with the `privileged_without_host_devices` option. Setting this to `true` will disable hot plugging of the host
 devices into the guest, even when privileged is enabled.
 
 Support for configuring privileged host devices behaviour was added in containerd `1.3.0` version.
@@ -43,10 +46,10 @@ See below example config:
  - [How to use Kata Containers and containerd with Kubernetes](how-to-use-k8s-with-containerd-and-kata.md)
  - [Containerd CRI config documentation](https://github.com/containerd/containerd/blob/main/docs/cri/config.md)
 
-#### CRI-O
+## CRI-O
 
 Similar to containerd, CRI-O allows configuring the privileged host devices
-behavior for each runtime in the CRI config. This is done with the 
+behavior for each runtime in the CRI config. This is done with the
 `privileged_without_host_devices` option. Setting this to `true` will disable
  hot plugging of the host devices into the guest, even when privileged is enabled.
 
@@ -70,5 +73,5 @@ See below example config:
   privileged_without_host_devices = true
 ```
 
- - [Kata Containers with CRI-O](../how-to/run-kata-with-k8s.md#cri-o)
-  
+ - [Kata Containers with CRI-O](../how-to/how-to-use-k8s-with-crio-and-kata.md#cri-o)
+

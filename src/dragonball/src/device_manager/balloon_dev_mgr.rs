@@ -31,7 +31,7 @@ pub enum BalloonDeviceError {
 
     /// guest memory error
     #[error("failed to access guest memory, {0}")]
-    GuestMemoryError(#[source] vm_memory::mmap::Error),
+    GuestMemoryError(#[source] vm_memory::GuestMemoryError),
 
     /// create balloon device error
     #[error("failed to create virtio-balloon device, {0}")]
@@ -253,7 +253,7 @@ impl BalloonDeviceMgr {
         let device = self.info_list[index]
             .device
             .as_ref()
-            .ok_or_else(|| BalloonDeviceError::NotExist)?;
+            .ok_or(BalloonDeviceError::NotExist)?;
         if let Some(mmio_dev) = device.as_any().downcast_ref::<DbsMmioV2Device>() {
             let guard = mmio_dev.state();
             let inner_dev = guard.get_inner_device();
@@ -298,6 +298,7 @@ mod tests {
     use super::*;
     use crate::device_manager::tests::create_address_space;
     use crate::test_utils::tests::create_vm_for_test;
+    use test_utils::skip_if_kvm_unaccessable;
 
     impl Default for BalloonDeviceConfigInfo {
         fn default() -> Self {
@@ -330,6 +331,7 @@ mod tests {
 
     #[test]
     fn test_balloon_insert_or_update_device() {
+        skip_if_kvm_unaccessable!();
         //Init vm for test.
         let mut vm = create_vm_for_test();
 
@@ -354,6 +356,7 @@ mod tests {
 
     #[test]
     fn test_balloon_attach_device() {
+        skip_if_kvm_unaccessable!();
         //Init vm and insert balloon config for test.
         let mut vm = create_vm_for_test();
         let device_op_ctx = DeviceOpContext::new(
@@ -393,6 +396,7 @@ mod tests {
 
     #[test]
     fn test_balloon_update_device() {
+        skip_if_kvm_unaccessable!();
         //Init vm for test.
         let mut vm = create_vm_for_test();
         let device_op_ctx = DeviceOpContext::new(

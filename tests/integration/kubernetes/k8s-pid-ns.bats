@@ -5,15 +5,15 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 
+load "${BATS_TEST_DIRNAME}/lib.sh"
 load "${BATS_TEST_DIRNAME}/../../common.bash"
 load "${BATS_TEST_DIRNAME}/tests_common.sh"
 
 setup() {
+	setup_common || die "setup_common failed"
 	pod_name="busybox"
 	first_container_name="first-test-container"
 	second_container_name="second-test-container"
-
-	get_pod_config_dir
 
 	test_yaml_file="${pod_config_dir}/pid-ns-busybox-pod.yaml"
 	cp "$pod_config_dir/busybox-pod.yaml" "${test_yaml_file}"
@@ -35,15 +35,16 @@ setup() {
 	kubectl wait --for=condition=Ready --timeout=$timeout pod $pod_name
 
 	# Check PID from first container
+	# Strip \r — containers with tty: true return \r\n line endings
 	first_pid_container=$(kubectl exec $pod_name -c $first_container_name \
-		-- $ps_command | grep "/pause")
+		-- $ps_command | grep "/pause" | tr -d '\r')
 	# Verify that is not empty
 	check_first_pid=$(echo $first_pid_container | wc -l)
 	[ "$check_first_pid" == "1" ]
 
 	# Check PID from second container
 	second_pid_container=$(kubectl exec $pod_name -c $second_container_name \
-		-- $ps_command | grep "/pause")
+		-- $ps_command | grep "/pause" | tr -d '\r')
 	# Verify that is not empty
 	check_second_pid=$(echo $second_pid_container | wc -l)
 	[ "$check_second_pid" == "1" ]
@@ -59,4 +60,5 @@ teardown() {
 
 	rm "${test_yaml_file}"
 	delete_tmp_policy_settings_dir "${policy_settings_dir}"
+	teardown_common "${node}" "${node_start_time:-}"
 }

@@ -16,13 +16,35 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=/dev/null
 source "${script_dir}/../../scripts/lib.sh"
 
-build_busybox_from_source()
-{
-	echo "build busybox from source"
+# Path to the ORAS cache helper for downloading tarballs (sourced when needed)
+oras_cache_helper="${script_dir}/../../scripts/download-with-oras-cache.sh"
 
-	URL_TARBZ2="${BUSYBOX_URL:?}/busybox-${BUSYBOX_VERSION:?}.tar.bz2"
-	URL_SHA="${BUSYBOX_URL:?}/busybox-${BUSYBOX_VERSION:?}.tar.bz2.sha256"
-	URL_SIG="${BUSYBOX_URL:?}/busybox-${BUSYBOX_VERSION:?}.tar.bz2.sig"
+# Use ORAS cache for busybox downloads (busybox.net can be unreliable)
+USE_ORAS_CACHE="${USE_ORAS_CACHE:-yes}"
+
+download_busybox_tarball()
+{
+	# shellcheck disable=SC2034
+	local tarball_name="busybox-${BUSYBOX_VERSION:?}.tar.bz2"
+
+	# Use ORAS cache if available and enabled
+	if [[ "${USE_ORAS_CACHE}" == "yes" ]] && [[ -f "${oras_cache_helper}" ]]; then
+		echo "Using ORAS cache for busybox download"
+		# shellcheck source=/dev/null
+		source "${oras_cache_helper}"
+		BUSYBOX_TARBALL=$(download_component busybox "$(pwd)")
+		if [[ -f "${BUSYBOX_TARBALL}" ]]; then
+			echo "Busybox tarball downloaded from cache: ${BUSYBOX_TARBALL}"
+			return 0
+		fi
+		echo "ORAS cache download failed, falling back to direct download"
+	fi
+
+	# Fallback to direct download
+	BUSYBOX_TARBALL="busybox-${BUSYBOX_VERSION:?}.tar.bz2"
+	URL_TARBZ2="${BUSYBOX_URL:?}/${BUSYBOX_TARBALL}"
+	URL_SHA="${BUSYBOX_URL:?}/${BUSYBOX_TARBALL}.sha256"
+	URL_SIG="${BUSYBOX_URL:?}/${BUSYBOX_TARBALL}.sig"
 
 	curl -O "${URL_TARBZ2}"
 	curl -O "${URL_SHA}"
@@ -39,18 +61,24 @@ build_busybox_from_source()
 	sig_file="$(basename "${URL_SIG}")"
 
 	gpg --verify "${sig_file}" "${tarbz_file}"
+}
 
-	tar xvf busybox-"${BUSYBOX_VERSION:?}".tar.bz2
+build_busybox_from_source()
+{
+	echo "build busybox from source"
+
+	download_busybox_tarball
+
+	tar xvf "${BUSYBOX_TARBALL}"
 
 	cd busybox-"${BUSYBOX_VERSION:?}"
 
 	cp "${BUSYBOX_CONF_DIR:?}/${BUSYBOX_CONF_FILE:?}" .config
 
-	# we do not want to install to CONFIG_PREFIX="./_install"
-	# we want CONFIG_PREFIX="${DESTDIR}"
+	# shellcheck disable=SC2154
 	sed -i "s|CONFIG_PREFIX=\"./_install\"|CONFIG_PREFIX=\"${DESTDIR}\"|g" .config
 
-	make
+	make -j "$(nproc)"
 	make install
 
 }

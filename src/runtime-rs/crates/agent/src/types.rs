@@ -42,7 +42,7 @@ pub struct StringUser {
     pub additional_gids: Vec<String>,
 }
 
-#[derive(PartialEq, Clone, Default)]
+#[derive(PartialEq, Clone, Debug, Default)]
 pub struct Device {
     pub id: String,
     pub field_type: String,
@@ -60,6 +60,7 @@ pub struct Storage {
     pub fs_group: Option<FSGroup>,
     pub options: Vec<String>,
     pub mount_point: String,
+    pub shared: bool,
 }
 
 #[derive(PartialEq, Clone, Default)]
@@ -93,7 +94,7 @@ pub struct Interface {
     pub mtu: u64,
     pub hw_addr: String,
     #[serde(default)]
-    pub pci_addr: String,
+    pub device_path: String,
     #[serde(default)]
     pub field_type: String,
     #[serde(default)]
@@ -113,6 +114,8 @@ pub struct Route {
     pub source: String,
     pub scope: u32,
     pub family: IPFamily,
+    pub flags: u32,
+    pub mtu: u32,
 }
 
 #[derive(Deserialize, Debug, PartialEq, Clone, Default)]
@@ -462,7 +465,7 @@ impl TryFrom<String> for KernelModule {
             } else if flag {
                 // a former param's string contains \"
                 if let Some(former_param) = parameters.pop() {
-                    let cur_param = format!("{} {}", former_param, info);
+                    let cur_param = format!("{former_param} {info}");
                     parameters.push(cur_param);
                 }
             } else {
@@ -600,6 +603,32 @@ pub struct VolumeStatsRequest {
 
 #[derive(PartialEq, Clone, Default, Debug)]
 pub struct VolumeStatsResponse {
+    pub data: String,
+}
+
+#[derive(PartialEq, Clone, Default, Debug)]
+pub struct AddSwapRequest {
+    pub pci_path: Vec<u32>,
+}
+
+#[derive(PartialEq, Clone, Default, Debug)]
+pub struct AddSwapPathRequest {
+    pub path: String,
+}
+
+#[derive(PartialEq, Clone, Default, Debug)]
+pub struct SetPolicyRequest {
+    pub policy: String,
+}
+
+#[derive(PartialEq, Clone, Default, Debug)]
+pub struct GetDiagnosticDataRequest {
+    pub log_type: String,
+    pub container_id: String,
+}
+
+#[derive(PartialEq, Clone, Default, Debug)]
+pub struct GetDiagnosticDataResponse {
     pub data: String,
 }
 

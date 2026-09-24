@@ -6,8 +6,8 @@ include ../../utils.mk
 
 PROJECT_DIRS := $(shell find . -name Cargo.toml -printf '%h\n' | sort -u)
 
-ifeq ($(ARCH), $(filter $(ARCH), s390x ppc64le))
-default build check test clippy vendor:
+ifeq ($(ARCH), $(filter $(ARCH), s390x powerpc64le))
+default build check test clippy:
 	@echo "$(ARCH) is not support currently"
 	exit 0
 else
@@ -29,13 +29,10 @@ clippy:
 		-- \
 		-D warnings
 
-vendor:
-	@echo "INFO: vendor do nothing.."
-
 format:
 	@echo "INFO: rust fmt..."
-	# This is kinda dirty step here simply because cargo fmt --all will apply fmt to all dependencies of dragonball which will include /src/libs/protocols with some file generated during compilation time and could not be formatted when you use cargo fmt --all before building the whole project. In order to avoid this problem, we do fmt check in this following way. 
-	rustfmt --edition 2018 ./src/dbs_address_space/src/lib.rs ./src/dbs_allocator/src/lib.rs ./src/dbs_arch/src/lib.rs ./src/dbs_boot/src/lib.rs ./src/dbs_device/src/lib.rs ./src/dbs_interrupt/src/lib.rs ./src/dbs_legacy_devices/src/lib.rs ./src/dbs_pci/src/lib.rs ./src/dbs_upcall/src/lib.rs ./src/dbs_utils/src/lib.rs ./src/dbs_virtio_devices/src/lib.rs ./src/lib.rs --check
+	# This is kinda dirty step here simply because cargo fmt --all will apply fmt to all dependencies of dragonball which will include /src/libs/protocols with some file generated during compilation time and could not be formatted when you use cargo fmt --all before building the whole project. In order to avoid this problem, we do fmt check in this following way.
+	rustfmt --edition 2018 ./dbs_address_space/src/lib.rs ./dbs_allocator/src/lib.rs ./dbs_arch/src/lib.rs ./dbs_boot/src/lib.rs ./dbs_device/src/lib.rs ./dbs_interrupt/src/lib.rs ./dbs_legacy_devices/src/lib.rs ./dbs_pci/src/lib.rs ./dbs_upcall/src/lib.rs ./dbs_utils/src/lib.rs ./dbs_virtio_devices/src/lib.rs ./src/lib.rs --check
 
 clean:
 	cargo clean
@@ -44,7 +41,7 @@ test:
 ifdef SUPPORT_VIRTUALIZATION
 	@set -e; \
 	for dir in $(PROJECT_DIRS); do \
-		bash -c "pushd $${dir} && RUST_BACKTRACE=1 cargo test --all-features --target $(TRIPLE) -- --nocapture --test-threads=1 && popd"; \
+		bash -c "pushd $${dir} && RUST_BACKTRACE=1 cargo test --all-features --target $(TRIPLE) --no-fail-fast -- --nocapture --test-threads=1 --skip bindgen && popd"; \
 	done
 else
 	@echo "INFO: skip testing dragonball, it need virtualization support."

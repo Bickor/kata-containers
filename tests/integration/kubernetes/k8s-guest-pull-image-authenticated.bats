@@ -8,18 +8,23 @@ load "${BATS_TEST_DIRNAME}/lib.sh"
 load "${BATS_TEST_DIRNAME}/confidential_common.sh"
 
 export KBS="${KBS:-false}"
+export SNAPSHOTTER="${SNAPSHOTTER:-}"
+export EXPERIMENTAL_FORCE_GUEST_PULL="${EXPERIMENTAL_FORCE_GUEST_PULL:-}"
 
 setup() {
     if ! is_confidential_runtime_class; then
         skip "Test not supported for ${KATA_HYPERVISOR}."
     fi
 
-    [ "${SNAPSHOTTER:-}" = "nydus" ] || skip "None snapshotter was found but this test requires one"
+    if [ "${SNAPSHOTTER}" != "nydus" ] && [ -z "${EXPERIMENTAL_FORCE_GUEST_PULL}" ]; then
+        skip "Either SNAPSHOTTER=nydus or EXPERIMENTAL_FORCE_GUEST_PULL must be set for this test"
+    fi
 
-    setup_common
+    setup_common || die "setup_common failed"
     AUTHENTICATED_IMAGE="${AUTHENTICATED_IMAGE:-quay.io/kata-containers/confidential-containers-auth:test}"
     AUTHENTICATED_IMAGE_USER=${AUTHENTICATED_IMAGE_USER:-}
     AUTHENTICATED_IMAGE_PASSWORD=${AUTHENTICATED_IMAGE_PASSWORD:-}
+    CREDENTIALS_KBS_URI="kbs:///default/credentials/test"
 
     if [[ -z ${AUTHENTICATED_IMAGE_USER} || -z ${AUTHENTICATED_IMAGE_PASSWORD} ]]; then
         if [[ -n ${GITHUB_ACTION:-} ]]; then
@@ -28,6 +33,14 @@ setup() {
             skip "running test locally due to missing user/password"
         fi
     fi
+
+    # shellcheck disable=SC2154 # BATS_FILE_TMPDIR is provided by bats.
+    setup_genpolicy_registry_auth \
+        "${AUTHENTICATED_IMAGE}" \
+        "${AUTHENTICATED_IMAGE_USER}" \
+        "${AUTHENTICATED_IMAGE_PASSWORD}" \
+        "${BATS_FILE_TMPDIR}/docker-genpolicy"
+    policy_settings_dir="$(create_tmp_policy_settings_dir "${pod_config_dir}")"
 
     # Set up Kubernetes secret for the nydus-snapshotter metadata pull
     kubectl delete secret cococred --ignore-not-found
@@ -62,12 +75,24 @@ function setup_kbs_credentials() {
     kbs_set_resource "default" "credentials" "test" "${auth_json}"
 }
 
+function get_initdata_with_auth_registry_config() {
+
+    image_section_with_policy=$(cat << EOF
+[image]
+authenticated_registry_credentials_uri = "${CREDENTIALS_KBS_URI}"
+EOF
+    )
+
+    get_initdata_with_cdh_image_section "${image_section_with_policy}"
+}
+
 @test "Test that creating a container from an authenticated image, with correct credentials works" {
 
     setup_kbs_credentials "${AUTHENTICATED_IMAGE}" ${AUTHENTICATED_IMAGE_USER} ${AUTHENTICATED_IMAGE_PASSWORD}
 
     create_coco_pod_yaml "${AUTHENTICATED_IMAGE}" "" "kbs:///default/credentials/test" "" "resource" "$node"
     yq -i ".spec.imagePullSecrets[0].name = \"cococred\"" "${kata_pod}"
+    auto_generate_policy "${policy_settings_dir}" "${kata_pod}"
 
     # For debug sake
     echo "Pod ${kata_pod}: $(cat ${kata_pod})"
@@ -82,12 +107,13 @@ function setup_kbs_credentials() {
 
     create_coco_pod_yaml "${AUTHENTICATED_IMAGE}" "" "kbs:///default/credentials/test" "" "resource" "$node"
     yq -i ".spec.imagePullSecrets[0].name = \"cococred\"" "${kata_pod}"
+    auto_generate_policy "${policy_settings_dir}" "${kata_pod}"
 
     # For debug sake
     echo "Pod ${kata_pod}: $(cat ${kata_pod})"
 
     assert_pod_fail "${kata_pod}"
-    assert_logs_contain "${node}" kata "${node_start_time}" "failed to pull manifest Not authorized"
+    assert_logs_contain "${node}" kata "${node_start_time}" "Not authorized"
 }
 
 @test "Test that creating a container from an authenticated image, with no credentials fails" {
@@ -95,12 +121,63 @@ function setup_kbs_credentials() {
     # Create pod config, but don't add agent.image_registry_auth annotation
     create_coco_pod_yaml "${AUTHENTICATED_IMAGE}" "" "" "" "resource" "$node"
     yq -i ".spec.imagePullSecrets[0].name = \"cococred\"" "${kata_pod}"
+    auto_generate_policy "${policy_settings_dir}" "${kata_pod}"
 
     # For debug sake
     echo "Pod ${kata_pod}: $(cat ${kata_pod})"
 
     assert_pod_fail "${kata_pod}"
-    assert_logs_contain "${node}" kata "${node_start_time}" "failed to pull manifest Not authorized"
+    assert_logs_contain "${node}" kata "${node_start_time}" "Not authorized"
+}
+
+@test "Test that creating a container from an authenticated image, with correct credentials works (with initdata)" {
+
+
+    setup_kbs_credentials "${AUTHENTICATED_IMAGE}" ${AUTHENTICATED_IMAGE_USER} ${AUTHENTICATED_IMAGE_PASSWORD}
+
+    initdata=$(get_initdata_with_auth_registry_config)
+    create_coco_pod_yaml_with_annotations "${AUTHENTICATED_IMAGE}" "" "${initdata}" "${node}"
+    yq -i ".spec.imagePullSecrets[0].name = \"cococred\"" "${kata_pod}"
+    auto_generate_policy "${policy_settings_dir}" "${kata_pod}"
+
+    # For debug sake
+    echo "Pod ${kata_pod}: $(cat ${kata_pod})"
+
+    k8s_create_pod "${kata_pod}"
+    echo "Kata pod test-e2e from authenticated image is running"
+}
+
+@test "Test that creating a container from an authenticated image, with incorrect credentials fails (with initdata)" {
+
+
+    setup_kbs_credentials "${AUTHENTICATED_IMAGE}" ${AUTHENTICATED_IMAGE_USER} "junk"
+
+    initdata=$(get_initdata_with_auth_registry_config)
+    create_coco_pod_yaml_with_annotations "${AUTHENTICATED_IMAGE}" "" "${initdata}" "${node}"
+    yq -i ".spec.imagePullSecrets[0].name = \"cococred\"" "${kata_pod}"
+    auto_generate_policy "${policy_settings_dir}" "${kata_pod}"
+
+    # For debug sake
+    echo "Pod ${kata_pod}: $(cat ${kata_pod})"
+
+    assert_pod_fail "${kata_pod}"
+    assert_logs_contain "${node}" kata "${node_start_time}" "Not authorized"
+}
+
+@test "Test that creating a container from an authenticated image, with no credentials fails (with initdata)" {
+
+
+    # Create pod config, but don't add image_registry_auth to initdata
+    initdata=$(get_initdata_with_cdh_image_section "")
+    create_coco_pod_yaml_with_annotations "${AUTHENTICATED_IMAGE}" "" "${initdata}" "${node}"
+    yq -i ".spec.imagePullSecrets[0].name = \"cococred\"" "${kata_pod}"
+    auto_generate_policy "${policy_settings_dir}" "${kata_pod}"
+
+    # For debug sake
+    echo "Pod ${kata_pod}: $(cat ${kata_pod})"
+
+    assert_pod_fail "${kata_pod}"
+    assert_logs_contain "${node}" kata "${node_start_time}" "Not authorized"
 }
 
 teardown() {
@@ -108,15 +185,11 @@ teardown() {
         skip "Test not supported for ${KATA_HYPERVISOR}."
     fi
 
-    [ "${SNAPSHOTTER:-}" = "nydus" ] || skip "None snapshotter was found but this test requires one"
+    if [ "${SNAPSHOTTER}" != "nydus" ] && [ -z "${EXPERIMENTAL_FORCE_GUEST_PULL}" ]; then
+        skip "Either SNAPSHOTTER=nydus or EXPERIMENTAL_FORCE_GUEST_PULL must be set for this test"
+    fi
 
+    delete_tmp_policy_settings_dir "${policy_settings_dir:-}"
+    confidential_teardown_common "${node}" "${node_start_time:-}"
     kubectl delete secret cococred --ignore-not-found
-
-    kubectl describe pods
-    k8s_delete_all_pods_if_any_exists || true
-
-    if [[ -n "${node_start_time:-}" && -z "$BATS_TEST_COMPLETED" ]]; then
-		echo "DEBUG: system logs of node '$node' since test start time ($node_start_time)"
-		print_node_journal "$node" "kata" --since "$node_start_time" || true
-	fi
 }

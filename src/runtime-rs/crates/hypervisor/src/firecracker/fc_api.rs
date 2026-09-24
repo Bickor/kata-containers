@@ -16,6 +16,7 @@ use dbs_utils::net::MacAddr;
 use hyper::{Body, Method, Request, Response};
 use hyperlocal::Uri;
 use kata_sys_util::mount;
+use kata_types::config::hypervisor::RateLimiterConfig;
 use nix::mount::MsFlags;
 use serde_json::json;
 use tokio::{fs, fs::File};
@@ -85,18 +86,19 @@ impl FcInner {
         let mut kernel_params = KernelParams::new(self.config.debug_info.enable_debug);
         kernel_params.push(Param::new("pci", "off"));
         kernel_params.push(Param::new("iommu", "off"));
-        let rootfs_driver = self.config.blockdev_info.block_device_driver.clone();
-
-        kernel_params.append(&mut KernelParams::new_rootfs_kernel_params(
-            &rootfs_driver,
+        let mut rootfs_params = KernelParams::new_rootfs_kernel_params(
+            &self.config.boot_info.kernel_verity_params,
+            &self.config.blockdev_info.block_device_driver,
             &self.config.boot_info.rootfs_type,
-        )?);
+            true,
+        )?;
+        kernel_params.append(&mut rootfs_params);
         kernel_params.append(&mut KernelParams::from_string(
             &self.config.boot_info.kernel_params,
         ));
         let mut parameters = String::new().to_owned();
 
-        for param in &kernel_params.to_string() {
+        if let Ok(param) = &kernel_params.to_string() {
             parameters.push_str(&param.to_string());
         }
 
@@ -107,6 +109,11 @@ impl FcInner {
             .get_resource(&self.config.boot_info.image, FC_ROOT_FS)
             .context("get resource ROOTFS")?;
 
+        let body_config: String = json!({
+            "mem_size_mib": self.config.memory_info.default_memory,
+            "vcpu_count": self.config.cpu_info.default_vcpus.ceil() as u8,
+        })
+        .to_string();
         let body_kernel: String = json!({
             "kernel_image_path": kernel,
             "boot_args": parameters,
@@ -124,6 +131,8 @@ impl FcInner {
         info!(sl(), "Before first request");
         self.request_with_retry(Method::PUT, "/boot-source", body_kernel)
             .await?;
+        self.request_with_retry(Method::PUT, "/machine-config", body_config)
+            .await?;
         self.request_with_retry(Method::PUT, "/drives/rootfs", body_rootfs)
             .await?;
 
@@ -137,7 +146,7 @@ impl FcInner {
         // We create some placeholder drives to be used for patching block devices while the vmm is
         // running, as firecracker does not support device hotplug.
         for i in 1..DISK_POOL_SIZE {
-            let full_path_name = format!("{}/drive{}", abs_path, i);
+            let full_path_name = format!("{abs_path}/drive{i}");
 
             let _ = File::create(&full_path_name)
                 .await
@@ -155,7 +164,7 @@ impl FcInner {
             })
             .to_string();
 
-            self.request_with_retry(Method::PUT, &format!("/drives/drive{}", i), body)
+            self.request_with_retry(Method::PUT, &format!("/drives/drive{i}"), body)
                 .await?;
         }
 
@@ -170,9 +179,22 @@ impl FcInner {
         let new_drive_path = self
             .get_resource(drive_path, new_drive_id)
             .context("get resource CONTAINER ROOTFS")?;
+
+        let block_rate_limit = RateLimiterConfig::new(
+            self.config.blockdev_info.disk_rate_limiter_bw_max_rate,
+            self.config.blockdev_info.disk_rate_limiter_ops_max_rate,
+            self.config
+                .blockdev_info
+                .disk_rate_limiter_bw_one_time_burst,
+            self.config
+                .blockdev_info
+                .disk_rate_limiter_ops_one_time_burst,
+        );
+
         let body: String = json!({
             "drive_id": format!("drive{drive_id}"),
-            "path_on_host": new_drive_path
+            "path_on_host": new_drive_path,
+            "rate_limiter": block_rate_limit,
         })
         .to_string();
         self.request_with_retry(
@@ -295,12 +317,11 @@ impl FcInner {
             self.umount_jail_resource("").ok();
         }
         std::fs::remove_dir_all(self.vm_path.as_str())
-            .map_err(|err| {
+            .inspect_err(|err| {
                 error!(
                     sl(),
                     "failed to remove dir all for {} with error: {:?}", &self.vm_path, &err
-                );
-                err
+                )
             })
             .ok();
     }

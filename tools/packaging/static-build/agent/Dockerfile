@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-FROM ubuntu:20.04
+FROM ubuntu:22.04
 ARG RUST_TOOLCHAIN
 
 COPY install_libseccomp.sh /usr/bin/install_libseccomp.sh
@@ -30,6 +30,7 @@ RUN apt-get update && \
 		curl \
 		g++ \
 		gcc \
+		gnupg \
 		libprotobuf-dev \
 		libssl-dev \
 		make \
@@ -39,6 +40,21 @@ RUN apt-get update && \
 		protobuf-compiler && \
 	apt-get clean && rm -rf /var/lib/apt/lists/ && \
 	curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain ${RUST_TOOLCHAIN}
+
+# Install ORAS CLI for tarball caching
+ARG ORAS_VERSION=1.3.0
+RUN ARCH=$(uname -m) && \
+    case "${ARCH}" in \
+        x86_64) ORAS_ARCH="amd64" ;; \
+        aarch64) ORAS_ARCH="arm64" ;; \
+        ppc64le) ORAS_ARCH="ppc64le" ;; \
+        s390x) ORAS_ARCH="s390x" ;; \
+        *) echo "Unsupported architecture: ${ARCH}" && exit 1 ;; \
+    esac && \
+    curl -sSL "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/oras_${ORAS_VERSION}_linux_${ORAS_ARCH}.tar.gz" -o /tmp/oras.tar.gz && \
+    tar -xzf /tmp/oras.tar.gz -C /usr/local/bin oras && \
+    rm /tmp/oras.tar.gz && \
+    oras version
 
 RUN ARCH=$(uname -m); \
 	rust_arch=""; \
@@ -51,6 +67,3 @@ RUN ARCH=$(uname -m); \
 	        *) echo "Unsupported architecture: ${ARCH}" && exit 1 ;; \
     	esac; \
 	rustup target add "${rust_arch}-unknown-linux-${libc}"
-
-# aarch64 requires this name -- link for all
-RUN ln -s /usr/bin/musl-gcc "/usr/bin/$(uname -m)-linux-musl-gcc"

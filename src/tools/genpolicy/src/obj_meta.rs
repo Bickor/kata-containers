@@ -16,29 +16,22 @@ pub struct ObjectMeta {
     pub name: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    generateName: Option<String>,
+    pub generateName: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    labels: Option<BTreeMap<String, String>>,
+    pub labels: Option<BTreeMap<String, String>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub annotations: Option<BTreeMap<String, String>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub namespace: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uid: Option<String>,
 }
 
 impl ObjectMeta {
-    pub fn get_name(&self) -> String {
-        if let Some(name) = &self.name {
-            name.clone()
-        } else if self.generateName.is_some() {
-            "$(generated-name)".to_string()
-        } else {
-            String::new()
-        }
-    }
-
     pub fn get_namespace(&self) -> Option<String> {
         self.namespace.as_ref().cloned()
     }

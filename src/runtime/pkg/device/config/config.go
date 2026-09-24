@@ -15,6 +15,7 @@ import (
 
 	"github.com/container-orchestrated-devices/container-device-interface/pkg/cdi"
 	"github.com/go-ini/ini"
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/device"
 	vcTypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
@@ -234,6 +235,17 @@ var (
 	// different types of PCI ports. We can deduces the Bus number from it
 	// and eliminate duplicates being assigned.
 	PCIeDevicesPerPort = map[PCIePort][]VFIODev{}
+
+	// NUMARootPorts maps host NUMA node IDs to root port IDs on pxb-pcie
+	// bridges.  When NUMA-aware PCIe topology is active (pxb-pcie),
+	// createPCIeTopology populates this so VFIODevice.Attach() can assign
+	// each device to the root port on its host NUMA node's pxb-pcie bus.
+	// Key: host NUMA node ID, Value: slice of root port IDs on that node's pxb.
+	NUMARootPorts = map[int][]string{}
+
+	// NUMARootPortDeviceCount tracks how many devices have been assigned
+	// to each host NUMA node's root ports (for round-robin assignment).
+	NUMARootPortDeviceCount = map[int]int{}
 )
 
 // DeviceInfo is an embedded type that contains device data common to all types of devices.
@@ -396,6 +408,9 @@ type VFIODev struct {
 	// sysfsdev of VFIO mediated device
 	SysfsDev string
 
+	// DevfsDev is used to identify a VFIO Group device or IOMMMUFD VFIO device
+	DevfsDev string
+
 	// VendorID specifies vendor id
 	VendorID string
 
@@ -414,6 +429,10 @@ type VFIODev struct {
 	// Type of VFIO device
 	Type VFIODeviceType
 
+	// NUMANode is the host NUMA node this device is attached to.
+	// -1 means no affinity or unknown.
+	NUMANode int
+
 	// IsPCIe specifies device is PCIe or PCI
 	IsPCIe bool
 
@@ -428,12 +447,30 @@ type VFIODev struct {
 	HostPath string
 }
 
+// IOMMUFDID returns the IOMMUFD ID if the VFIO device is backed by IOMMUFD
+// otherwise returns an empty string.
+func (t VFIODev) IOMMUFDID() string {
+	if !strings.HasPrefix(t.DevfsDev, device.IommufdDevPath) {
+		return ""
+	}
+	basename := filepath.Base(t.DevfsDev)
+	return strings.TrimPrefix(basename, "vfio")
+}
+
 // RNGDev represents a random number generator device
 type RNGDev struct {
 	// ID is used to identify the device in the hypervisor options.
 	ID string
 	// Filename is the file to use as entropy source.
 	Filename string
+}
+
+// BalloonDev represents a balloon device
+type BalloonDev struct {
+	ID                string
+	DeflateOnOOM      bool
+	DisableModern     bool
+	FreePageReporting bool
 }
 
 // VhostUserDeviceAttrs represents data shared by most vhost-user devices
@@ -673,6 +710,25 @@ func WithCDI(annotations map[string]string, cdiSpecDirs []string, spec *specs.Sp
 		return spec, nil
 	}
 
+	if err = injectDevices(cdiSpecDirs, spec, devsFromAnnotations); err != nil {
+		return nil, err
+	}
+
+	// One crucial thing to keep in mind is that CDI device injection
+	// might add OCI Spec environment variables, hooks, and mounts as
+	// well. Therefore it is important that none of the corresponding
+	// OCI Spec fields are reset up in the call stack once we return.
+	return spec, nil
+}
+
+// InjectCDIDevices injects the specified devices into the oci spec.
+// Devices must be a slice of strings of the form
+// vendor.com/class=unique_name
+func InjectCDIDevices(spec *specs.Spec, devices []string) error {
+	return injectDevices(nil, spec, devices)
+}
+
+func injectDevices(cdiSpecDirs []string, spec *specs.Spec, devices []string) error {
 	var registry cdi.Registry
 	if len(cdiSpecDirs) > 0 {
 		// We can override the directories where to search for CDI specs
@@ -682,22 +738,13 @@ func WithCDI(annotations map[string]string, cdiSpecDirs []string, spec *specs.Sp
 		registry = cdi.GetRegistry()
 	}
 
-	if err = registry.Refresh(); err != nil {
-		// We don't consider registry refresh failure a fatal error.
-		// For instance, a dynamically generated invalid CDI Spec file for
-		// any particular vendor shouldn't prevent injection of devices of
-		// different vendors. CDI itself knows better and it will fail the
-		// injection if necessary.
-		return nil, fmt.Errorf("CDI registry refresh failed: %w", err)
+	if err := registry.Refresh(); err != nil {
+		return fmt.Errorf("CDI registry refresh failed: %w", err)
 	}
 
-	if _, err := registry.InjectDevices(spec, devsFromAnnotations...); err != nil {
-		return nil, fmt.Errorf("CDI device injection failed: %w", err)
+	if _, err := registry.InjectDevices(spec, devices...); err != nil {
+		return fmt.Errorf("CDI device injection failed: %w", err)
 	}
 
-	// One crucial thing to keep in mind is that CDI device injection
-	// might add OCI Spec environment variables, hooks, and mounts as
-	// well. Therefore it is important that none of the corresponding
-	// OCI Spec fields are reset up in the call stack once we return.
-	return spec, nil
+	return nil
 }

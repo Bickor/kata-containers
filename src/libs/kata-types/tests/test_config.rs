@@ -7,18 +7,19 @@ mod tests {
     use kata_types::annotations::{
         Annotation, KATA_ANNO_CFG_AGENT_CONTAINER_PIPE_SIZE, KATA_ANNO_CFG_AGENT_TRACE,
         KATA_ANNO_CFG_DISABLE_GUEST_SECCOMP, KATA_ANNO_CFG_ENABLE_PPROF,
-        KATA_ANNO_CFG_EXPERIMENTAL, KATA_ANNO_CFG_HYPERVISOR_BLOCK_DEV_CACHE_NOFLUSH,
-        KATA_ANNO_CFG_HYPERVISOR_BLOCK_DEV_DRIVER, KATA_ANNO_CFG_HYPERVISOR_CTLPATH,
-        KATA_ANNO_CFG_HYPERVISOR_DEFAULT_MEMORY, KATA_ANNO_CFG_HYPERVISOR_DEFAULT_VCPUS,
-        KATA_ANNO_CFG_HYPERVISOR_ENABLE_GUEST_SWAP, KATA_ANNO_CFG_HYPERVISOR_ENABLE_HUGEPAGES,
-        KATA_ANNO_CFG_HYPERVISOR_ENABLE_IO_THREADS, KATA_ANNO_CFG_HYPERVISOR_ENABLE_SWAP,
-        KATA_ANNO_CFG_HYPERVISOR_FILE_BACKED_MEM_ROOT_DIR,
-        KATA_ANNO_CFG_HYPERVISOR_GUEST_HOOK_PATH, KATA_ANNO_CFG_HYPERVISOR_JAILER_PATH,
-        KATA_ANNO_CFG_HYPERVISOR_KERNEL_PATH, KATA_ANNO_CFG_HYPERVISOR_MEMORY_PREALLOC,
-        KATA_ANNO_CFG_HYPERVISOR_MEMORY_SLOTS, KATA_ANNO_CFG_HYPERVISOR_PATH,
-        KATA_ANNO_CFG_HYPERVISOR_VHOSTUSER_STORE_PATH, KATA_ANNO_CFG_HYPERVISOR_VIRTIO_FS_DAEMON,
-        KATA_ANNO_CFG_HYPERVISOR_VIRTIO_FS_EXTRA_ARGS, KATA_ANNO_CFG_HYPERVISOR_VIRTIO_MEM,
-        KATA_ANNO_CFG_KERNEL_MODULES, KATA_ANNO_CFG_RUNTIME_NAME,
+        KATA_ANNO_CFG_EXPERIMENTAL, KATA_ANNO_CFG_HYPERVISOR_BLK_LOGICAL_SECTOR_SIZE,
+        KATA_ANNO_CFG_HYPERVISOR_BLK_PHYSICAL_SECTOR_SIZE,
+        KATA_ANNO_CFG_HYPERVISOR_BLOCK_DEV_CACHE_NOFLUSH,
+        KATA_ANNO_CFG_HYPERVISOR_BLOCK_DEV_DRIVER, KATA_ANNO_CFG_HYPERVISOR_DEFAULT_MEMORY,
+        KATA_ANNO_CFG_HYPERVISOR_DEFAULT_VCPUS, KATA_ANNO_CFG_HYPERVISOR_ENABLE_GUEST_SWAP,
+        KATA_ANNO_CFG_HYPERVISOR_ENABLE_HUGEPAGES, KATA_ANNO_CFG_HYPERVISOR_ENABLE_IO_THREADS,
+        KATA_ANNO_CFG_HYPERVISOR_GUEST_HOOK_PATH, KATA_ANNO_CFG_HYPERVISOR_INDEP_IO_THREADS,
+        KATA_ANNO_CFG_HYPERVISOR_JAILER_PATH, KATA_ANNO_CFG_HYPERVISOR_KERNEL_PATH,
+        KATA_ANNO_CFG_HYPERVISOR_MEMORY_PREALLOC, KATA_ANNO_CFG_HYPERVISOR_MEMORY_SLOTS,
+        KATA_ANNO_CFG_HYPERVISOR_PATH, KATA_ANNO_CFG_HYPERVISOR_VHOSTUSER_STORE_PATH,
+        KATA_ANNO_CFG_HYPERVISOR_VIRTIO_FS_DAEMON, KATA_ANNO_CFG_HYPERVISOR_VIRTIO_FS_EXTRA_ARGS,
+        KATA_ANNO_CFG_HYPERVISOR_VIRTIO_MEM, KATA_ANNO_CFG_KERNEL_MODULES,
+        KATA_ANNO_CFG_RUNTIME_NAME,
     };
     use kata_types::config::KataConfig;
     use kata_types::config::{QemuConfig, TomlConfig};
@@ -48,10 +49,6 @@ mod tests {
             .expect("failed to execute process");
         std::process::Command::new("mkdir")
             .arg("./jvm")
-            .output()
-            .expect("failed to execute process");
-        std::process::Command::new("mkdir")
-            .arg("./test_file_backend_mem_root")
             .output()
             .expect("failed to execute process");
         std::process::Command::new("mkdir")
@@ -105,10 +102,6 @@ mod tests {
             "false".to_string(),
         );
         anno_hash.insert(
-            KATA_ANNO_CFG_HYPERVISOR_CTLPATH.to_string(),
-            "./jvm".to_string(),
-        );
-        anno_hash.insert(
             KATA_ANNO_CFG_HYPERVISOR_DEFAULT_VCPUS.to_string(),
             "12".to_string(),
         );
@@ -126,16 +119,12 @@ mod tests {
             "false".to_string(),
         );
         anno_hash.insert(
+            KATA_ANNO_CFG_HYPERVISOR_INDEP_IO_THREADS.to_string(),
+            "3".to_string(),
+        );
+        anno_hash.insert(
             KATA_ANNO_CFG_HYPERVISOR_ENABLE_IO_THREADS.to_string(),
             "false".to_string(),
-        );
-        anno_hash.insert(
-            KATA_ANNO_CFG_HYPERVISOR_ENABLE_SWAP.to_string(),
-            "false".to_string(),
-        );
-        anno_hash.insert(
-            KATA_ANNO_CFG_HYPERVISOR_FILE_BACKED_MEM_ROOT_DIR.to_string(),
-            "./test_file_backend_mem_root".to_string(),
         );
         anno_hash.insert(
             KATA_ANNO_CFG_HYPERVISOR_ENABLE_HUGEPAGES.to_string(),
@@ -195,17 +184,11 @@ mod tests {
                 "./test_hypervisor_hook_path"
             );
             assert!(!hv.memory_info.enable_mem_prealloc);
-            assert_eq!(hv.ctlpath, "./jvm".to_string());
-            assert_eq!(hv.cpu_info.default_vcpus, 12);
+            assert_eq!(hv.cpu_info.default_vcpus, 12.0);
             assert!(!hv.memory_info.enable_guest_swap);
             assert_eq!(hv.memory_info.default_memory, 100);
             assert!(!hv.enable_iothreads);
-            assert!(!hv.enable_iothreads);
-            assert!(!hv.memory_info.enable_swap);
-            assert_eq!(
-                hv.memory_info.file_mem_backend,
-                "./test_file_backend_mem_root"
-            );
+            assert_eq!(hv.indep_iothreads, 3);
             assert!(!hv.memory_info.enable_hugepages);
             assert_eq!(hv.jailer_path, "./test_jailer_path".to_string());
             assert_eq!(hv.boot_info.kernel, "./test_kernel_path");
@@ -243,11 +226,6 @@ mod tests {
             .expect("failed to execute process");
         std::process::Command::new("rmdir")
             .arg("./test_hypervisor_hook_path")
-            .output()
-            .expect("failed to execute process");
-
-        std::process::Command::new("rmdir")
-            .arg("./test_file_backend_mem_root")
             .output()
             .expect("failed to execute process");
 
@@ -485,6 +463,113 @@ mod tests {
         anno_hash.insert(
             KATA_ANNO_CFG_RUNTIME_NAME.to_string(),
             "other-container".to_string(),
+        );
+        let anno = Annotation::new(anno_hash);
+        let mut config = TomlConfig::load(content).unwrap();
+        assert!(anno.update_config_by_annotation(&mut config).is_err());
+    }
+
+    #[test]
+    fn test_block_device_sector_size_annotations_valid() {
+        let content = include_str!("texture/configuration-anno-0.toml");
+
+        let qemu = QemuConfig::new();
+        qemu.register();
+
+        // Valid: 512 logical, 4096 physical
+        let config = TomlConfig::load(content).unwrap();
+        KataConfig::set_active_config(Some(config), "qemu", "agent0");
+
+        let mut anno_hash = HashMap::new();
+        anno_hash.insert(
+            KATA_ANNO_CFG_HYPERVISOR_BLK_LOGICAL_SECTOR_SIZE.to_string(),
+            "512".to_string(),
+        );
+        anno_hash.insert(
+            KATA_ANNO_CFG_HYPERVISOR_BLK_PHYSICAL_SECTOR_SIZE.to_string(),
+            "4096".to_string(),
+        );
+        let anno = Annotation::new(anno_hash);
+        let mut config = TomlConfig::load(content).unwrap();
+        assert!(anno.update_config_by_annotation(&mut config).is_ok());
+        if let Some(hv) = config.hypervisor.get("qemu") {
+            assert_eq!(hv.blockdev_info.block_device_logical_sector_size, 512);
+            assert_eq!(hv.blockdev_info.block_device_physical_sector_size, 4096);
+        }
+
+        // Valid: 0 means hypervisor default
+        let mut anno_hash = HashMap::new();
+        anno_hash.insert(
+            KATA_ANNO_CFG_HYPERVISOR_BLK_LOGICAL_SECTOR_SIZE.to_string(),
+            "0".to_string(),
+        );
+        anno_hash.insert(
+            KATA_ANNO_CFG_HYPERVISOR_BLK_PHYSICAL_SECTOR_SIZE.to_string(),
+            "0".to_string(),
+        );
+        let anno = Annotation::new(anno_hash);
+        let mut config = TomlConfig::load(content).unwrap();
+        assert!(anno.update_config_by_annotation(&mut config).is_ok());
+        if let Some(hv) = config.hypervisor.get("qemu") {
+            assert_eq!(hv.blockdev_info.block_device_logical_sector_size, 0);
+            assert_eq!(hv.blockdev_info.block_device_physical_sector_size, 0);
+        }
+    }
+
+    #[test]
+    fn test_block_device_sector_size_annotation_invalid_not_power_of_two() {
+        let content = include_str!("texture/configuration-anno-0.toml");
+
+        let qemu = QemuConfig::new();
+        qemu.register();
+
+        let config = TomlConfig::load(content).unwrap();
+        KataConfig::set_active_config(Some(config), "qemu", "agent0");
+
+        let mut anno_hash = HashMap::new();
+        anno_hash.insert(
+            KATA_ANNO_CFG_HYPERVISOR_BLK_LOGICAL_SECTOR_SIZE.to_string(),
+            "1000".to_string(),
+        );
+        let anno = Annotation::new(anno_hash);
+        let mut config = TomlConfig::load(content).unwrap();
+        assert!(anno.update_config_by_annotation(&mut config).is_err());
+    }
+
+    #[test]
+    fn test_block_device_sector_size_annotation_invalid_below_minimum() {
+        let content = include_str!("texture/configuration-anno-0.toml");
+
+        let qemu = QemuConfig::new();
+        qemu.register();
+
+        let config = TomlConfig::load(content).unwrap();
+        KataConfig::set_active_config(Some(config), "qemu", "agent0");
+
+        let mut anno_hash = HashMap::new();
+        anno_hash.insert(
+            KATA_ANNO_CFG_HYPERVISOR_BLK_PHYSICAL_SECTOR_SIZE.to_string(),
+            "256".to_string(),
+        );
+        let anno = Annotation::new(anno_hash);
+        let mut config = TomlConfig::load(content).unwrap();
+        assert!(anno.update_config_by_annotation(&mut config).is_err());
+    }
+
+    #[test]
+    fn test_block_device_sector_size_annotation_invalid_above_maximum() {
+        let content = include_str!("texture/configuration-anno-0.toml");
+
+        let qemu = QemuConfig::new();
+        qemu.register();
+
+        let config = TomlConfig::load(content).unwrap();
+        KataConfig::set_active_config(Some(config), "qemu", "agent0");
+
+        let mut anno_hash = HashMap::new();
+        anno_hash.insert(
+            KATA_ANNO_CFG_HYPERVISOR_BLK_LOGICAL_SECTOR_SIZE.to_string(),
+            "131072".to_string(),
         );
         let anno = Annotation::new(anno_hash);
         let mut config = TomlConfig::load(content).unwrap();

@@ -22,7 +22,7 @@ pub fn get_host_path(dev_type: &str, major: i64, minor: i64) -> Result<String> {
         // for device type p will return an empty string
         _ => return Ok(String::new()),
     };
-    let format = format!("{}:{}", major, minor);
+    let format = format!("{major}:{minor}");
     let sys_dev_path = std::path::Path::new(SYS_DEV_PREFIX)
         .join(path_comp)
         .join(format)
@@ -34,7 +34,7 @@ pub fn get_host_path(dev_type: &str, major: i64, minor: i64) -> Result<String> {
         .ok_or_else(|| anyhow!("has no section"))?
         .get("DEVNAME")
         .ok_or_else(|| anyhow!("has no DEVNAME"))?;
-    Ok(format!("/dev/{}", dev_name))
+    Ok(format!("/dev/{dev_name}"))
 }
 
 // get_virt_drive_name returns the disk name format for virtio-blk
@@ -138,7 +138,7 @@ mod tests {
         assert!(do_decrease_count(ref_count_3).unwrap());
 
         // Third, ref_count is MAX
-        let mut max_count = std::u64::MAX;
+        let mut max_count = u64::MAX;
         let ref_count_max: &mut u64 = &mut max_count;
         assert!(do_increase_count(ref_count_max).is_err());
     }
