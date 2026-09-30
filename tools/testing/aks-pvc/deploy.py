@@ -17,6 +17,7 @@ items = [
         "handler": "kata-pvc-test", "scheduling": {"nodeSelector": {"kubernetes.io/hostname": "aks-kata-94127873-vmss00000b"}}},
     {"apiVersion": "v1", "kind": "Pod", "metadata": {"name": "installer", "namespace": namespace},
         "spec": {"nodeName": "aks-kata-94127873-vmss00000b", "hostPID": True,
+            "imagePullSecrets": [{"name": "acr-test-pull"}],
             "automountServiceAccountToken": False, "restartPolicy": "Never",
             "containers": [{"name": "installer", "image": image,
                 "command": ["bash", "-c", "sleep infinity"],

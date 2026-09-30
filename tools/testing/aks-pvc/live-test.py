@@ -105,8 +105,7 @@ def setup():
                                       ("disk-standard", "disk", "kata-pvc-test", False),
                                       ("disk-observer", "disk", "runc", False),
                                       ("files-csi-direct", "files-direct", "kata-pvc-test", False),
-                                      ("files-csi-observer", "files-direct", "runc", False),
-                                      ("block", "block", "kata-pvc-test", True)]:
+                                      ("files-csi-observer", "files-direct", "runc", False)]:
         print(apply(pod(name, claim, runtime, block=block)), end="")
 
 
@@ -118,7 +117,7 @@ def replace(name, claim, block=False):
 
 def verify():
     for name in ["files-standard", "files-observer", "disk-standard", "disk-observer",
-                 "files-csi-direct", "files-csi-observer", "block"]:
+                 "files-csi-direct", "files-csi-observer"]:
         ready(name)
     for prefix in ["files", "disk"]:
         name = prefix + "-standard"
@@ -127,8 +126,9 @@ def verify():
         run(observer, "test ! -e /data/copy-only-marker; printf 'CONFIRMED standard PVC still copy-only\\n'")
         replace(name, prefix)
         run(name, "test ! -e /data/copy-only-marker; printf 'CONFIRMED marker lost after replacement\\n'")
+        print(k("delete", "pod", name, "--wait=true", "--timeout=90s"), end="")
     name, observer = "files-csi-direct", "files-csi-observer"
-    run(name, "uname -r; df -T /data; grep ' /data .* cifs ' /proc/mounts; printf 'direct-persistent-marker' > /data/direct-marker; sync")
+    run(name, "uname -r; df -T /data; grep ' /data cifs ' /proc/mounts; printf 'direct-persistent-marker' > /data/direct-marker; sync")
     run(observer, "test \"$(cat /data/direct-marker)\" = direct-persistent-marker; printf 'observer-response' > /data/response; sync; printf 'PASS independent reader sees Kata write\\n'")
     run(name, "test \"$(cat /data/response)\" = observer-response; printf 'PASS Kata sees live external update\\n'")
     replace(name, "files-direct")
@@ -137,12 +137,16 @@ def verify():
     ready("files-csi-second")
     run("files-csi-second", "test \"$(cat /data/direct-marker)\" = direct-persistent-marker; printf 'second-kata' > /data/second; sync")
     run(name, "test \"$(cat /data/second)\" = second-kata; printf 'PASS live sharing across independent Kata VMs\\n'")
+    print(k("delete", "pod", "files-csi-second", "--wait=true", "--timeout=90s"), end="")
     readonly = pod("files-csi-readonly", "files-direct")
     readonly["spec"]["volumes"][0]["persistentVolumeClaim"]["readOnly"] = True
     readonly["spec"]["containers"][0]["volumeMounts"][0]["readOnly"] = True
     print(apply(readonly), end="")
     ready("files-csi-readonly")
     run("files-csi-readonly", "test \"$(cat /data/direct-marker)\" = direct-persistent-marker; if touch /data/should-not-exist 2>/dev/null; then exit 1; fi; printf 'PASS read-only mount rejects writes\\n'")
+    print(k("delete", "pod", "files-csi-readonly", "--wait=true", "--timeout=90s"), end="")
+    print(apply(pod("block", "block", block=True)), end="")
+    ready("block")
     run("block", "test -b /dev/probe; printf 'raw-persist-test' | dd of=/dev/probe bs=4096 conv=fsync")
     replace("block", "block", block=True)
     run("block", "test \"$(dd if=/dev/probe bs=1 count=16 2>/dev/null)\" = raw-persist-test; printf 'PASS raw block persistence regression\\n'")

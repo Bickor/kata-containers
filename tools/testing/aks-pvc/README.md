@@ -58,6 +58,21 @@ python3 tools/testing/aks-pvc/live-test.py setup
 python3 tools/testing/aks-pvc/live-test.py verify
 ```
 
+The installer references the namespaced `acr-test-pull` imagePullSecret. Create
+it using an ephemeral ACR login token before deployment when the cluster lacks
+pull access; remove it with the test namespace afterwards. Do not enable
+anonymous registry access for this experiment.
+
+On the first CSI guest-mount request, the current node driver can discover the
+custom Kata node label only at publish time, after staging omitted the metadata.
+If the pod reports missing staging `mountInfo.json`, delete both consumers of
+that test claim, wait for volume unstage, then recreate them. This required one
+retry in the live test; subsequent mounts and pod replacements worked.
+
+Run Kata tests sequentially on small OS disks: the EROFS snapshotter can consume
+substantial host storage per pod. The verification script removes extra Kata
+consumers as each case finishes.
+
 Installation adds `/opt/kata-pvc-test` and one isolated containerd handler,
 then restarts containerd to load it. Existing handlers are preserved. Failed
 containerd readiness restores the saved configuration. The script refuses to
