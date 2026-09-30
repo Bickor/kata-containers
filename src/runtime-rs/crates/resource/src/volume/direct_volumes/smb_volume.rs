@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 use std::path::{Path, PathBuf};
 
 use agent::Storage;
@@ -97,6 +100,37 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+
+    #[test]
+    fn recognizes_only_azurefile_smb_metadata() {
+        for (volume_type, fs_type, expected) in [
+            ("azurefile", "cifs", true),
+            ("azurefile", "smb", true),
+            ("azurefile", "nfs", false),
+            ("block", "cifs", false),
+        ] {
+            let info = DirectVolumeMountInfo {
+                volume_type: volume_type.into(),
+                fs_type: fs_type.into(),
+                device: String::new(),
+                metadata: HashMap::new(),
+                options: vec![],
+            };
+            assert_eq!(is_smb_volume(&info), expected);
+        }
+    }
+
+    #[test]
+    fn rejects_empty_share_source() {
+        let info = DirectVolumeMountInfo {
+            volume_type: "azurefile".into(),
+            fs_type: "cifs".into(),
+            device: String::new(),
+            metadata: HashMap::new(),
+            options: vec![],
+        };
+        assert!(SmbVolume::new(&oci::Mount::default(), &info).is_err());
+    }
 
     #[test]
     fn creates_guest_smb_storage_and_bind_mount() {
