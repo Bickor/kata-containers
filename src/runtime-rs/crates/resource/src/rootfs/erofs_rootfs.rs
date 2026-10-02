@@ -41,6 +41,7 @@ use std::io::{BufWriter, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::RwLock;
 
 /// EROFS rootfs type identifier
@@ -1066,6 +1067,13 @@ impl ErofsMultiLayerRootfs {
                 source.display()
             ));
         }
+        let class = match destination.file_name().and_then(|name| name.to_str()) {
+            Some(name) if name.starts_with("lower-") => "readonly",
+            Some("rwlayer.img") => "writable",
+            Some("gpt-head.img") => "gpt",
+            _ => "other",
+        };
+        let started = Instant::now();
         reflink_copy(source, destination).with_context(|| {
             format!(
                 "copy snapshot file {} to {}",
@@ -1076,6 +1084,13 @@ impl ErofsMultiLayerRootfs {
         let mut permissions = fs::metadata(destination)?.permissions();
         permissions.set_mode(0o600);
         fs::set_permissions(destination, permissions)?;
+        info!(
+            sl!(),
+            "KATA_VMSTATE_ROOTFS_COPY class={} logical_bytes={} elapsed_ms={}",
+            class,
+            metadata.len(),
+            started.elapsed().as_millis()
+        );
         Ok(())
     }
 
