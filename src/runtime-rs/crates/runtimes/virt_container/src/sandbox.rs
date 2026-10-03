@@ -95,7 +95,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use strum::Display;
 use tokio::sync::{mpsc::Sender, watch, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -106,6 +106,18 @@ const VMM_START_TIMEOUT_SECS: i32 = 10_000;
 const SOURCE_AGENT_LISTEN_GRACE: Duration = Duration::from_secs(2);
 const SNAPSHOT_MANIFEST_FILE: &str = "kata-snapshot.json";
 const SNAPSHOT_MANIFEST_FORMAT_VERSION: u32 = 1;
+
+#[derive(Default)]
+struct SnapshotPhaseTimings {
+    setup: Duration,
+    quiesce: Duration,
+    persist: Duration,
+    vm_save: Duration,
+    rootfs: Duration,
+    finalize: Duration,
+    recovery: Duration,
+    publish: Duration,
+}
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -2412,6 +2424,8 @@ impl VirtSandbox {
         container_manager: Arc<dyn ContainerManager>,
         destination: &Path,
     ) -> Result<()> {
+        let started = Instant::now();
+        let mut timings = SnapshotPhaseTimings::default();
         if !destination.is_absolute() || destination == Path::new("/") {
             return Err(anyhow!(
                 "snapshot destination must be absolute and non-root"
@@ -2466,11 +2480,13 @@ impl VirtSandbox {
         let mut agent_disconnected = false;
         let mut disconnect_token = None;
         let mut vm_paused = false;
+        timings.setup = started.elapsed();
         // Ordering is part of the snapshot protocol:
         // 1. stop health RPCs and pause containers while the agent is reachable;
         // 2. drain writes, disconnect, and let the guest agent return to listen;
         // 3. pause the VM and capture a disconnected-listening checkpoint.
         let operation: Result<Vec<resource::rootfs::RootfsSnapshotArtifacts>> = async {
+            let quiesce_started = Instant::now();
             self.monitor.suspend().await;
             monitor_suspended = true;
             for container in &inventory.live_containers {
@@ -2497,20 +2513,28 @@ impl VirtSandbox {
 
             self.hypervisor.pause_vm().await.context("pause VM")?;
             vm_paused = true;
+            timings.quiesce = quiesce_started.elapsed();
 
+            let persist_started = Instant::now();
             self.save().await.context("persist sandbox state")?;
+            timings.persist = persist_started.elapsed();
             let clh_staging = staging.join("clh");
             fs::create_dir(&clh_staging)?;
             fs::set_permissions(&clh_staging, fs::Permissions::from_mode(0o700))?;
+            let vm_save_started = Instant::now();
             self.hypervisor
                 .save_vm(&clh_staging)
                 .await
                 .context("save VM snapshot")?;
+            timings.vm_save = vm_save_started.elapsed();
+            let rootfs_started = Instant::now();
             let artifacts = self
                 .resource_manager
                 .snapshot_rootfs_artifacts(&staging, destination, &active_host_ids)
                 .await
                 .context("package rootfs snapshot artifacts")?;
+            timings.rootfs = rootfs_started.elapsed();
+            let finalize_started = Instant::now();
             resource::rootfs::snapshot::finalize_snapshot_config(
                 &clh_staging,
                 snapshot_root,
@@ -2532,6 +2556,7 @@ impl VirtSandbox {
             let persist_destination = staging.join("runtime-state.json");
             reflink_copy(&persist_source, &persist_destination)?;
             fs::set_permissions(&persist_destination, fs::Permissions::from_mode(0o600))?;
+            timings.finalize = finalize_started.elapsed();
             Ok(artifacts)
         }
         .await;
@@ -2539,6 +2564,7 @@ impl VirtSandbox {
         // Recover in the opposite dependency order. The VM must run before the
         // agent can reconnect, and containers/monitor must remain paused until
         // reconnectable RPCs have acquired the new healthy generation.
+        let recovery_started = Instant::now();
         let mut recovery_error: Option<anyhow::Error> = None;
         let mut vm_ready = !vm_paused;
         if vm_paused {
@@ -2597,6 +2623,7 @@ impl VirtSandbox {
         if monitor_suspended && agent_ready {
             self.monitor.resume();
         }
+        timings.recovery = recovery_started.elapsed();
 
         // Never publish an artifact unless both capture and source recovery
         // succeeded. A failed recovery is a failed snapshot transaction.
@@ -2616,6 +2643,7 @@ impl VirtSandbox {
             }
         };
 
+        let publish_started = Instant::now();
         let agent_config = self.agent.agent_config().await;
 
         let publication: Result<()> = (|| {
@@ -2776,6 +2804,15 @@ impl VirtSandbox {
         if publication.is_err() {
             let _ = fs::remove_dir_all(&staging);
         }
+        timings.publish = publish_started.elapsed();
+        // Durations only: never emit snapshot paths, identities, data, or secrets.
+        info!(sl!(), "KATA_VMSTATE_RUNTIME_TIMING status={} total_ms={} setup_ms={} quiesce_ms={} persist_ms={} vm_save_ms={} rootfs_ms={} finalize_ms={} recovery_ms={} publish_ms={}",
+            if publication.is_ok() { "ok" } else { "error" },
+            started.elapsed().as_millis(), timings.setup.as_millis(),
+            timings.quiesce.as_millis(), timings.persist.as_millis(),
+            timings.vm_save.as_millis(), timings.rootfs.as_millis(),
+            timings.finalize.as_millis(), timings.recovery.as_millis(),
+            timings.publish.as_millis());
         publication
     }
 }
