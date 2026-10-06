@@ -1,0 +1,27 @@
+# syntax=docker/dockerfile:1.7
+FROM rust:1.95-bookworm AS builder
+RUN apt-get update && apt-get install -y --no-install-recommends clang gcc libseccomp-dev make pkg-config protobuf-compiler && rm -rf /var/lib/apt/lists/*
+ENV CARGO_BUILD_JOBS=8 CARGO_PROFILE_RELEASE_DEBUG=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0
+WORKDIR /src
+COPY . .
+RUN make -C src/runtime-rs BUILD_TYPE=release LIBC=gnu USE_BUILTIN_DB=false HYPERVISOR=clh-runtime-rs runtime
+RUN cargo test -p virt_container --lib restore::tests -- --nocapture
+FROM builder AS agent-builder
+# The guest remains on the managed guest's 3.32-compatible agent branch. Supply
+# the reviewed cleanup-fix commit rather than building the unrelated 4.x agent.
+ARG KATA_AGENT_COMMIT
+RUN test -n "$KATA_AGENT_COMMIT" && git clone https://github.com/Bickor/kata-containers.git /agent \
+    && git -C /agent checkout "$KATA_AGENT_COMMIT"
+WORKDIR /agent
+RUN make -C src/agent BUILD_TYPE=release LIBC=gnu src/version.rs \
+    && make -C src/agent BUILD_TYPE=release LIBC=gnu optimize
+FROM mheberlingpub.azurecr.io/runtime/kata-v2-installer@sha256:8cfe2d28f9d21870ac2dd8e2ea58a0535fe869d65692a0c3ea8fd1257faf266a
+USER root
+ARG KATA_COMMIT
+ARG KATA_AGENT_COMMIT
+COPY --from=builder /src/target/x86_64-unknown-linux-gnu/release/containerd-shim-kata-v2 /payload/containerd-shim-kata-v2
+COPY --from=agent-builder /agent/target/x86_64-unknown-linux-gnu/release/kata-agent /payload/kata-agent
+RUN test -n "$KATA_COMMIT" && test -n "$KATA_AGENT_COMMIT" \
+    && printf 'KATA_COMMIT=%s\nKATA_AGENT_COMMIT=%s\nCLOUD_HYPERVISOR_COMMIT=f828d1142ca447727840fb2fc25feed4b5779da1\n' "$KATA_COMMIT" "$KATA_AGENT_COMMIT" > /payload/source-commits \
+    && cd /payload && sha256sum cloud-hypervisor configuration-clh-azure-runtime-rs-v2.toml containerd-shim-kata-v2 kata-agent kata-ctl > payload.sha256
+ENTRYPOINT ["/bin/bash"]

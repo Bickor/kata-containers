@@ -23,7 +23,7 @@ pub(crate) struct EphemeralVolume {
 }
 
 impl EphemeralVolume {
-    pub(crate) fn new(m: &oci::Mount) -> Result<Self> {
+    pub(crate) fn new(m: &oci::Mount, sandbox_id: &str) -> Result<Self> {
         if m.source().is_none() {
             return Err(anyhow!(format!(
                 "got a wrong volume without source: {:?}",
@@ -52,6 +52,7 @@ impl EphemeralVolume {
             .context(format!("get file name from {:?}", &m.source()))?;
         let source = Path::new(kata_guest_sandbox_dir().as_str())
             .join(KATA_EPHEMERAL_VOLUME_TYPE)
+            .join(sandbox_id)
             .join(file_name)
             .into_os_string()
             .into_string()
@@ -124,9 +125,10 @@ mod tests {
         let mut mount = oci::Mount::default();
         mount.set_source(Some(source.path().to_path_buf()));
 
-        let volume = EphemeralVolume::new(&mount).unwrap();
+        let volume = EphemeralVolume::new(&mount, "sandbox-generation").unwrap();
         let expected = Path::new(DEFAULT_KATA_GUEST_SANDBOX_DIR)
             .join(KATA_EPHEMERAL_VOLUME_TYPE)
+            .join("sandbox-generation")
             .join(source.path().file_name().unwrap());
 
         let mounts = volume.get_volume_mount().unwrap();
