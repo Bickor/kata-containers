@@ -596,6 +596,9 @@ message CopyFileRequest {
 	int64 offset = 7;
 	// Data to write in the destination file.
 	bytes data = 8;
+	// Update an existing regular file without replacing the inode referenced by
+	// restored bind mounts. Compatible with the runtime-rs snapshot protocol.
+	bool preserve_inode = 9;
 }
 
 message GetOOMEventRequest {}

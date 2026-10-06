@@ -292,7 +292,12 @@ mod tests {
     }
 
     fn get_pipe_size(fd: RawFd) -> i32 {
-        fcntl(fd, FcntlArg::F_GETPIPE_SZ).unwrap()
+        // Borrow for the query; the pipe owner retains responsibility for close.
+        fcntl(
+            unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) },
+            FcntlArg::F_GETPIPE_SZ,
+        )
+        .unwrap()
     }
 
     #[test]

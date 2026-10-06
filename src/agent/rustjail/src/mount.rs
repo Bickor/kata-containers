@@ -1490,6 +1490,8 @@ mod tests {
             let tempdir = tempdir().unwrap();
 
             let (rfd, wfd) = unistd::pipe2(OFlag::O_CLOEXEC).unwrap();
+            let rfd = std::os::fd::IntoRawFd::into_raw_fd(rfd);
+            let wfd = std::os::fd::IntoRawFd::into_raw_fd(wfd);
             defer!({
                 unistd::close(rfd).unwrap();
                 unistd::close(wfd).unwrap();

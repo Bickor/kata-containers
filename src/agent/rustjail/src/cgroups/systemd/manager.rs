@@ -84,7 +84,21 @@ impl CgroupManager for Manager {
     }
 
     fn destroy(&mut self) -> Result<()> {
-        self.dbus_client.kill_unit()?;
+        if let Err(error) = self.dbus_client.kill_unit() {
+            // Container::destroy already sent SIGKILL to every process. Some
+            // systemd/kernel combinations reject KillUnit for an emptied scope
+            // (including restored frozen scopes). Never treat that as success
+            // while the actual cgroup still contains a process.
+            if !wait_for_empty_scope(
+                || self.fs_manager.get_pids(),
+                100,
+                || {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                },
+            )? {
+                return Err(error);
+            }
+        }
         self.fs_manager.destroy()
     }
 
@@ -107,6 +121,41 @@ impl CgroupManager for Manager {
 
     fn name(&self) -> &str {
         "systemd"
+    }
+}
+
+fn wait_for_empty_scope(
+    mut pids: impl FnMut() -> Result<Vec<pid_t>>,
+    attempts: usize,
+    mut wait: impl FnMut(),
+) -> Result<bool> {
+    for _ in 0..attempts {
+        if pids()?.is_empty() {
+            return Ok(true);
+        }
+        wait();
+    }
+    Ok(false)
+}
+
+#[cfg(test)]
+mod removal_tests {
+    use super::*;
+    #[test]
+    fn redundant_kill_failure_requires_verified_empty_scope() {
+        assert!(wait_for_empty_scope(|| Ok(vec![]), 1, || {}).unwrap());
+        assert!(!wait_for_empty_scope(|| Ok(vec![123]), 2, || {}).unwrap());
+        assert!(wait_for_empty_scope(|| Err(anyhow!("unreadable cgroup")), 2, || {}).is_err());
+        let mut count = 0;
+        assert!(wait_for_empty_scope(
+            || {
+                count += 1;
+                Ok(if count == 2 { vec![] } else { vec![123] })
+            },
+            2,
+            || {}
+        )
+        .unwrap());
     }
 }
 

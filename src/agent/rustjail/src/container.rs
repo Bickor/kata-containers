@@ -1327,7 +1327,29 @@ impl BaseContainer for LinuxContainer {
             warn!(self.logger, "rootfs not mounted");
             Ok(())
         })?;
-        fs::remove_dir_all(&self.root)?;
+        // A restored bundle can retain stacked bind mounts below the rootfs.
+        // Never recursively remove files through those read-only/shared mounts.
+        // Detach only mount points contained in this container's bundle, deepest
+        // first, then remove the now-unmounted runtime bookkeeping directory.
+        let mounts = bundle_mounts(
+            &self.root,
+            crate::mount::parse_mount_table("/proc/self/mountinfo")?
+                .into_iter()
+                .map(|entry| entry.mount_point),
+        );
+        for path in mounts {
+            mount::umount2(path.as_str(), MntFlags::MNT_DETACH)
+                .or_else(|error| {
+                    if error == nix::Error::EINVAL || error == nix::Error::ENOENT {
+                        Ok(())
+                    } else {
+                        Err(error)
+                    }
+                })
+                .with_context(|| format!("detach container bundle mount {path}"))?;
+        }
+        fs::remove_dir_all(&self.root)
+            .with_context(|| format!("remove container bundle {}", self.root))?;
 
         Ok(())
     }
@@ -1368,6 +1390,33 @@ impl BaseContainer for LinuxContainer {
         unistd::close(fd)?;
 
         Ok(())
+    }
+}
+
+fn bundle_mounts(bundle: &str, mounts: impl Iterator<Item = String>) -> Vec<String> {
+    let mut owned = mounts
+        .filter(|path| Path::new(path).starts_with(Path::new(bundle)))
+        .collect::<Vec<_>>();
+    owned.sort_by_key(|path| std::cmp::Reverse(path.len()));
+    owned
+}
+
+#[cfg(test)]
+mod bundle_cleanup_tests {
+    use super::*;
+    #[test]
+    fn detach_only_owned_mounts_deepest_first() {
+        let paths = [
+            "/run/a",
+            "/run/ab/rootfs",
+            "/run/a/rootfs",
+            "/run/a/rootfs/etc",
+            "/run/shared",
+        ];
+        assert_eq!(
+            bundle_mounts("/run/a", paths.iter().map(|p| p.to_string())),
+            vec!["/run/a/rootfs/etc", "/run/a/rootfs", "/run/a"]
+        );
     }
 }
 

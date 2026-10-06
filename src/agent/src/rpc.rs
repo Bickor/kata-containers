@@ -2276,6 +2276,47 @@ fn do_copy_file(req: &CopyFileRequest) -> Result<()> {
         ));
     }
 
+    if req.preserve_inode {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        if req.file_mode & libc::S_IFMT != libc::S_IFREG
+            || req.offset < 0
+            || req.file_size < req.offset
+            || req.data.len() as u64 > (req.file_size - req.offset) as u64
+        {
+            return Err(anyhow!("invalid inode-preserving copy request"));
+        }
+        // The agent-owned backing directory must not resolve through links.
+        // Workloads only receive the bind mount, not writable access to this path.
+        if fs::canonicalize(&path)? != path || !path.starts_with("/run/kata-containers/") {
+            return Err(anyhow!(
+                "inode-preserving path is not a canonical guest backing file"
+            ));
+        }
+        let file = OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.nlink() != 1 {
+            return Err(anyhow!(
+                "inode-preserving target must be a singly linked regular file"
+            ));
+        }
+        if req.offset == 0 {
+            file.set_len(0)?;
+        }
+        file.write_all_at(&req.data, req.offset as u64)?;
+        if req.offset + req.data.len() as i64 == req.file_size {
+            file.set_permissions(std::fs::Permissions::from_mode(req.file_mode & 0o7777))?;
+            unistd::fchown(
+                &file,
+                Some(Uid::from_raw(req.uid as u32)),
+                Some(Gid::from_raw(req.gid as u32)),
+            )?;
+        }
+        return Ok(());
+    }
+
     // Create parent directories if missing
     if let Some(parent) = path.parent() {
         if !parent.exists() {
@@ -2388,6 +2429,43 @@ fn do_copy_file(req: &CopyFileRequest) -> Result<()> {
     fs::rename(tmpfile, path)?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod preserved_copy_tests {
+    use super::*;
+    use std::os::unix::fs::MetadataExt;
+
+    #[test]
+    fn inode_preserving_copy_keeps_open_file_and_rejects_links() {
+        fs::create_dir_all(CONTAINER_BASE).unwrap();
+        let directory = tempfile::tempdir_in(CONTAINER_BASE).unwrap();
+        let path = directory.path().join("resolv.conf");
+        fs::write(&path, b"old nameserver").unwrap();
+        let old = fs::File::open(&path).unwrap();
+        let inode = old.metadata().unwrap().ino();
+        let request = CopyFileRequest {
+            path: path.to_str().unwrap().to_string(),
+            file_size: 3,
+            offset: 0,
+            data: b"new".to_vec(),
+            file_mode: libc::S_IFREG | 0o644,
+            uid: unistd::getuid().as_raw() as i32,
+            gid: unistd::getgid().as_raw() as i32,
+            preserve_inode: true,
+            ..Default::default()
+        };
+        do_copy_file(&request).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
+        let mut bytes = [0; 3];
+        old.read_exact_at(&mut bytes, 0).unwrap();
+        assert_eq!(&bytes, b"new");
+        fs::hard_link(&path, directory.path().join("alias")).unwrap();
+        assert!(do_copy_file(&request).is_err());
+        let mut invalid = request.clone();
+        invalid.offset = -1;
+        assert!(do_copy_file(&invalid).is_err());
+    }
 }
 
 async fn do_add_swap(sandbox: &Arc<Mutex<Sandbox>>, req: &AddSwapRequest) -> Result<()> {
