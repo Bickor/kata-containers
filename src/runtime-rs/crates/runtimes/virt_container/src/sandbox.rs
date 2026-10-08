@@ -103,7 +103,6 @@ use tracing::instrument;
 
 pub(crate) const VIRTCONTAINER: &str = "virt_container";
 const VMM_START_TIMEOUT_SECS: i32 = 10_000;
-const SOURCE_AGENT_LISTEN_GRACE: Duration = Duration::from_secs(2);
 const SNAPSHOT_MANIFEST_FILE: &str = "kata-snapshot.json";
 const SNAPSHOT_MANIFEST_FORMAT_VERSION: u32 = 1;
 
@@ -2549,7 +2548,7 @@ impl VirtSandbox {
         timings.setup = started.elapsed();
         // Ordering is part of the snapshot protocol:
         // 1. stop health RPCs and pause containers while the agent is reachable;
-        // 2. drain writes, disconnect, and let the guest agent return to listen;
+        // 2. drain writes and disconnect;
         // 3. pause the VM and capture a disconnected-listening checkpoint.
         let operation: Result<Vec<resource::rootfs::RootfsSnapshotArtifacts>> = async {
             let quiesce_started = Instant::now();
@@ -2575,7 +2574,6 @@ impl VirtSandbox {
                 .disconnect()
                 .await
                 .context("disconnect source agent")?;
-            tokio::time::sleep(SOURCE_AGENT_LISTEN_GRACE).await;
 
             self.hypervisor.pause_vm().await.context("pause VM")?;
             vm_paused = true;
