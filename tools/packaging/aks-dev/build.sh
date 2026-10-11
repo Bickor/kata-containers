@@ -7,8 +7,8 @@ export RUSTUP_TOOLCHAIN=1.95.0
 lock_before=$(sha256sum Cargo.lock)
 # Protocol codegen writes into the source tree rather than OUT_DIR. A fresh
 # Docker COPY with a warm target cache must rerun its build script.
-cargo clean -p protocols
-cargo clean -p protocols --release --target x86_64-unknown-linux-gnu
+cargo clean -p protocols -p hypervisor
+cargo clean -p protocols -p hypervisor --release --target x86_64-unknown-linux-gnu
 package=$(python3 -c 'import json; print(json.load(open("tools/packaging/aks-dev/release.json"))["packageVersion"])')
 make -C src/runtime-rs BUILD_TYPE=release LIBC=gnu USE_BUILTIN_DB=false \
     HYPERVISOR=clh-runtime-rs PACKAGE_VERSION="$package" COMMIT="$commit" runtime
