@@ -12,6 +12,35 @@ use std::path::PathBuf;
 use tokio::sync::{Mutex, MutexGuard};
 
 pub(crate) const OCI_IDENTITY_VERSION: u32 = 1;
+pub(crate) const RESTART_CONTAINERS_ANNOTATION: &str =
+    "io.katacontainers.snapshot-restart-containers";
+
+// This is an operator-selected lifecycle contract, not permission to change an
+// adopted process. Only these containers are discarded and created normally.
+pub(crate) fn restart_containers(
+    annotations: &HashMap<String, String>,
+) -> Result<BTreeSet<String>> {
+    let Some(raw) = annotations.get(RESTART_CONTAINERS_ANNOTATION) else {
+        return Ok(BTreeSet::new());
+    };
+    let names: Vec<String> = serde_json::from_str(raw)?;
+    let unique: BTreeSet<_> = names.iter().cloned().collect();
+    if names.is_empty()
+        || names.len() > 32
+        || unique.len() != names.len()
+        || names.iter().any(|name| {
+            name == "POD"
+                || name.is_empty()
+                || name.len() > 63
+                || !name
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        })
+    {
+        return Err(anyhow!("invalid snapshot restart-container selection"));
+    }
+    Ok(unique)
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub(crate) enum RestoreActivation {
@@ -89,6 +118,8 @@ struct RestoreState {
     host_to_guest: HashMap<HostContainerId, GuestContainerId>,
     // Inbound guest event routing back to containerd IDs.
     guest_to_host: HashMap<GuestContainerId, HostContainerId>,
+    #[serde(default)]
+    restart_containers: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -115,6 +146,7 @@ impl RestoreContext {
                 completed_slots: HashMap::new(),
                 host_to_guest: HashMap::new(),
                 guest_to_host: HashMap::new(),
+                restart_containers: BTreeSet::new(),
             }),
             activation_lock: Mutex::new(()),
         }
@@ -191,6 +223,31 @@ impl RestoreContext {
         Ok(())
     }
 
+    pub(crate) async fn select_cold_replacements(&self, names: BTreeSet<String>) -> Result<()> {
+        let mut state = self.state.lock().await;
+        if state.activation != RestoreActivation::RestoringPaused {
+            return Err(anyhow!("restart selection requires restore preparation"));
+        }
+        for name in &names {
+            if name == "POD"
+                || (!state.live_slots.contains_key(name)
+                    && !state.completed_slots.contains_key(name))
+            {
+                return Err(anyhow!(
+                    "restart selection has no captured container {name}"
+                ));
+            }
+        }
+        // Guest removal is performed while the VM network is still fenced.
+        // These names must never be adopted or synthesize old completion.
+        for name in &names {
+            state.live_slots.remove(name);
+            state.completed_slots.remove(name);
+        }
+        state.restart_containers = names;
+        Ok(())
+    }
+
     pub(crate) async fn is_restore(&self) -> bool {
         self.state.lock().await.activation != RestoreActivation::Cold
     }
@@ -216,6 +273,9 @@ impl RestoreContext {
         // must wait until guest network identity is replaced and verified.
         if !is_pause && state.activation != RestoreActivation::Active {
             return Err(anyhow!("restored sandbox is not active"));
+        }
+        if state.restart_containers.contains(cri_name) {
+            return Ok(RestoreCreateAction::Cold);
         }
         if let Some(slot) = state.completed_slots.get_mut(cri_name) {
             // Once kubelet consumed and deleted the synthetic task, a restart
@@ -758,6 +818,78 @@ pub(crate) fn canonical_oci_identity(spec: &oci::Spec) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restart_selection_rejects_pause_duplicates_and_invalid_names() {
+        for value in ["[]", r#"["POD"]"#, r#"["app","app"]"#, r#"["../app"]"#] {
+            assert!(restart_containers(&HashMap::from([(
+                RESTART_CONTAINERS_ANNOTATION.into(),
+                value.into()
+            )]))
+            .is_err());
+        }
+        assert_eq!(
+            restart_containers(&HashMap::from([(
+                RESTART_CONTAINERS_ANNOTATION.into(),
+                r#"["setup","proxy"]"#.into()
+            )]))
+            .unwrap()
+            .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn selected_completed_container_is_cold_but_unselected_workload_stays_strict() {
+        let context = RestoreContext::new("target");
+        context
+            .begin(
+                "source",
+                vec![
+                    RestoreLiveSlot {
+                        cri_name: "POD".into(),
+                        guest_id: guest("pause"),
+                        identity: identity("pause"),
+                        node_local_mounts: vec![],
+                    },
+                    RestoreLiveSlot {
+                        cri_name: "app".into(),
+                        guest_id: guest("app"),
+                        identity: identity("app"),
+                        node_local_mounts: vec![],
+                    },
+                ],
+                vec![RestoreCompletedSlot {
+                    cri_name: "setup".into(),
+                    exit_code: 0,
+                    identity: identity("old"),
+                }],
+            )
+            .await
+            .unwrap();
+        context
+            .select_cold_replacements(BTreeSet::from(["setup".into()]))
+            .await
+            .unwrap();
+        context.prepared_paused().await.unwrap();
+        context.begin_activation(&host("target")).await.unwrap();
+        context.activate().await.unwrap();
+        assert_eq!(
+            context
+                .classify_create(&host("setup-new"), "setup", false, &identity("new"))
+                .await
+                .unwrap(),
+            RestoreCreateAction::Cold
+        );
+        assert!(context
+            .classify_create(&host("app-new"), "app", false, &identity("changed"))
+            .await
+            .is_err());
+        assert!(context
+            .classify_create(&host("unknown"), "unknown", false, &identity("new"))
+            .await
+            .is_err());
+    }
     use std::collections::HashMap;
 
     fn identity(value: &str) -> RestoreIdentity {

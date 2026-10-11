@@ -101,7 +101,7 @@ impl VolumeResource {
                 )
             } else if ephemeral_volume::is_ephemeral_volume(m) {
                 Arc::new(
-                    ephemeral_volume::EphemeralVolume::new(m)
+                    ephemeral_volume::EphemeralVolume::new(m, sid)
                         .with_context(|| format!("new ephemeral volume {m:?}"))?,
                 )
             } else if block_emptydir_volume::is_block_emptydir_volume(m, emptydir_mode) {

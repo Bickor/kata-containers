@@ -1,0 +1,66 @@
+name: AKS unified Kata release
+on:
+  pull_request:
+    branches: [aks-dev]
+  push:
+    tags: ['aks-dev-v*']
+permissions:
+  contents: read
+concurrency:
+  group: aks-dev-release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      DOCKER_BUILDKIT: '1'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify release source
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [ "$EVENT" = push ]; then
+            git fetch origin aks-dev
+            git merge-base --is-ancestor HEAD origin/aks-dev
+            test "$REF_NAME" = "$(jq -r .release tools/packaging/aks-dev/release.json)"
+          fi
+      - name: Build and test all components
+        run: |
+          docker buildx build --file tools/packaging/aks-dev/Dockerfile \
+            --build-arg SOURCE_COMMIT="$(git rev-parse HEAD)" \
+            --target artifacts --output type=local,dest=dist .
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: kata-aks-dev-linux-amd64
+          path: |
+            dist/kata-aks-dev-linux-amd64.tar.gz
+            dist/release-manifest.json
+            dist/SHA256SUMS
+  publish:
+    if: github.event_name == 'push' && github.repository == 'Bickor/kata-containers'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: kata-aks-dev-linux-amd64
+          path: dist
+      - name: Publish immutable prerelease assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          cd dist
+          sha256sum --check SHA256SUMS
+          gh release create "$TAG" --verify-tag --prerelease --title "$TAG" \
+            --notes 'Unified aks-dev runtime, agent and kata-ctl. See release-manifest.json for the source commit, external Cloud Hypervisor pin, hashes and validation boundary. Fresh nodes and snapshots are required.' \
+            kata-aks-dev-linux-amd64.tar.gz release-manifest.json SHA256SUMS

@@ -95,7 +95,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use strum::Display;
 use tokio::sync::{mpsc::Sender, watch, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -106,6 +106,18 @@ const VMM_START_TIMEOUT_SECS: i32 = 10_000;
 const SOURCE_AGENT_LISTEN_GRACE: Duration = Duration::from_secs(2);
 const SNAPSHOT_MANIFEST_FILE: &str = "kata-snapshot.json";
 const SNAPSHOT_MANIFEST_FORMAT_VERSION: u32 = 1;
+
+#[derive(Default)]
+struct SnapshotPhaseTimings {
+    setup: Duration,
+    quiesce: Duration,
+    persist: Duration,
+    vm_save: Duration,
+    rootfs: Duration,
+    finalize: Duration,
+    recovery: Duration,
+    publish: Duration,
+}
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -168,6 +180,8 @@ struct SnapshotManifest {
     live_containers: Vec<SnapshotLiveContainerManifest>,
     completed_containers: Vec<SnapshotCompletedContainerManifest>,
     files: Vec<SnapshotFileManifest>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    restart_containers: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -837,6 +851,7 @@ mod snapshot_manifest_tests {
                 writable_disk: Some("containers/source/rwlayer.img".to_string()),
             }],
             completed_containers: Vec::new(),
+            restart_containers: Vec::new(),
             files: file_paths
                 .iter()
                 .map(|path| SnapshotFileManifest {
@@ -863,6 +878,7 @@ mod snapshot_manifest_tests {
             live_containers: Vec::new(),
             completed_containers: Vec::new(),
             files: Vec::new(),
+            restart_containers: Vec::new(),
         };
 
         let value = serde_json::to_value(manifest).unwrap();
@@ -909,6 +925,7 @@ mod snapshot_manifest_tests {
                 path: "clh/state.json".to_string(),
                 size: 42,
             }],
+            restart_containers: Vec::new(),
         };
 
         let value = serde_json::to_value(manifest).unwrap();
@@ -1339,6 +1356,19 @@ impl VirtSandbox {
         }
 
         let manifest = load_restore_manifest(&snapshot_dir, &self.package_version)?;
+        let restart = crate::restore::restart_containers(&sandbox_config.annotations)?;
+        let captured_restart = manifest
+            .restart_containers
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        if restart != captured_restart
+            || captured_restart.len() != manifest.restart_containers.len()
+        {
+            return Err(anyhow!(
+                "snapshot restart-container contract differs from captured selection"
+            ));
+        }
         let saved_network = saved_restore_network(&snapshot_dir)?;
         let live_slots = manifest
             .live_containers
@@ -1374,6 +1404,9 @@ impl VirtSandbox {
             .collect();
         self.restore_context
             .begin(&manifest.source_sandbox_id, live_slots, completed_slots)
+            .await?;
+        self.restore_context
+            .select_cold_replacements(restart)
             .await?;
         let private_dir = self.restore_private_dir();
         let result: Result<()> = async {
@@ -1512,6 +1545,28 @@ impl VirtSandbox {
                 .check(agent::CheckRequest::new(""))
                 .await
                 .context("health-check restored agent")?;
+
+            // Discard selected saved processes before releasing any restored
+            // traffic. All captured cgroups remain frozen at this point.
+            let config = self.sandbox_config.as_ref().ok_or_else(|| anyhow!("missing restore config"))?;
+            let restart = crate::restore::restart_containers(&config.annotations)?;
+            if !restart.is_empty() {
+                let runtime_config = self.resource_manager.config().await;
+                let source = restore_source_from_annotations(&config.annotations, Path::new(&runtime_config.runtime.snapshot_root))?
+                    .ok_or_else(|| anyhow!("missing restore source"))?;
+                let manifest = load_restore_manifest(&source, &self.package_version)?;
+                for container in &manifest.live_containers {
+                    if restart.contains(&container.cri_name) {
+                        self.agent.remove_container(agent::RemoveContainerRequest {
+                            container_id: container.snapshot_guest_id.clone(),
+                            timeout: 10,
+                            ..Default::default()
+                        }).await.with_context(|| format!("discard captured container {}", container.cri_name))?;
+                        self.resource_manager.cleanup_restored_rootfs(&container.source_host_id).await
+                            .with_context(|| format!("release captured rootfs {}", container.cri_name))?;
+                    }
+                }
+            }
 
             self.agent
                 .reseed_random_dev(agent::ReseedRandomDevRequest {
@@ -2412,6 +2467,8 @@ impl VirtSandbox {
         container_manager: Arc<dyn ContainerManager>,
         destination: &Path,
     ) -> Result<()> {
+        let started = Instant::now();
+        let mut timings = SnapshotPhaseTimings::default();
         if !destination.is_absolute() || destination == Path::new("/") {
             return Err(anyhow!(
                 "snapshot destination must be absolute and non-root"
@@ -2452,6 +2509,29 @@ impl VirtSandbox {
         fs::set_permissions(&staging, fs::Permissions::from_mode(0o700))?;
 
         let inventory = container_manager.snapshot_inventory().await?;
+        let restart = crate::restore::restart_containers(
+            &self
+                .sandbox_config
+                .as_ref()
+                .ok_or_else(|| anyhow!("missing snapshot configuration"))?
+                .annotations,
+        )?;
+        for name in &restart {
+            if !inventory
+                .live_containers
+                .iter()
+                .any(|c| &c.cri_name == name)
+                && !inventory
+                    .completed_containers
+                    .iter()
+                    .any(|c| &c.cri_name == name)
+            {
+                let _ = fs::remove_dir_all(&staging);
+                return Err(anyhow!(
+                    "snapshot restart selection has no container {name}"
+                ));
+            }
+        }
         let runtime_config = self.resource_manager.config().await;
         let snapshot_root = Path::new(&runtime_config.runtime.snapshot_root);
         let active_host_ids = inventory
@@ -2466,11 +2546,13 @@ impl VirtSandbox {
         let mut agent_disconnected = false;
         let mut disconnect_token = None;
         let mut vm_paused = false;
+        timings.setup = started.elapsed();
         // Ordering is part of the snapshot protocol:
         // 1. stop health RPCs and pause containers while the agent is reachable;
         // 2. drain writes, disconnect, and let the guest agent return to listen;
         // 3. pause the VM and capture a disconnected-listening checkpoint.
         let operation: Result<Vec<resource::rootfs::RootfsSnapshotArtifacts>> = async {
+            let quiesce_started = Instant::now();
             self.monitor.suspend().await;
             monitor_suspended = true;
             for container in &inventory.live_containers {
@@ -2497,20 +2579,28 @@ impl VirtSandbox {
 
             self.hypervisor.pause_vm().await.context("pause VM")?;
             vm_paused = true;
+            timings.quiesce = quiesce_started.elapsed();
 
+            let persist_started = Instant::now();
             self.save().await.context("persist sandbox state")?;
+            timings.persist = persist_started.elapsed();
             let clh_staging = staging.join("clh");
             fs::create_dir(&clh_staging)?;
             fs::set_permissions(&clh_staging, fs::Permissions::from_mode(0o700))?;
+            let vm_save_started = Instant::now();
             self.hypervisor
                 .save_vm(&clh_staging)
                 .await
                 .context("save VM snapshot")?;
+            timings.vm_save = vm_save_started.elapsed();
+            let rootfs_started = Instant::now();
             let artifacts = self
                 .resource_manager
                 .snapshot_rootfs_artifacts(&staging, destination, &active_host_ids)
                 .await
                 .context("package rootfs snapshot artifacts")?;
+            timings.rootfs = rootfs_started.elapsed();
+            let finalize_started = Instant::now();
             resource::rootfs::snapshot::finalize_snapshot_config(
                 &clh_staging,
                 snapshot_root,
@@ -2532,6 +2622,7 @@ impl VirtSandbox {
             let persist_destination = staging.join("runtime-state.json");
             reflink_copy(&persist_source, &persist_destination)?;
             fs::set_permissions(&persist_destination, fs::Permissions::from_mode(0o600))?;
+            timings.finalize = finalize_started.elapsed();
             Ok(artifacts)
         }
         .await;
@@ -2539,6 +2630,7 @@ impl VirtSandbox {
         // Recover in the opposite dependency order. The VM must run before the
         // agent can reconnect, and containers/monitor must remain paused until
         // reconnectable RPCs have acquired the new healthy generation.
+        let recovery_started = Instant::now();
         let mut recovery_error: Option<anyhow::Error> = None;
         let mut vm_ready = !vm_paused;
         if vm_paused {
@@ -2566,6 +2658,17 @@ impl VirtSandbox {
                     .check(agent::CheckRequest::new(""))
                     .await
                     .context("health-check reconnected source agent")?;
+                // The source VM clock stopped during capture. Consumers compare
+                // wall-clock authorization deadlines issued outside the VM; do
+                // not resume them with a capture-length clock skew.
+                let now = SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
+                self.agent
+                    .set_guest_date_time(agent::SetGuestDateTimeRequest {
+                        sec: now.as_secs() as i64,
+                        usec: now.subsec_micros() as i64,
+                    })
+                    .await
+                    .context("synchronize source guest time after capture")?;
                 Ok(())
             }
             .await;
@@ -2597,6 +2700,7 @@ impl VirtSandbox {
         if monitor_suspended && agent_ready {
             self.monitor.resume();
         }
+        timings.recovery = recovery_started.elapsed();
 
         // Never publish an artifact unless both capture and source recovery
         // succeeded. A failed recovery is a failed snapshot transaction.
@@ -2616,6 +2720,7 @@ impl VirtSandbox {
             }
         };
 
+        let publish_started = Instant::now();
         let agent_config = self.agent.agent_config().await;
 
         let publication: Result<()> = (|| {
@@ -2760,6 +2865,15 @@ impl VirtSandbox {
                 live_containers,
                 completed_containers,
                 files,
+                restart_containers: crate::restore::restart_containers(
+                    &self
+                        .sandbox_config
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("missing snapshot configuration"))?
+                        .annotations,
+                )?
+                .into_iter()
+                .collect(),
             };
             let manifest_path = staging.join("kata-snapshot.json");
             fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
@@ -2776,6 +2890,15 @@ impl VirtSandbox {
         if publication.is_err() {
             let _ = fs::remove_dir_all(&staging);
         }
+        timings.publish = publish_started.elapsed();
+        // Durations only: never emit snapshot paths, identities, data, or secrets.
+        info!(sl!(), "KATA_VMSTATE_RUNTIME_TIMING status={} total_ms={} setup_ms={} quiesce_ms={} persist_ms={} vm_save_ms={} rootfs_ms={} finalize_ms={} recovery_ms={} publish_ms={}",
+            if publication.is_ok() { "ok" } else { "error" },
+            started.elapsed().as_millis(), timings.setup.as_millis(),
+            timings.quiesce.as_millis(), timings.persist.as_millis(),
+            timings.vm_save.as_millis(), timings.rootfs.as_millis(),
+            timings.finalize.as_millis(), timings.recovery.as_millis(),
+            timings.publish.as_millis());
         publication
     }
 }
