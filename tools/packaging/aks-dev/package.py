@@ -21,6 +21,7 @@ settings = {
     "image": '"/opt/aks-sandbox-demo/kata-v2/share/kata-containers/kata-containers.img"',
     "valid_hypervisor_paths": '["/opt/aks-sandbox-demo/kata-v2/bin/cloud-hypervisor"]',
     "kernel_params": '"cgroup_no_v1=all systemd.unified_cgroup_hierarchy=1"',
+    "container_pipe_size": "1",
     "default_vcpus": "1",
     "default_memory": "2048",
     "overhead_vcpus": "0",
