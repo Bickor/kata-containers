@@ -5,6 +5,9 @@ commit=${1:?source commit is required}
 [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || { echo 'invalid source commit' >&2; exit 1; }
 export RUSTUP_TOOLCHAIN=1.95.0
 lock_before=$(sha256sum Cargo.lock)
+# Protocol codegen writes into the source tree rather than OUT_DIR. A fresh
+# Docker COPY with a warm target cache must rerun its build script.
+cargo clean -p protocols
 package=$(python3 -c 'import json; print(json.load(open("tools/packaging/aks-dev/release.json"))["packageVersion"])')
 make -C src/runtime-rs BUILD_TYPE=release LIBC=gnu USE_BUILTIN_DB=false \
     HYPERVISOR=clh-runtime-rs PACKAGE_VERSION="$package" COMMIT="$commit" runtime
