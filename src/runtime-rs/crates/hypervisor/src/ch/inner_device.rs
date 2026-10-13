@@ -537,7 +537,8 @@ impl TryFrom<BlockConfigModern> for DiskConfig {
             readonly: blkcfg.is_readonly,
             num_queues: blkcfg.num_queues,
             queue_size: blkcfg.queue_size as u16,
-            sparse: blkcfg.discard_unmap,
+            // CLH fallocates writable disks to their full logical size when sparse is false.
+            sparse: true,
             image_type,
             extent_anchor_path: blkcfg.extent_anchor_path,
             ..Default::default()
@@ -630,6 +631,26 @@ mod tests {
         let net = NetConfig::try_from(cfg);
         assert!(net.is_ok());
         assert_eq!(net.unwrap(), expected);
+    }
+
+    #[test]
+    fn test_raw_disks_remain_sparse_without_discard() {
+        for discard_unmap in [false, true] {
+            let disk = DiskConfig::try_from(BlockConfigModern {
+                path_on_host: "/run/kata/rwlayer.img".to_string(),
+                format: BlockDeviceFormat::Raw,
+                is_readonly: false,
+                discard_unmap,
+                ..Default::default()
+            })
+            .unwrap();
+            // Verify the wire configuration sent to CLH, including the default
+            // no-discard case which previously caused full-size preallocation.
+            let disk_json = serde_json::to_value(disk).unwrap();
+            assert_eq!(disk_json["sparse"], true);
+            assert_eq!(disk_json["readonly"], false);
+            assert_eq!(disk_json["image_type"], "Raw");
+        }
     }
 
     #[test]

@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "repository": "Bickor/kata-containers",
+  "branch": "aks-dev",
+  "release": "aks-dev-v2026.10.11-rc.1",
+  "packageVersion": "4.1.0-aks-dev.2026.10.11-rc.1",
+  "cloudHypervisor": {
+    "repository": "https://github.com/microsoft/cloud-hypervisor.git",
+    "commit": "f828d1142ca447727840fb2fc25feed4b5779da1",
+    "features": "mshv"
+  }
+}
