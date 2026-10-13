@@ -17,6 +17,7 @@ make -C src/agent BUILD_TYPE=release LIBC=gnu COMMIT="$commit" optimize
 make -C src/tools/kata-ctl BUILD_TYPE=release LIBC=gnu USE_BUILTIN_DB=false COMMIT="$commit"
 
 # All tests use the same source tree and protocol definitions as all binaries.
+cargo test --manifest-path third_party/pathrs-0.2.4/Cargo.toml --lib parse_kernel_version -- --nocapture
 cargo test --locked -p hypervisor --lib ch::inner_device::tests -- --nocapture
 cargo test --locked -p virt_container --lib restore::tests -- --nocapture
 cargo test --locked -p virt_container --lib snapshot_manifest_tests -- --nocapture

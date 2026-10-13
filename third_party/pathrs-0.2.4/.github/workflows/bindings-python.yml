@@ -1,0 +1,172 @@
+# SPDX-License-Identifier: MPL-2.0
+#
+# libpathrs: safe path resolution on Linux
+# Copyright (C) 2019-2025 SUSE LLC
+# Copyright (C) 2026 Aleksa Sarai <cyphar@cyphar.com>
+#
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+on:
+  push:
+    branches: [ main ]
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [ main ]
+  release:
+    types: [ published ]
+  schedule:
+    - cron: '0 0 * * *'
+
+env:
+  PYTHON_DIST: ${{ github.workspace }}/.tmp/python3-pathrs-${{ github.run_id }}-${{ github.run_attempt }}
+
+name: bindings-python
+
+jobs:
+  ruff:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/ruff-action@v3
+        with:
+          args: "--version"
+      - run: ruff check
+      - run: ruff format --check --diff
+
+  mypy:
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: write # allow the action to annotate code
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      # Set up python venv.
+      - uses: actions/setup-python@v6
+      - name: install mypy
+        run: >-
+          python3 -m pip install --user mypy
+      - uses: tsuyoshicho/action-mypy@v5
+        with:
+          github_token: ${{ secrets.github_token }}
+          reporter: github-check
+          workdir: contrib/bindings/python/pathrs
+          fail_on_error: true
+
+  build-pyproject:
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.x"]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      # Build and install libpathrs.so.
+      - uses: dtolnay/rust-toolchain@stable
+      - name: build libpathrs
+        run: make release
+      - name: install libpathrs
+        run: sudo ./install.sh --libdir=/usr/lib
+      # Set up python venv.
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: install pypa/build
+        run: >-
+          python3 -m pip install --user build twine
+      # Build and install our bindings.
+      - name: build python-pathrs bindings
+        run: make -C contrib/bindings/python dist
+      - run: twine check contrib/bindings/python/dist/*
+      - name: install python-pathrs bindings
+        run: make -C contrib/bindings/python install
+      # Verify that the crate and python bindings have the same version.
+      # TODO: Move this to a "make check" we can run locally as well.
+      - name: check crate and python binding versions match
+        run: |
+          CRATE_VERSION="$(cargo metadata --no-deps --format-version=1 | jq -rM '.packages[] | select(.name == "pathrs") | "\(.name)-\(.version)"')"
+          PY_VERSION="$(python3 -c 'import importlib.metadata; print("pathrs-" + importlib.metadata.version("pathrs"))')"
+
+          echo "rust crate version: $CRATE_VERSION";
+          echo "python module version: $PY_VERSION";
+
+          [[ "$CRATE_VERSION" == "$PY_VERSION" ]] || exit 1
+      # Include the dist/ in our artefacts.
+      - name: upload python-pathrs bindings dist/
+        uses: actions/upload-artifact@v7
+        with:
+          name: python-${{ matrix.python-version }}-pathrs-dist
+          path: contrib/bindings/python/dist/
+
+  smoke-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.x"]
+    needs:
+      - build-pyproject
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      # Build and install libpathrs.so.
+      - uses: dtolnay/rust-toolchain@stable
+      - name: build libpathrs
+        run: make release
+      - name: install libpathrs
+        run: sudo ./install.sh --libdir=/usr/lib
+      # Set up python venv.
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      # Download the pre-built python dist.
+      - name: download built python-pathrs
+        uses: actions/download-artifact@v8
+        with:
+          name: python-${{ matrix.python-version }}-pathrs-dist
+          path: ${{ env.PYTHON_DIST }}
+      - name: install python-pathrs
+        run: |-
+          python3 -m pip install ${{ env.PYTHON_DIST }}/*.whl
+      # Run smoke-tests.
+      - run: make -C examples/python smoke-test
+
+  python-complete:
+    needs:
+      - ruff
+      - mypy
+      - build-pyproject
+      - smoke-test
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Python CI jobs completed successfully."
+
+  # TODO: Should we move this to a separate workflow?
+  release-pypi:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - build-pyproject
+      - python-complete
+    runs-on: ubuntu-latest
+    environment:
+      name: release-pypi
+      url: "https://pypi.org/p/pathrs"
+    permissions:
+      id-token: write
+    steps:
+      - name: download built python-pathrs
+        uses: actions/download-artifact@v8
+        with:
+          name: python-3.x-pathrs-dist
+          path: ${{ env.PYTHON_DIST }}
+      # PyPI doesn't let us upload our native wheel because we aren't building
+      # using the restrictive manylinux set of libraries (because we depend on
+      # libpathrs.so).
+      - name: remove wheel from python-pathrs
+        run: rm -fv ${{ env.PYTHON_DIST }}/*.whl
+      - name: upload python-pathrs to pypi
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: ${{ env.PYTHON_DIST }}

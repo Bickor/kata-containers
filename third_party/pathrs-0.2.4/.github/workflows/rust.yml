@@ -1,0 +1,570 @@
+# SPDX-License-Identifier: MPL-2.0
+#
+# libpathrs: safe path resolution on Linux
+# Copyright (C) 2019-2025 SUSE LLC
+# Copyright (C) 2026 Aleksa Sarai <cyphar@cyphar.com>
+#
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+on:
+  push:
+    branches: [ main ]
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [ main ]
+  release:
+    types: [ published ]
+  schedule:
+    - cron: '0 0 * * *'
+
+name: rust-ci
+
+env:
+  RUST_MSRV: &RUST_MSRV "1.63"
+
+jobs:
+  codespell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - run: pip install codespell==v2.3.0
+      - run: codespell -L crate
+
+  check:
+    name: cargo check (stable)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-hack
+      - name: cargo check
+        run: >-
+          cargo hack --workspace --each-feature --keep-going \
+            check --all-targets
+
+  check-msrv:
+    name: cargo check (msrv)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: *RUST_MSRV
+      - uses: taiki-e/install-action@cargo-hack
+      - name: cargo check
+        run: >-
+          cargo hack --each-feature --keep-going \
+            check --all-targets
+
+  check-cross:
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+          - arm-unknown-linux-gnueabi
+          - arm-unknown-linux-gnueabihf
+          - armv7-unknown-linux-gnueabihf
+          - i686-unknown-linux-gnu
+          - loongarch64-unknown-linux-gnu
+          - loongarch64-unknown-linux-musl
+          - powerpc-unknown-linux-gnu
+          - powerpc64-unknown-linux-gnu
+          - powerpc64le-unknown-linux-gnu
+          - riscv64gc-unknown-linux-gnu
+          - sparc64-unknown-linux-gnu
+          - s390x-unknown-linux-gnu
+    name: cargo check (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # TODO: Should we use MSRV for this?
+          targets: ${{ matrix.target }}
+      - uses: taiki-e/install-action@cargo-hack
+      - name: cargo check --target=${{ matrix.target }}
+        run: >-
+          cargo hack --each-feature --keep-going \
+            check --target=${{ matrix.target }} --all-targets
+      - name: cargo build --target=${{ matrix.target }}
+        run: >-
+          cargo hack --each-feature --keep-going \
+            build --target=${{ matrix.target }} --release
+
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      # We need to use nightly Rust to check the formatting.
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      # Pin the Rust version to avoid Rust updates breaking our clippy lints.
+      - uses: dtolnay/rust-toolchain@1.88
+        with:
+          components: clippy
+      - uses: taiki-e/install-action@cargo-hack
+      - name: cargo clippy
+        run: >-
+          cargo hack --workspace --each-feature --keep-going \
+            clippy --all-targets
+
+  check-lint-nohack:
+    name: make lint (no cargo-hack)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt,clippy
+      - name: install cbindgen
+        run: cargo install --force cbindgen
+      - name: make lint
+        run: make CARGO_NIGHTLY=cargo lint
+
+  validate-cbindgen:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: install cbindgen
+        run: cargo install --force cbindgen
+      - run: make validate-cbindgen
+
+  validate-elf-symbols:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        rust-version:
+          - *RUST_MSRV
+          - "1.72" # loongarch64 global_asm! stabilised
+          - "1.84" # arm64ex / s390x global_asm! stabilised
+          - "1.91" # loongarch32 global_asm! stabilised
+          - stable
+          - nightly
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust-version }}
+      - name: install lld
+        run: sudo apt-get install -y lld
+      - run: make validate-elf-symbols
+
+  validate-keyring:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - run: make validate-keyring
+
+  validate-dist-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - run: make dist-release
+      - name: check release artefacts
+        run: |-
+          ls -la release/*/
+          cat release/*/libpathrs.sha256sum
+
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        rust-version:
+          - *RUST_MSRV # debian bookworm (oldstable)
+          - "1.75" # centos stream 8
+          - "1.85" # debian trixie (stable)
+          - stable
+          - nightly
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust-version }}
+      - name: install lld
+        run: sudo apt-get install -y lld
+      - run: make debug
+      - run: make release
+
+  rustdoc:
+    name: cargo doc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo doc --document-private-items --workspace --all-features
+      - name: upload docs
+        uses: actions/upload-artifact@v7
+        with:
+          name: rustdoc
+          path: target/doc
+
+  nextest-archive:
+    strategy:
+      fail-fast: false
+      matrix:
+        run-as:
+          - unpriv
+          - root
+    name: cargo nextest archive (${{ matrix.run-as }})
+    runs-on: ubuntu-latest
+    env:
+      FEATURES: >-
+        capi
+        _test_race
+        ${{ matrix.run-as == 'root' && '_test_as_root' || '' }}
+    steps:
+      - uses: actions/checkout@v6
+      # Nightly rust is required for llvm-cov --doc.
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: llvm-tools
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: taiki-e/install-action@nextest
+      - name: cargo nextest archive
+        run: >-
+          cargo llvm-cov \
+            nextest-archive \
+              --workspace \
+              -F "${{ env.FEATURES }}" \
+              --archive-file nextest-pathrs-${{ matrix.run-as }}.tar.zst
+      - name: upload nextest archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: nextest-archive-${{ matrix.run-as }}
+          path: nextest-pathrs-${{ matrix.run-as }}.tar.zst
+          retention-days: 7 # no need to waste disk space
+
+  doctest:
+    name: cargo test --doc
+    runs-on: ubuntu-latest
+    env:
+      CARGO_NIGHTLY: cargo
+    steps:
+      - uses: actions/checkout@v6
+      # Nightly rust is required for llvm-cov --doc.
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: llvm-tools
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - run: make test-rust-doctest
+      - name: upload rust coverage (artifact)
+        uses: actions/upload-artifact@v7
+        with:
+          name: profraw-${{ github.job }}-${{ strategy.job-index }}
+          path: "target/llvm-cov-target/*.profraw"
+          retention-days: 7 # no need to waste disk space
+
+      # TODO: Upload to CodeCov. Unfortunately, "cargo test --doc" does not
+      # generate a binary that llvm-cov can use to generate coverage reports
+      # from.
+
+  compute-test-partitions:
+    name: compute test partitions
+    runs-on: ubuntu-latest
+    outputs:
+      tests: ${{ steps.test-partitions.outputs.data }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: compute test partitions
+        id: test-partitions
+        run: |-
+          # Compute the default test set then convert each object to a string
+          # so that we can double-fromJSON it (once as a list for
+          # test.strategy, and once again for test.name and the actual test).
+          partitions="$(./hack/ci-compute-test-partition.jq <<<"null")"
+          jq -CS <<<"$partitions" # for debugging
+          echo "data=$(jq -ScM 'map("\(.)")' <<<"$partitions")" >>"$GITHUB_OUTPUT"
+
+  nextest:
+    needs:
+      - compute-test-partitions
+      - nextest-archive
+    strategy:
+      fail-fast: false
+      matrix:
+        tests: ${{ fromJSON(needs.compute-test-partitions.outputs.tests) }}
+        run-as:
+          - unpriv
+          - root
+        enosys:
+          - ""
+          - openat2
+          - statx
+        exclude:
+          # The statx tests are quite slow with statx disabled, and there is no
+          # real benefit to including them since the fallback code is tested
+          # elsewhere and our race tests don't try even to attack fdinfo.
+          - enosys: statx
+            tests: >-
+              {"name":"race","pattern":"test(#tests::test_race*)"}
+
+    env:
+      NEXTEST_PATTERN_SPEC: ${{ fromJSON(matrix.tests).pattern }}
+    name: >-
+      cargo nextest
+      ${{
+          format('({0}, {1}{2})',
+            fromJSON(matrix.tests).name,
+            matrix.run-as,
+            matrix.enosys && format(', {0}=enosys', matrix.enosys) || '',
+          )
+      }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      # Nightly rust is required for llvm-cov --doc.
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: llvm-tools
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: taiki-e/install-action@nextest
+      - name: install llvm-tools wrappers
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-binutils
+
+      - name: pull nextest archive
+        uses: actions/download-artifact@v8
+        with:
+          name: nextest-archive-${{ matrix.run-as }}
+          path: .
+
+      - name: rust unit tests (${{ matrix.run-as }})
+        run: >-
+          ./hack/rust-tests.sh \
+            --cargo=cargo \
+            ${{ matrix.run-as == 'root' && '--sudo' || '' }} \
+            --enosys="${{ matrix.enosys }}" \
+            --archive-file="nextest-pathrs-${{ matrix.run-as }}.tar.zst" \
+            "${{ env.NEXTEST_PATTERN_SPEC }}"
+
+      - name: upload rust coverage (artifact)
+        uses: actions/upload-artifact@v7
+        with:
+          name: profraw-${{ github.job }}-${{ strategy.job-index }}
+          path: "target/llvm-cov-target/*.profraw"
+          retention-days: 7 # no need to waste disk space
+
+      # FIXME: llvm-cov appears to have some kind of bug with
+      # --nextest-archive-file as they do not strip the "target" prefix from
+      # the nextest archive. As a workaround, we just extract it ourselves.
+      - name: extract nextest archive
+        run: >-
+          tar xv -f nextest-pathrs-${{ matrix.run-as }}.tar.zst -C target/llvm-cov-target/ --strip-components=1
+      # Upload to CodeCov.
+      - name: generate codecov-friendly coverage
+        id: codecov-coverage
+        run: |-
+          CODECOV_FILE="$(mktemp coverage-codecov.lcov.txt.XXXXXX)"
+          cargo llvm-cov report --lcov --output-path="$CODECOV_FILE"
+          echo "file=$CODECOV_FILE" >>"$GITHUB_OUTPUT"
+      - name: upload rust coverage (codecov)
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          slug: cyphar/libpathrs
+          files: ${{ steps.codecov-coverage.outputs.file }}
+
+  # Smoke-test for our %check section in the libpathrs RPM.
+  # <https://github.com/cyphar/libpathrs/issues/299>
+  # TODO: I guess we should run this as root too...
+  cargo-test:
+    name: cargo test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: cargo test
+        run: cargo test --features capi
+
+  coverage:
+    needs:
+      - doctest
+      - nextest
+    name: compute coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      # Nightly rust is required for llvm-cov --doc.
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: llvm-tools
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: install llvm-tools wrappers
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-binutils
+
+      - name: pull rust coverage
+        id: rust-coverage
+        uses: actions/download-artifact@v8
+        with:
+          pattern: "profraw-*"
+          path: profraw
+      - name: merge coverage
+        run: |-
+          mkdir -p target/llvm-cov-target
+          profraw_list="$(mktemp --tmpdir libpathrs-profraw.XXXXXXXX)"
+          find "${{ steps.rust-coverage.outputs.download-path }}" -name '*.profraw' -type f >"$profraw_list"
+          rust-profdata merge --sparse -f "$profraw_list" -o ./target/llvm-cov-target/libpathrs-combined.profraw
+      - name: upload merged rust coverage
+        uses: actions/upload-artifact@v7
+        with:
+          name: libpathrs-combined-profraw
+          path: target/llvm-cov-target/libpathrs-combined.profraw
+          retention-days: 7 # no need to waste disk space
+
+      # FIXME: We just pull one version of the archive and use it for
+      # generating coverage profiles, but this really is not correct because
+      # the "root" and "unpriv" binaries are different and so the coverage data
+      # is a little off. See <https://github.com/cyphar/libpathrs/issues/282>.
+      - name: pull nextest archive
+        uses: actions/download-artifact@v8
+        with:
+          name: nextest-archive-root
+          path: .
+
+      # FIXME: llvm-cov appears to have some kind of bug with
+      # --nextest-archive-file as they do not strip the "target" prefix from
+      # the nextest archive. As a workaround, we just extract it ourselves.
+      - name: extract nextest archive
+        run: >-
+          tar xv -f nextest-pathrs-root.tar.zst -C target/llvm-cov-target/ --strip-components=1
+
+      - name: calculate coverage
+        run: cargo llvm-cov report
+      - name: generate coverage html
+        run: cargo llvm-cov report --html
+      - name: upload coverage html
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-report
+          path: target/llvm-cov/html
+
+  examples:
+    name: smoke-test examples
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --examples
+      - run: make -C examples smoke-test-rust
+
+  size:
+    permissions:
+      contents: read
+      statuses: write
+    strategy:
+      fail-fast: false
+      matrix:
+        libtype: [ "cdylib", "staticlib" ]
+    name: check ${{ matrix.libtype }} size
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - run: make release
+      - name: compute ${{ matrix.libtype }} file name
+        run: |-
+          case "${{ matrix.libtype }}" in
+            cdylib)
+              libfile=libpathrs.so ;;
+            staticlib)
+              libfile=libpathrs.a ;;
+            *)
+              exit 1 ;;
+          esac
+          echo "LIB_FILENAME=$libfile" >>"$GITHUB_ENV"
+      - name: strip ${{ matrix.libtype }}
+        run: |-
+          cp target/release/$LIB_FILENAME{,.nostrip}
+          strip target/release/$LIB_FILENAME
+      - name: compute ${{ matrix.libtype }} binary size
+        run: |-
+          LIB_SIZE="$(stat -c "%s" "target/release/$LIB_FILENAME" | numfmt --to=si --suffix=B)"
+          LIB_NOSTRIP_SIZE="$(stat -c "%s" "target/release/$LIB_FILENAME.nostrip" | numfmt --to=si --suffix=B)"
+          cat >&2 <<-EOF
+          === binary sizes ===
+          $LIB_FILENAME Size: $LIB_SIZE
+          Unstripped: $LIB_NOSTRIP_SIZE
+          EOF
+          echo "LIB_SIZE=$LIB_SIZE" >>"$GITHUB_ENV"
+          echo "LIB_NOSTRIP_SIZE=$LIB_NOSTRIP_SIZE" >>"$GITHUB_ENV"
+      # At the moment, we can only attach the commit status for push operations
+      # because pull requests don't get the right permissions in the default
+      # GITHUB_TOKEN. It's not really clear to me how we should work around
+      # this (secrets like access tokens are not provided for PRs from forked
+      # repos) -- we probably need to switch to status checks?
+      - if: github.event_name == 'push'
+        name: update commit status
+        uses: octokit/request-action@v2.x
+        with:
+          route: POST /repos/{owner_repo}/statuses/{sha}
+          owner_repo: ${{ github.repository }}
+          sha: ${{ github.sha }}
+          state: success
+          description: ${{ env.LIB_FILENAME }} (${{ matrix.libtype }}) is ${{ env.LIB_SIZE }} (${{ env.LIB_NOSTRIP_SIZE }} unstripped)
+          context: rust-ci / ${{ matrix.libtype }} size
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  rust-complete:
+    needs:
+      - codespell
+      - check
+      - check-msrv
+      - check-cross
+      - fmt
+      - clippy
+      - check-lint-nohack
+      - validate-cbindgen
+      - validate-elf-symbols
+      - validate-keyring
+      - validate-dist-release
+      - build
+      - rustdoc
+      - doctest
+      - nextest
+      - cargo-test
+      - coverage
+      - examples
+      - size
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Rust CI jobs completed successfully."
+
+  release-crate:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - rust-complete
+    runs-on: ubuntu-latest
+    environment:
+      name: release-crate
+      url: "https://crates.io/crates/pathrs"
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

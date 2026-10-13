@@ -1,0 +1,104 @@
+# SPDX-License-Identifier: MPL-2.0
+#
+# libpathrs: safe path resolution on Linux
+# Copyright (C) 2019-2025 SUSE LLC
+# Copyright (C) 2026 Aleksa Sarai <cyphar@cyphar.com>
+#
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+on:
+  push:
+    branches: [ main ]
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [ main ]
+  release:
+    types: [ published ]
+  schedule:
+    - cron: '0 0 * * *'
+
+name: bindings-go
+
+env:
+  GO_VERSION: 1.25.x
+
+jobs:
+  lint:
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: write # to allow the action to annotate code in the pr.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      # Build and install libpathrs.so.
+      - uses: dtolnay/rust-toolchain@stable
+      - name: build libpathrs
+        run: make release
+      - name: install libpathrs
+        run: sudo ./install.sh --libdir=/usr/lib
+      # Run golangci-lint.
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.5
+          working-directory: go-pathrs
+
+  go-fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 2
+      # Build and install libpathrs.so.
+      - uses: dtolnay/rust-toolchain@stable
+      - name: build libpathrs
+        run: make release
+      - name: install libpathrs
+        run: sudo ./install.sh --libdir=/usr/lib
+      # Run go-fix.
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "${{ env.GO_VERSION }}"
+      - name: run go fix
+        run: |
+          cd go-pathrs
+          go fix ./...
+          git diff --exit-code
+
+  smoke-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        go-version:
+          - "1.18"
+          - "oldstable"
+          - "stable"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      # Build and install libpathrs.so.
+      - uses: dtolnay/rust-toolchain@stable
+      - name: build libpathrs
+        run: make release
+      - name: install libpathrs
+        run: sudo ./install.sh --libdir=/usr/lib
+      # Setup go.
+      - name: install go ${{ matrix.go-version }}
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ matrix.go-version }}
+          check-latest: true
+      # Run smoke-tests.
+      - run: make -C examples/go smoke-test
+
+  go-complete:
+    needs:
+      - lint
+      - go-fix
+      - smoke-test
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Go CI jobs completed successfully."
