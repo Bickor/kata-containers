@@ -634,6 +634,26 @@ mod tests {
     }
 
     #[test]
+    fn test_raw_disks_remain_sparse_without_discard() {
+        for discard_unmap in [false, true] {
+            let disk = DiskConfig::try_from(BlockConfigModern {
+                path_on_host: "/run/kata/rwlayer.img".to_string(),
+                format: BlockDeviceFormat::Raw,
+                is_readonly: false,
+                discard_unmap,
+                ..Default::default()
+            })
+            .unwrap();
+            // Verify the wire configuration sent to CLH, including the default
+            // no-discard case which previously caused full-size preallocation.
+            let disk_json = serde_json::to_value(disk).unwrap();
+            assert_eq!(disk_json["sparse"], true);
+            assert_eq!(disk_json["readonly"], false);
+            assert_eq!(disk_json["image_type"], "Raw");
+        }
+    }
+
+    #[test]
     fn test_vmdk_extent_anchor_to_diskconfig() {
         let disk = DiskConfig::try_from(BlockConfigModern {
             path_on_host: "/run/kata/merged_fs.vmdk".to_string(),

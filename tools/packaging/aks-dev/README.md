@@ -20,6 +20,9 @@ Preserved changes from the old fork branches:
   CopyFile and restore RPCs, so the 3.32 backports are not reapplied.
 - `4699235c1`: large CopyFile chunking, missing from the upstream integration branch.
 - PR #3: metadata-only snapshot/rootfs phase timings.
+- PR #7 (Microsoft PR #574): explicitly sparse Cloud Hypervisor disks regardless
+  of discard requests, and removal of the obsolete two-second disconnect delay.
+  Snapshot phase timing instrumentation remains enabled.
 
 The `review/*`, old `feat/*`, and merged `fix/*` branches are historical inputs,
 not release sources. The old `main` is retained as history. No source branch
