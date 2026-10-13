@@ -4,6 +4,9 @@ edition = "2018"
 license = "Apache-2.0"
 rust-version = "1.95"
 
+[patch.crates-io]
+pathrs = { path = "third_party/pathrs-0.2.4" }
+
 [workspace]
 members = [
   # libs
@@ -68,6 +71,7 @@ resolver = "2"
 
 # TODO: Add all excluded crates to root workspace
 exclude = [
+  "third_party/pathrs-0.2.4",
   "src/tools",
 
   # We are cloning and building rust packages under
