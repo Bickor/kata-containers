@@ -314,6 +314,23 @@ impl RuntimeHandlerManager {
 
     pub async fn cleanup(&self) -> Result<()> {
         let inner = self.inner.read().await;
+        let result = Self::cleanup_sandbox(&inner).await;
+
+        // A restore can own disk storage before state.json exists or loads.
+        #[cfg(feature = "virt")]
+        let workspace = virt_container::sandbox::cleanup_restore_workspace(&inner.id)
+            .context("remove restore workspace");
+        #[cfg(not(feature = "virt"))]
+        let workspace: Result<()> = Ok(());
+        match (result, workspace) {
+            (Err(error), Err(workspace_error)) => {
+                Err(error.context(format!("{workspace_error:#}")))
+            }
+            (result, workspace) => result.and(workspace),
+        }
+    }
+
+    async fn cleanup_sandbox(inner: &RuntimeHandlerManagerInner) -> Result<()> {
         let sender = inner.msg_sender.clone();
         let sandbox_state = persist::from_disk::<SandboxState>(&inner.id)
             .context("failed to load the sandbox state")?;
@@ -1002,6 +1019,18 @@ fn config_path_matches_defaults(config_path: &str, default_config_paths: Vec<Pat
 // this update the agent-specfic kernel parameters into hypervisor's bootinfo
 // the agent inside the VM will read from file cmdline to get the params and function
 fn update_agent_kernel_params(config: &mut TomlConfig) -> Result<()> {
+    #[cfg(feature = "openvmm")]
+    if config.runtime.hypervisor_name == kata_types::config::hypervisor::HYPERVISOR_NAME_OPENVMM {
+        if let Some(h) = config.hypervisor.get(&config.runtime.hypervisor_name) {
+            if kata_types::config::hypervisor::snp_igvm_enabled(h)? {
+                info!(
+                    sl!(),
+                    "Skipping agent kernel parameters for OpenVMM SNP: the command line is measured in the IGVM"
+                );
+                return Ok(());
+            }
+        }
+    }
     let mut params = vec![];
     if let Ok(kv) = config.get_agent_kernel_params() {
         for (k, v) in kv.into_iter() {
@@ -1178,6 +1207,29 @@ mod tests {
     use common::types::ShutdownRequest;
     use rstest::rstest;
     use tokio::sync::mpsc::channel;
+
+    #[cfg(feature = "openvmm")]
+    #[test]
+    fn snp_igvm_does_not_receive_unmeasured_agent_parameters() {
+        let mut config = TomlConfig::default();
+        config.runtime.hypervisor_name = "openvmm".to_string();
+        config.runtime.agent_name = "kata".to_string();
+        let mut h = kata_types::config::hypervisor::Hypervisor::default();
+        h.boot_info.igvm = "/tmp/guest.igvm".to_string();
+        h.security_info.confidential_guest = true;
+        h.security_info.sev_snp_guest = true;
+        config.hypervisor.insert("openvmm".to_string(), h);
+        let agent = kata_types::config::Agent {
+            debug: true,
+            ..Default::default()
+        };
+        config.agent.insert("kata".to_string(), agent);
+        update_agent_kernel_params(&mut config).unwrap();
+        assert!(config.hypervisor["openvmm"]
+            .boot_info
+            .kernel_params
+            .is_empty());
+    }
 
     #[rstest]
     #[case::armed_guard_removes_runtime_dir(false, false)]
