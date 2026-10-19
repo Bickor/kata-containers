@@ -27,6 +27,7 @@ settings = {
     "overhead_vcpus": "0",
     "overhead_memory": "0",
     "memory_restore_mode": '"copyonwrite"',
+    "disable_hotplug_memory": "true",
     "shared_fs": '"none"',
     "sandbox_cgroup_only": "true",
     "static_sandbox_resource_mgmt": "true",
