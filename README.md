@@ -160,7 +160,7 @@ See the [tests documentation](tests/README.md).
 See the [glossary of terms](https://github.com/kata-containers/kata-containers/wiki/Glossary) related to Kata Containers.
 # AKS development fork
 
-Use `aks-dev` for integration and release PRs. The
+Use `msft-main` for integration and release PRs. The
 [unified release guide](tools/packaging/aks-dev/README.md) describes the single-tree
 4.1 runtime/agent build, source migration, complete payload and release workflow.
 The old review and feature branches are historical inputs, not release branches.

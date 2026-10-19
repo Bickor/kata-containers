@@ -1,13 +1,13 @@
 name: AKS unified Kata release
 on:
   pull_request:
-    branches: [aks-dev]
+    branches: [msft-main]
   push:
-    tags: ['aks-dev-v*']
+    tags: ['msft-main-v*']
 permissions:
   contents: read
 concurrency:
-  group: aks-dev-release-${{ github.ref }}
+  group: msft-main-release-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   build:
@@ -26,8 +26,9 @@ jobs:
           REF_NAME: ${{ github.ref_name }}
         run: |
           if [ "$EVENT" = push ]; then
-            git fetch origin aks-dev
-            git merge-base --is-ancestor HEAD origin/aks-dev
+            git fetch origin msft-main
+            git merge-base --is-ancestor HEAD origin/msft-main
+            test "$(jq -r .branch tools/packaging/aks-dev/release.json)" = msft-main
             test "$REF_NAME" = "$(jq -r .release tools/packaging/aks-dev/release.json)"
           fi
       - name: Build and test all components
@@ -62,5 +63,5 @@ jobs:
           cd dist
           sha256sum --check SHA256SUMS
           gh release create "$TAG" --verify-tag --prerelease --title "$TAG" \
-            --notes 'Unified aks-dev runtime, agent and kata-ctl. See release-manifest.json for the source commit, external Cloud Hypervisor pin, hashes and validation boundary. Fresh nodes and snapshots are required.' \
+            --notes 'Unified msft-main runtime, agent and kata-ctl. See release-manifest.json for the source commit, Microsoft upstream baseline, external Cloud Hypervisor pin, hashes and validation boundary. Fresh nodes and snapshots are required.' \
             kata-aks-dev-linux-amd64.tar.gz release-manifest.json SHA256SUMS

@@ -6,8 +6,12 @@
 //! OpenVMM hypervisor lifecycle management over the standalone VM service.
 
 use anyhow::{anyhow, Context, Result};
+use base64::{engine::general_purpose::STANDARD, Engine};
+use kata_types::config::hypervisor::snp_igvm_enabled;
 use kata_types::config::KATA_PATH;
 use protobuf::MessageField;
+use std::collections::HashMap;
+use std::convert::TryInto;
 use std::fs;
 
 use super::inner::OpenVmmInner;
@@ -15,12 +19,16 @@ use super::vmm_instance::OPENVMM_READY_TIMEOUT;
 use super::vmservice;
 use super::{
     OPENVMM_BLOCK_HOTPLUG_FIRST_DEVICE, OPENVMM_BLOCK_HOTPLUG_PORT_COUNT,
-    OPENVMM_BLOCK_HOTPLUG_PORT_PREFIX, OPENVMM_NET_PCI_FIRST_DEVICE, OPENVMM_NET_PCI_MAX_COUNT,
-    OPENVMM_ROOTFS_PCI_DEVICE, OPENVMM_SHAREFS_PCI_DEVICE, OPENVMM_VSOCK_PCI_DEVICE,
+    OPENVMM_BLOCK_HOTPLUG_PORT_PREFIX, OPENVMM_CONSOLE_PCI_DEVICE, OPENVMM_NET_PCI_FIRST_DEVICE,
+    OPENVMM_NET_PCI_MAX_COUNT, OPENVMM_ROOTFS_PCI_DEVICE, OPENVMM_SHAREFS_PCI_DEVICE,
+    OPENVMM_VSOCK_PCI_DEVICE,
 };
 use crate::kernel_param::KernelParams;
 use crate::utils::{get_jailer_root, get_sandbox_path};
-use crate::{DeviceType, MemoryConfig, VcpuThreadIds, VmmState, VM_ROOTFS_DRIVER_BLK};
+use crate::{
+    DeviceType, MemoryConfig, ProtectionDeviceConfig, VcpuThreadIds, VmmState, KATA_BLK_DEV_TYPE,
+    VM_ROOTFS_DRIVER_BLK,
+};
 
 const OPENVMM_STANDALONE_VIRTIO_FS: &str = "virtio-fs";
 
@@ -84,7 +92,7 @@ fn net_device_kind(mac_address: String, tap_name: String) -> vmservice::PcieDevi
     virtio_pcie_device(vmservice::virtio_device::Kind::Net(vmservice::VirtioNet {
         backend: MessageField::some(vmservice::NicBackend {
             kind: Some(vmservice::nic_backend::Kind::Tap(vmservice::TapBackend {
-                name: tap_name,
+                source: Some(vmservice::tap_backend::Source::Name(tap_name)),
                 ..Default::default()
             })),
             ..Default::default()
@@ -111,6 +119,51 @@ fn agent_vsock_pcie_port(socket_path: &str) -> vmservice::PciePort {
         false,
         Some(vsock_device_kind(socket_path.to_string())),
     )
+}
+
+fn console_device_kind(socket_path: String) -> vmservice::PcieDeviceKind {
+    virtio_pcie_device(vmservice::virtio_device::Kind::Console(
+        vmservice::VirtioConsole {
+            backend: MessageField::some(vmservice::SerialBackend {
+                kind: Some(vmservice::serial_backend::Kind::Relay(
+                    vmservice::SerialRelay {
+                        socket_path,
+                        connect: false,
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    ))
+}
+
+fn snp_host_data(config: &ProtectionDeviceConfig) -> Result<Option<[u8; 32]>> {
+    let ProtectionDeviceConfig::SevSnp(config) = config else {
+        return Err(anyhow!(
+            "Kata's OpenVMM backend only supports SEV-SNP protection"
+        ));
+    };
+    if !config.is_snp {
+        return Err(anyhow!(
+            "OpenVMM received a SEV/SNP protection device, but SNP is not enabled (is_snp=false)"
+        ));
+    }
+
+    let Some(encoded) = config.host_data.as_ref() else {
+        return Ok(None);
+    };
+    let decoded = STANDARD
+        .decode(encoded)
+        .context("decode OpenVMM SNP host data")?;
+    let host_data = decoded.try_into().map_err(|decoded: Vec<u8>| {
+        anyhow!(
+            "openvmm SNP host data is {} bytes, expected 32",
+            decoded.len()
+        )
+    })?;
+    Ok(Some(host_data))
 }
 
 /// Build a vhost-user-fs endpoint (virtiofsd backend reached over a Unix socket).
@@ -198,23 +251,30 @@ impl OpenVmmInner {
     pub(crate) async fn start_vm(&mut self, _timeout: i32) -> Result<()> {
         info!(sl!(), "openvmm: start_vm via external ttrpc process");
 
-        let cmdline = build_kernel_cmdline(
-            self.config.debug_info.enable_debug,
-            &self.config.boot_info.kernel_params,
-            &self.config.boot_info.kernel_verity_params,
-            &self.config.boot_info.rootfs_type,
-        )?;
-        let cmdline = adapt_cmdline_for_rpc(cmdline);
+        let use_snp_igvm = snp_igvm_enabled(&self.config)?;
+
+        let cmdline = if use_snp_igvm {
+            String::new()
+        } else {
+            let cmdline = build_kernel_cmdline(
+                self.config.debug_info.enable_debug,
+                &self.config.boot_info.kernel_params,
+                &self.config.boot_info.kernel_verity_params,
+                &self.config.boot_info.rootfs_type,
+            )?;
+            adapt_cmdline_for_rpc(cmdline)
+        };
 
         info!(sl!(), "openvmm: kernel={}", self.config.boot_info.kernel);
+        info!(sl!(), "openvmm: igvm={}", self.config.boot_info.igvm);
         info!(sl!(), "openvmm: image={}", self.config.boot_info.image);
         info!(sl!(), "openvmm: cmdline={}", cmdline);
 
         // Build the PCIe topology: every Kata device is a virtio (or
         // vhost-user) function at function 0 of its own root port on a single
-        // root complex. Cold-plug devices (rootfs, sharefs, network, the agent
-        // vsock) are attached here; block volumes are hot-added after resume
-        // into the pre-declared empty hotplug ports.
+        // root complex. Rootfs and queued devices, including initdata and block
+        // volumes, are cold-plugged here. Unused ports remain available for
+        // later hotplug.
         let mut root_ports: Vec<vmservice::PciePort> = Vec::new();
 
         // rootfs as virtio-blk-pci. The guest mounts it via the kernel cmdline
@@ -239,10 +299,12 @@ impl OpenVmmInner {
         };
 
         let vsock_socket_path = format!("{}/vsock.sock", self.run_dir);
+        let console_socket_path = format!("{}/console.sock", self.run_dir);
         let pending = self.pending_devices.clone();
-        let mut deferred_block_devices = Vec::new();
+        let mut coldplug_disks = HashMap::new();
         let mut network_index = 0u8;
         let mut agent_vsock_port = None;
+        let mut snp_launch_host_data: Option<[u8; 32]> = None;
 
         for dev in &pending {
             match dev {
@@ -327,15 +389,47 @@ impl OpenVmmInner {
                     ));
                 }
                 DeviceType::BlockModern(block_device) => {
-                    let path_on_host = block_device.lock().await.config.path_on_host.clone();
-                    if Some(path_on_host.as_str()) == rootfs_disk_path.as_deref() {
+                    let (device_id, config) = {
+                        let block = block_device.lock().await;
+                        (block.device_id.clone(), block.config.clone())
+                    };
+                    if Some(config.path_on_host.as_str()) == rootfs_disk_path.as_deref() {
                         info!(
                             sl!(),
                             "openvmm: skipping duplicate BlockModern device already used as rootfs: {}",
-                            path_on_host
+                            config.path_on_host
                         );
                     } else {
-                        deferred_block_devices.push(dev.clone());
+                        if config.driver_option != KATA_BLK_DEV_TYPE {
+                            return Err(anyhow!(
+                                "Kata's OpenVMM backend only supports '{}' for cold-plugged block devices, got '{}'",
+                                KATA_BLK_DEV_TYPE,
+                                config.driver_option
+                            ));
+                        }
+                        if config.path_on_host.is_empty() {
+                            return Err(anyhow!("openvmm cold-plug block device has no host path"));
+                        }
+
+                        let port = self.reserve_block_hotplug_port(&device_id)?;
+                        let disk_path = config.path_on_host.clone();
+                        info!(
+                            sl!(),
+                            "openvmm: cold-plugging block device {} at port {} (pci_path {})",
+                            disk_path,
+                            port.name,
+                            port.pci_path
+                        );
+                        coldplug_disks
+                            .insert(port.name, blk_device_kind(disk_path, config.is_readonly));
+                        let mut block = block_device.lock().await;
+                        block.config.pci_path = Some(port.pci_path);
+                        block.config.scsi_addr = None;
+                    }
+                }
+                DeviceType::Protection(protection_device) => {
+                    if let Some(host_data) = snp_host_data(&protection_device.config)? {
+                        snp_launch_host_data = Some(host_data);
                     }
                 }
                 DeviceType::Vfio(_) => {
@@ -356,6 +450,7 @@ impl OpenVmmInner {
         let ttrpc_socket_path = format!("{}/openvmm.sock", self.run_dir);
         let serial_socket_path = format!("{}/serial.sock", self.run_dir);
         let _ = std::fs::remove_file(&vsock_socket_path);
+        let _ = std::fs::remove_file(&console_socket_path);
         let _ = std::fs::remove_file(&ttrpc_socket_path);
         let _ = std::fs::remove_file(&serial_socket_path);
 
@@ -366,17 +461,27 @@ impl OpenVmmInner {
         root_ports
             .push(agent_vsock_port.unwrap_or_else(|| agent_vsock_pcie_port(&vsock_socket_path)));
 
-        // Pre-declare empty, hotplug-capable ports (hp0..) for block volumes
-        // that are hot-added after resume. Their device numbers match the
+        if use_snp_igvm && self.config.debug_info.enable_debug {
+            root_ports.push(make_pcie_port(
+                "console",
+                OPENVMM_CONSOLE_PCI_DEVICE,
+                false,
+                Some(console_device_kind(console_socket_path)),
+            ));
+        }
+
+        // Pre-declare hotplug-capable ports (hp0..), populated for cold-plugged
+        // disks and otherwise empty for hotplug. Their device numbers match the
         // OpenVmmHotplugPort pool so the guest pci_path can be computed without
         // an OpenVMM round-trip.
         for index in 0..OPENVMM_BLOCK_HOTPLUG_PORT_COUNT {
             let device = OPENVMM_BLOCK_HOTPLUG_FIRST_DEVICE + index;
+            let name = format!("{}{}", OPENVMM_BLOCK_HOTPLUG_PORT_PREFIX, index);
             root_ports.push(make_pcie_port(
-                &format!("{}{}", OPENVMM_BLOCK_HOTPLUG_PORT_PREFIX, index),
+                &name,
                 device,
                 true,
-                None,
+                coldplug_disks.remove(&name),
             ));
         }
 
@@ -398,6 +503,53 @@ impl OpenVmmInner {
             ..Default::default()
         };
 
+        let (boot_config, isolation_config) = if use_snp_igvm {
+            // convert Option<[u8; 32]> host data to Vec<u8> for protobuf
+            let host_data = match snp_launch_host_data {
+                Some(digest) => digest.to_vec(),
+                None => Vec::new(),
+            };
+            (
+                vmservice::vmconfig::BootConfig::Igvm(vmservice::IgvmBoot {
+                    igvm_path: self.config.boot_info.igvm.clone(),
+                    personality: vmservice::igvm_boot::Personality::PERSONALITY_LINUX_DIRECT.into(),
+                    ..Default::default()
+                }),
+                MessageField::some(vmservice::IsolationConfig {
+                    isolation_type: Some(vmservice::isolation_config::Isolation_type::Snp(
+                        vmservice::SnpIsolationConfig {
+                            host_data,
+                            ..Default::default()
+                        },
+                    )),
+                    ..Default::default()
+                }),
+            )
+        } else {
+            (
+                vmservice::vmconfig::BootConfig::DirectBoot(vmservice::DirectBoot {
+                    kernel_path: self.config.boot_info.kernel.clone(),
+                    initrd_path: self.config.boot_info.initrd.clone(),
+                    kernel_cmdline: cmdline,
+                    ..Default::default()
+                }),
+                MessageField::none(),
+            )
+        };
+        let serial_config = if use_snp_igvm {
+            MessageField::none()
+        } else {
+            MessageField::some(vmservice::SerialConfig {
+                ports: vec![vmservice::serial_config::Config {
+                    port: 0,
+                    socket_path: serial_socket_path,
+                    connect: false,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+        };
+
         let request = vmservice::CreateVMRequest {
             config: MessageField::some(vmservice::VMConfig {
                 memory_config: MessageField::some(vmservice::MemoryConfig {
@@ -409,23 +561,10 @@ impl OpenVmmInner {
                     ..Default::default()
                 }),
                 pcie: MessageField::some(pcie),
-                serial_config: MessageField::some(vmservice::SerialConfig {
-                    ports: vec![vmservice::serial_config::Config {
-                        port: 0,
-                        socket_path: serial_socket_path,
-                        connect: false,
-                        ..Default::default()
-                    }],
-                    ..Default::default()
-                }),
-                BootConfig: Some(vmservice::vmconfig::BootConfig::DirectBoot(
-                    vmservice::DirectBoot {
-                        kernel_path: self.config.boot_info.kernel.clone(),
-                        initrd_path: self.config.boot_info.initrd.clone(),
-                        kernel_cmdline: cmdline,
-                        ..Default::default()
-                    },
-                )),
+                serial_config,
+                BootConfig: Some(boot_config),
+                isolation_config,
+                disable_vmbus: use_snp_igvm,
                 ..Default::default()
             }),
             log_id: self.id.clone(),
@@ -453,12 +592,6 @@ impl OpenVmmInner {
                 .context("failed to resume VM")?;
 
             self.state = VmmState::VmRunning;
-            for device in deferred_block_devices {
-                self.add_device(device)
-                    .await
-                    .context("failed to hotplug deferred block device")?;
-            }
-
             self.vmm_instance
                 .start_wait_task()
                 .context("failed to start OpenVMM process monitor")?;
@@ -563,5 +696,49 @@ impl OpenVmmInner {
 
     pub(crate) async fn get_passfd_listener_addr(&self) -> Result<(String, u32)> {
         Err(anyhow!("openvmm passfd IO is not supported"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::SevSnpConfig;
+
+    #[test]
+    fn decodes_snp_host_data() {
+        let config = ProtectionDeviceConfig::SevSnp(SevSnpConfig {
+            is_snp: true,
+            cbitpos: 0,
+            phys_addr_reduction: 0,
+            firmware: String::new(),
+            host_data: Some(STANDARD.encode([0xab; 32])),
+        });
+        assert_eq!(snp_host_data(&config).unwrap(), Some([0xab; 32]));
+    }
+
+    #[test]
+    fn rejects_invalid_snp_host_data_length() {
+        for length in [0, 31, 33] {
+            let config = ProtectionDeviceConfig::SevSnp(SevSnpConfig {
+                is_snp: true,
+                cbitpos: 0,
+                phys_addr_reduction: 0,
+                firmware: String::new(),
+                host_data: Some(STANDARD.encode(vec![0xab; length])),
+            });
+            assert!(snp_host_data(&config).is_err());
+        }
+    }
+
+    #[test]
+    fn accepts_missing_snp_host_data() {
+        let config = ProtectionDeviceConfig::SevSnp(SevSnpConfig {
+            is_snp: true,
+            cbitpos: 0,
+            phys_addr_reduction: 0,
+            firmware: String::new(),
+            host_data: None,
+        });
+        assert_eq!(snp_host_data(&config).unwrap(), None);
     }
 }
